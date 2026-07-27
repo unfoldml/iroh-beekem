@@ -46,6 +46,27 @@ therefore `BLAKE3-MAC(workspace_secret, document_uuid)` — fixed 32 bytes, so n
 depth or filename length, and derived from a stable UUID rather than the path, so renaming a document
 touches only the encrypted manifest and never invalidates a stored chunk.
 
+### The control plane is authenticated here, not by beekem
+
+beekem verifies nothing. `Cgka::merge_concurrent_operation` checks the operation
+hash and the causal predecessors; `Cgka::apply_operation` mutates the tree without
+ever looking at the issuer. Since the gossip topic is derived from the tree id, which
+every past invitee knows, an unchecked `merge` would let anyone broadcast a self-issued
+`Add` and read everything written afterwards.
+
+`CgkaController::merge` therefore applies two checks beekem does not, and neither
+substitutes for the other:
+
+* **Signature** — the operation must verify against its own embedded issuer key.
+  Catches a payload spliced onto an observed signature.
+* **Membership** — that issuer must be someone an accepted `Add` introduced.
+  Catches the freshly minted keypair, which can sign its own messages perfectly well.
+
+The membership set is deliberately monotone: a `Remove` does not retract it. Two peers
+seeing a removal and a concurrent operation by the removed member in opposite orders
+would otherwise disagree about admissibility and diverge. A removed member's operations
+cannot reach the root key anyway, so beekem's tree semantics already neutralise them.
+
 ### Two DAGs must both be satisfied
 
 An arriving chunk applies only when the CGKA operation graph has caught up far enough to reach its PCS
@@ -56,9 +77,9 @@ data loss in the system, and it is what the property tests are aimed at.
 ## Verification
 
 ```bash
-cargo test -p iroh-beekem-core     # unit + the beekem handshake spike + state-machine tests
-cargo test -p iroh-beekem-sim      # propsim: convergence, join, no permanent parking, determinism
-cargo test -p iroh-beekem          # two real endpoints over real QUIC, including revocation
+cargo test -p iroh-beekem-core     # unit + handshake spike + state machine + forgery rejection
+cargo test -p iroh-beekem-sim      # propsim: convergence, concurrent rotation/revocation, forging peer
+cargo test -p iroh-beekem          # two real endpoints over real QUIC: revocation, roles, rotation
 cargo clippy --workspace --all-targets -- -D warnings
 
 # The core's purity is enforced mechanically; this must match nothing:
@@ -69,14 +90,15 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
 Note: `cargo clippy --all-features` pulls in a substantially larger dependency set (`arbitrary`,
 `objc2`, …) and needs several GB of free disk.
 
-## Known limitations
+## Deliberate trade-offs
 
-These are real and deliberate, not oversights:
+These are consequences of the design, not work left undone. Each one buys something.
 
-1. **`iroh-docs` write capability is all-or-nothing.** Every writer holds the same `NamespaceSecret`.
-   A revoked member keeps it and can still push entries; they cannot *read* anything written after
-   their removal, but shutting off their writes needs a namespace rotation. Check the entry author
-   against the manifest roles before accepting an entry.
+1. **`iroh-docs` write capability is all-or-nothing.** Every writer holds the same `NamespaceSecret`,
+   so a revoked member keeps it and can still push entries into the replica. They cannot *read*
+   anything written after their removal — that is the CGKA — and peers now refuse their entries
+   (see `Manifest::author_may_write`), but genuinely shutting off their writes needs a namespace
+   rotation, which is not automatic.
 2. **A new member cannot read content written before they joined.** They reconstruct the group from
    the operation log but not the historical PCS keys. This is forward secrecy working as intended;
    `Workspace` re-publishes current state when a peer joins the overlay so they can catch up.
@@ -87,9 +109,40 @@ These are real and deliberate, not oversights:
 5. **Forward secrecy is bounded by retention.** Decryption keys are recovered from the CGKA operation
    graph, so pruning old operations to gain forward secrecy also destroys the ability to read old
    content. Retention is a policy knob, not a free win.
-6. **M-of-N admin actions are not implemented.** The manifest has the role schema to support them;
-   the enforcement is not written.
-7. the networked facade covers a single document per workspace and uses in-memory stores.
+6. **The workspace blinding secret does not rotate.** A revoked member can still recognise which
+   blinded key belongs to a document UUID they already knew. Rotating it would force every peer to
+   rewrite every entry. They learn nothing about documents created after their removal, and can
+   read no content either way.
+7. **Roles are advisory against a cryptographically capable member.** Anyone holding a leaf can
+   decrypt, whatever the manifest says. Roles constrain what a well-behaved peer accepts, not what a
+   malicious one can read. Genuine read revocation is a CGKA removal.
+8. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
+   bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`) and evict oldest-first, because an unbounded
+   queue is a remote memory-exhaustion vector. Evicted operations return with the next neighbour log
+   exchange; evicted chunks wait for a resync. A property test asserts honest runs never evict.
+
+## Not yet implemented
+
+These are gaps, not trades. Nothing in the design prevents them.
+
+1. **No persistence.** `MemStore` and `Docs::memory()` only, and neither `CgkaController` nor
+   `WorkspaceState` can be serialized — so there is no export/import to build persistence on, and
+   nothing survives a restart.
+2. **Single document per workspace in the networked facade.** The core already keys documents by
+   UUID and the manifest indexes them; `Workspace` pins one.
+3. **M-of-N admin actions.** The manifest has the role schema; the threshold enforcement is not
+   written. Single-admin rules *are* enforced: admin-only membership changes, and a refusal to
+   demote or remove the last admin.
+4. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
+   re-encrypts them and writes a new blob; superseded blobs are never collected. Cost grows
+   quadratically in edits.
+5. **No namespace rotation and no `leave`.** A revoked member keeps the docs write capability and
+   stays subscribed to the control topic, where it can observe membership churn.
+6. **Invites are replayable.** No expiry, no nonce, no binding to the invitee — and the ticket
+   carries the raw workspace secret, so it must travel over an authenticated, confidential channel.
+7. **No CI, and `LICENSE-APACHE` is missing.** `LICENSE-MIT` is present; fetch the other from its
+   canonical source rather than transcribing it:
+   `curl -o LICENSE-APACHE https://www.apache.org/licenses/LICENSE-2.0.txt`
 
 
 
