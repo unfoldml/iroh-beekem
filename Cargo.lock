@@ -3713,7 +3713,7 @@ dependencies = [
 [[package]]
 name = "propsim"
 version = "0.0.0"
-source = "git+https://github.com/unfoldml/propsim#fc358b00afe68478b9a575d5e2814c3b75438e26"
+source = "git+https://github.com/unfoldml/propsim?rev=fc358b00afe68478b9a575d5e2814c3b75438e26#fc358b00afe68478b9a575d5e2814c3b75438e26"
 dependencies = [
  "propsim-core",
  "propsim-oracle",
@@ -3724,7 +3724,7 @@ dependencies = [
 [[package]]
 name = "propsim-core"
 version = "0.0.0"
-source = "git+https://github.com/unfoldml/propsim#fc358b00afe68478b9a575d5e2814c3b75438e26"
+source = "git+https://github.com/unfoldml/propsim?rev=fc358b00afe68478b9a575d5e2814c3b75438e26#fc358b00afe68478b9a575d5e2814c3b75438e26"
 dependencies = [
  "propsim-history",
  "proptest",
@@ -3733,12 +3733,12 @@ dependencies = [
 [[package]]
 name = "propsim-history"
 version = "0.0.0"
-source = "git+https://github.com/unfoldml/propsim#fc358b00afe68478b9a575d5e2814c3b75438e26"
+source = "git+https://github.com/unfoldml/propsim?rev=fc358b00afe68478b9a575d5e2814c3b75438e26#fc358b00afe68478b9a575d5e2814c3b75438e26"
 
 [[package]]
 name = "propsim-oracle"
 version = "0.0.0"
-source = "git+https://github.com/unfoldml/propsim#fc358b00afe68478b9a575d5e2814c3b75438e26"
+source = "git+https://github.com/unfoldml/propsim?rev=fc358b00afe68478b9a575d5e2814c3b75438e26#fc358b00afe68478b9a575d5e2814c3b75438e26"
 dependencies = [
  "propsim-core",
 ]
@@ -3746,7 +3746,7 @@ dependencies = [
 [[package]]
 name = "propsim-sim"
 version = "0.0.0"
-source = "git+https://github.com/unfoldml/propsim#fc358b00afe68478b9a575d5e2814c3b75438e26"
+source = "git+https://github.com/unfoldml/propsim?rev=fc358b00afe68478b9a575d5e2814c3b75438e26#fc358b00afe68478b9a575d5e2814c3b75438e26"
 dependencies = [
  "propsim-core",
  "proptest",

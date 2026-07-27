@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use iroh_beekem::{Node, Workspace};
-use iroh_beekem_core::DocumentUuid;
+use iroh_beekem_core::{DocumentUuid, FileEntry};
 use keyhive_crypto::{
     share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
 };
@@ -79,6 +79,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         alice.text().await.contains("hello from Bob")
     })
     .await;
+
+    // Logical paths and roles live only in the encrypted manifest; `iroh-docs`
+    // sees a blinded 32-byte key and nothing more. Bob seeing either means the
+    // manifest was encrypted, stored, synced, fetched and decrypted.
+    println!("\nalice names the document in the manifest...");
+    alice
+        .upsert_file(FileEntry {
+            uuid: DOC,
+            logical_path: "/notes/greetings.md".into(),
+            mime_type: "text/markdown".into(),
+        })
+        .await?;
+    settle("bob sees the logical path", Duration::from_secs(30), || async {
+        bob.ingest().await;
+        bob.files()
+            .await
+            .iter()
+            .any(|f| f.logical_path == "/notes/greetings.md")
+    })
+    .await;
+
+    println!("  manifest as bob sees it:");
+    for file in bob.files().await {
+        println!("    {} ({})", file.logical_path, file.mime_type);
+    }
+    for (member, role) in bob.roles().await {
+        println!("    {:02x}{:02x}.. → {role:?}", member[0], member[1]);
+    }
+
+    // Post-compromise security: after this, bob's old leaf secret derives no
+    // further group key. The group has to keep working across it.
+    println!("\nbob rotates his leaf key...");
+    bob.rotate().await?;
+    alice.append("Written after Bob's rotation. ").await?;
+    settle("bob reads across the rotation", Duration::from_secs(30), || async {
+        bob.ingest().await;
+        bob.text().await.contains("after Bob's rotation")
+    })
+    .await;
+
+    // Roles are enforced, not decorative: bob is an editor, not an admin.
+    println!("\nbob (an editor) tries to revoke alice...");
+    match bob.revoke(alice.member_id().await).await {
+        Err(err) => println!("  ✓ refused: {err}"),
+        Ok(()) => println!("  ✗ a non-admin was allowed to revoke a member"),
+    }
 
     println!("\nalice revokes bob, then writes again...");
     alice.revoke(bob_id).await?;

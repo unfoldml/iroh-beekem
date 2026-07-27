@@ -858,7 +858,12 @@ async fn fetch_chunks(
                 state.manifest().author_may_write(&author)
             };
             if !accepted {
-                tracing::warn!("skipping an entry from an author with no writing role");
+                // Routine during catch-up, not necessarily an attack: until the
+                // manifest naming this author has synced, a perfectly legitimate
+                // peer's entries look exactly like an outsider's. `ingest_all`
+                // re-reads every entry on each sync event, so this self-corrects
+                // once the manifest lands — which is why it is not a warning.
+                tracing::debug!("skipping an entry whose author has no writing role yet");
                 continue;
             }
         }
