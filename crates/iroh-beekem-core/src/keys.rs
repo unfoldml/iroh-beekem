@@ -74,7 +74,7 @@ pub type ControlOp = Arc<Signed<CgkaOperation>>;
 /// Overflow evicts oldest-first. That is safe rather than merely expedient: the
 /// operation log is re-exchanged whenever a neighbour appears, so an evicted
 /// operation is recoverable, whereas exhausted memory is not.
-const MAX_PARKED_OPS: usize = 1024;
+pub const MAX_PARKED_OPS: usize = 1024;
 
 /// What happened when an operation was offered to the local CGKA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

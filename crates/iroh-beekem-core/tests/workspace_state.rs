@@ -31,6 +31,8 @@ struct Bus {
     to_bob: Vec<Signed<CgkaOperation>>,
     /// Data-plane chunks alice has emitted but bob has not yet received.
     chunks_to_bob: Vec<iroh_beekem_core::Chunk>,
+    /// Encrypted manifest replicas alice has emitted but bob has not received.
+    manifests_to_bob: Vec<iroh_beekem_core::Chunk>,
 }
 
 fn two_node_workspace() -> Bus {
@@ -55,10 +57,12 @@ fn two_node_workspace() -> Bus {
         CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
 
     Bus {
-        alice: WorkspaceState::new(alice_cgka, WorkspaceSecret::new(secret.to_bytes())),
-        bob: WorkspaceState::new(bob_cgka, secret),
+        alice: WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
+            .expect("alice founds the workspace"),
+        bob: WorkspaceState::joined(bob_cgka, secret),
         to_bob: Vec::new(),
         chunks_to_bob: Vec::new(),
+        manifests_to_bob: Vec::new(),
     }
 }
 
@@ -73,7 +77,8 @@ impl Bus {
             match effect {
                 Effect::BroadcastOp(op) => self.to_bob.push(*op),
                 Effect::StoreChunk { chunk, .. } => self.chunks_to_bob.push(*chunk),
-                Effect::Applied { .. } => {}
+                Effect::StoreManifest { chunk, .. } => self.manifests_to_bob.push(*chunk),
+                Effect::Applied { .. } | Effect::ManifestUpdated => {}
             }
         }
     }
@@ -84,6 +89,16 @@ impl Bus {
             self.bob
                 .handle(Event::ControlOp(Arc::new(op)), &mut rng(0))
                 .expect("bob should handle a control op");
+        }
+        for chunk in std::mem::take(&mut self.manifests_to_bob) {
+            self.bob
+                .handle(
+                    Event::ManifestArrived {
+                        chunk: Box::new(chunk),
+                    },
+                    &mut rng(0),
+                )
+                .expect("bob should handle a manifest arrival");
         }
         for chunk in std::mem::take(&mut self.chunks_to_bob) {
             self.bob
@@ -233,7 +248,12 @@ fn concurrent_edits_from_both_members_converge() {
                     )
                     .expect("alice handles bob's chunk");
             }
-            Effect::Applied { .. } => {}
+            Effect::StoreManifest { chunk, .. } => {
+                bus.alice
+                    .handle(Event::ManifestArrived { chunk }, &mut rng(0))
+                    .expect("alice handles bob's manifest");
+            }
+            Effect::Applied { .. } | Effect::ManifestUpdated => {}
         }
     }
     bus.deliver_all_to_bob();
@@ -253,6 +273,250 @@ fn concurrent_edits_from_both_members_converge() {
     }
     assert_eq!(bus.alice.pending_len(), 0, "alice should have nothing parked");
     assert_eq!(bus.bob.pending_len(), 0, "bob should have nothing parked");
+}
+
+/// Roles were fully implemented in the manifest but had no caller: nothing
+/// consulted them before acting. These cover the enforcement points.
+mod roles_are_enforced {
+    use super::{rng, two_node_workspace, DOC};
+    use iroh_beekem_core::{CoreError, Event, FileEntry, Role};
+
+    #[test]
+    fn the_founder_is_an_admin_and_a_joiner_is_not() {
+        let bus = two_node_workspace();
+
+        assert_eq!(
+            bus.alice.manifest().role_of(&bus.alice.member_id().to_bytes()),
+            Some(Role::Admin),
+            "founding a workspace must make you its first admin"
+        );
+        assert_eq!(
+            bus.bob.manifest().role_of(&bus.bob.member_id().to_bytes()),
+            None,
+            "a joiner's manifest starts empty and is filled by sync, not by \
+             self-assignment"
+        );
+    }
+
+    #[test]
+    fn a_non_admin_cannot_change_membership() {
+        let mut bus = two_node_workspace();
+        let alice_id = bus.alice.member_id();
+
+        // Bob has synced no manifest, so he holds no role at all.
+        let result = bus
+            .bob
+            .handle(Event::RemoveMember { member: alice_id }, &mut rng(9));
+
+        assert!(
+            matches!(result, Err(CoreError::NotAnAdmin)),
+            "a member with no administrative role must not be able to revoke \
+             anyone, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn an_admitted_member_is_given_a_writing_role() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: FileEntry {
+                    uuid: DOC,
+                    logical_path: "/notes.md".into(),
+                    mime_type: "text/markdown".into(),
+                },
+            },
+            50,
+        );
+        bus.deliver_all_to_bob();
+
+        // `two_node_workspace` admits bob through the controller directly, so
+        // drive the manifest half of an admission here.
+        let bob_id = bus.bob.member_id();
+        bus.alice_does(
+            Event::SetRole {
+                member: bob_id.to_bytes(),
+                role: Role::Editor,
+            },
+            51,
+        );
+        bus.deliver_all_to_bob();
+
+        assert_eq!(
+            bus.bob.manifest().role_of(&bob_id.to_bytes()),
+            Some(Role::Editor),
+            "bob should learn his own role once the manifest reaches him"
+        );
+        assert_eq!(
+            bus.bob.manifest().resolve_path("/notes.md"),
+            Some(DOC),
+            "the manifest's file index must survive the encrypt/sync round trip"
+        );
+    }
+
+    #[test]
+    fn the_last_admin_cannot_be_demoted_or_removed() {
+        let mut bus = two_node_workspace();
+        let alice_id = bus.alice.member_id();
+
+        let demote = bus.alice.handle(
+            Event::SetRole {
+                member: alice_id.to_bytes(),
+                role: Role::Editor,
+            },
+            &mut rng(60),
+        );
+        assert!(
+            matches!(demote, Err(CoreError::LastAdmin)),
+            "demoting the only admin would leave a workspace nobody can ever \
+             administer again, got {demote:?}"
+        );
+
+        let remove = bus
+            .alice
+            .handle(Event::RemoveMember { member: alice_id }, &mut rng(61));
+        assert!(
+            matches!(remove, Err(CoreError::LastAdmin)),
+            "removing the only admin must be refused for the same reason, got {remove:?}"
+        );
+
+        assert_eq!(
+            bus.alice.manifest().admin_count(),
+            1,
+            "the refused operations must have left the admin in place"
+        );
+    }
+
+    #[test]
+    fn an_author_may_write_only_once_claimed_and_roled() {
+        let mut bus = two_node_workspace();
+        let bob_id = bus.bob.member_id();
+        let bob_author = [0xB0_u8; 32];
+
+        // Claimed by bob, but no role assigned yet.
+        bus.bob
+            .handle(Event::AnnounceAuthor { author: bob_author }, &mut rng(70))
+            .expect("announcing your own author id needs no privilege");
+        assert!(
+            !bus.bob.manifest().author_may_write(&bob_author),
+            "self-attestation alone must not confer the right to write"
+        );
+
+        // Now an admin grants the role. Applied to bob's own replica directly,
+        // standing in for the sync that would carry it.
+        bus.bob
+            .manifest()
+            .set_role(&bob_id.to_bytes(), Role::Editor)
+            .expect("recording the role");
+        assert!(
+            bus.bob.manifest().author_may_write(&bob_author),
+            "a claimed author whose member holds a writing role should be accepted"
+        );
+
+        assert!(
+            !bus.bob.manifest().author_may_write(&[0xFF_u8; 32]),
+            "an author nobody has claimed must never be accepted"
+        );
+    }
+}
+
+/// The pending-chunk queue holds ciphertext that arrived before its key, so it
+/// is filled by anyone who can write to the data plane. Both of its limits are
+/// checked here against chunks that can never become applicable, which is what
+/// a flood looks like.
+mod the_pending_queue_is_bounded {
+    use super::{rng, two_node_workspace, DOC};
+    use iroh_beekem_core::{
+        state::{MAX_PENDING_CHUNKS, MAX_PENDING_CHUNK_BYTES},
+        Chunk, ChunkRef, Event,
+    };
+    use keyhive_crypto::{digest::Digest, siv::Siv, symmetric_key::SymmetricKey};
+
+    /// A syntactically valid chunk that no key in the workspace can open.
+    ///
+    /// `content_ref` varies per chunk so the arrival-side deduplication does
+    /// not collapse them into one entry — otherwise this would test dedup
+    /// rather than the budget.
+    fn undecryptable_chunk(index: u64, size: usize) -> Chunk {
+        let mut ciphertext = vec![0u8; size];
+        ciphertext[..8].copy_from_slice(&index.to_le_bytes());
+
+        let mut content_ref = [0u8; 32];
+        content_ref[..8].copy_from_slice(&index.to_le_bytes());
+
+        Chunk::new(
+            Siv::new(&SymmetricKey::from([7u8; 32]), &ciphertext, b"doc"),
+            ciphertext,
+            Digest::from([1u8; 32]),
+            Digest::from([2u8; 32]),
+            ChunkRef(content_ref),
+            Digest::from([3u8; 32]),
+        )
+    }
+
+    #[test]
+    fn a_flood_of_small_chunks_is_capped_by_count() {
+        let mut bus = two_node_workspace();
+        let flood = MAX_PENDING_CHUNKS + 100;
+
+        for i in 0..flood {
+            bus.bob
+                .handle(
+                    Event::ChunkArrived {
+                        doc: DOC,
+                        chunk: Box::new(undecryptable_chunk(i as u64, 64)),
+                    },
+                    &mut rng(0),
+                )
+                .expect("an undecryptable chunk parks rather than failing");
+        }
+
+        assert_eq!(
+            bus.bob.pending_len(),
+            MAX_PENDING_CHUNKS,
+            "the queue should sit exactly at its count limit"
+        );
+        assert_eq!(
+            bus.bob.evicted_chunks(),
+            (flood - MAX_PENDING_CHUNKS) as u64,
+            "every chunk past the cap should be accounted for as an eviction"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_large_chunks_is_capped_by_total_bytes() {
+        let mut bus = two_node_workspace();
+
+        // Well under MAX_PENDING_CHUNKS, so only the byte budget can stop this.
+        let chunk_size = 1024 * 1024;
+        let flood = MAX_PENDING_CHUNK_BYTES / chunk_size + 8;
+
+        for i in 0..flood {
+            bus.bob
+                .handle(
+                    Event::ChunkArrived {
+                        doc: DOC,
+                        chunk: Box::new(undecryptable_chunk(i as u64, chunk_size)),
+                    },
+                    &mut rng(0),
+                )
+                .expect("an undecryptable chunk parks rather than failing");
+        }
+
+        assert!(
+            bus.bob.pending_len() < MAX_PENDING_CHUNKS,
+            "the count cap must not be what stopped this, or the test proves nothing"
+        );
+        assert!(
+            bus.bob.pending_len() * chunk_size <= MAX_PENDING_CHUNK_BYTES,
+            "parked ciphertext must stay within the byte budget, got {} chunks",
+            bus.bob.pending_len()
+        );
+        assert!(
+            bus.bob.evicted_chunks() > 0,
+            "exceeding the byte budget should have evicted something"
+        );
+    }
 }
 
 #[test]

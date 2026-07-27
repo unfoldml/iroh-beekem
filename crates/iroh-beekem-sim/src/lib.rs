@@ -192,6 +192,19 @@ impl WorkspaceNode {
         self.state.as_ref().map_or(0, WorkspaceState::parked_ops)
     }
 
+    /// Chunks and control operations discarded because a queue overflowed.
+    ///
+    /// The queue limits exist for hostile traffic. A well-behaved run must
+    /// never reach them, so a property asserting this stays zero is really a
+    /// guard against the eviction logic firing when it should not — which
+    /// would show up as silent data loss rather than as a failure.
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map_or(0, |s| s.evicted_chunks() + s.evicted_ops())
+    }
+
     /// The text this node has contributed locally.
     #[must_use]
     pub fn contributed(&self) -> &[String] {
@@ -288,7 +301,7 @@ impl WorkspaceNode {
         let Ok(cgka) = CgkaController::join(tree_id(), signer, share_secret, log) else {
             return;
         };
-        self.state = Some(WorkspaceState::new(cgka, WorkspaceSecret::new(secret)));
+        self.state = Some(WorkspaceState::joined(cgka, WorkspaceSecret::new(secret)));
         self.flush_inbox(cx);
     }
 }
@@ -307,11 +320,13 @@ impl Node for WorkspaceNode {
         self.share_secret = Some(share_secret);
 
         if me.0 == FOUNDER {
-            if let Ok(cgka) = CgkaController::create(tree_id(), signer, &mut node_rng(me, 0xC3)) {
-                self.state = Some(WorkspaceState::new(
+            if let Ok(cgka) = CgkaController::create(tree_id(), signer, &mut node_rng(me, 0xC3))
+                && let Ok(state) = WorkspaceState::found(
                     cgka,
                     WorkspaceSecret::new(workspace_secret_bytes()),
-                ));
+                )
+            {
+                self.state = Some(state);
             }
         } else {
             self.send_hello(cx);

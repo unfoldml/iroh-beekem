@@ -31,7 +31,7 @@ use crate::{
     content::{Chunk, ChunkRef},
     error::CoreError,
     keys::{CgkaController, ControlOp, MergeOutcome},
-    manifest::Manifest,
+    manifest::{FileEntry, Manifest, Role},
 };
 
 /// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
@@ -45,10 +45,10 @@ use crate::{
 /// from a peer exchange — it comes back only on the next resync. The budget is
 /// therefore generous: eviction here means losing content until someone
 /// re-announces, so it should be a genuine last resort.
-const MAX_PENDING_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_PENDING_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// How many chunks may be parked at once, regardless of their size.
-const MAX_PENDING_CHUNKS: usize = 4096;
+pub const MAX_PENDING_CHUNKS: usize = 4096;
 
 /// Something that happened to this node.
 #[derive(Debug, Clone)]
@@ -83,6 +83,40 @@ pub enum Event {
     },
     /// The local user rotated their leaf key for post-compromise security.
     Rotate,
+    /// An encrypted manifest replica arrived on the data plane.
+    ManifestArrived {
+        /// The ciphertext, exactly as stored.
+        chunk: Box<Chunk>,
+    },
+    /// The local user recorded or replaced a document's metadata.
+    UpsertFile {
+        /// The metadata to record.
+        entry: FileEntry,
+    },
+    /// The local user moved or renamed a document.
+    RenameFile {
+        /// Which document to rename.
+        doc: DocumentUuid,
+        /// The new logical path.
+        path: String,
+    },
+    /// The local user assigned a role. Requires the local member to be an admin.
+    SetRole {
+        /// The member whose role changes, as raw verifying-key bytes.
+        member: [u8; 32],
+        /// The role to assign.
+        role: Role,
+    },
+    /// Publish the local member's data-plane author identity.
+    ///
+    /// Self-attestation, so it needs no privilege: it says only "entries signed
+    /// by this author are mine", and grants nothing on its own. Until an admin
+    /// has also given this member a writing role, peers still reject the
+    /// entries it names.
+    AnnounceAuthor {
+        /// The local `iroh-docs` author id.
+        author: [u8; 32],
+    },
     /// Re-publish a document's current state without editing it.
     ///
     /// This is anti-entropy. Over a lossy transport a chunk can be dropped with
@@ -112,11 +146,25 @@ pub enum Effect {
         /// The ciphertext to store.
         chunk: Box<Chunk>,
     },
+    /// Persist the encrypted manifest and announce it under its well-known key.
+    ///
+    /// Separate from [`Effect::StoreChunk`] because it lands at a key derived
+    /// from a constant label rather than from a document UUID: every member
+    /// must be able to find the manifest without first being told where it is,
+    /// which is the one thing a random UUID cannot provide.
+    StoreManifest {
+        /// The blinded `iroh-docs` key the manifest always lives at.
+        key: StorageKey,
+        /// The ciphertext to store.
+        chunk: Box<Chunk>,
+    },
     /// A remote chunk was decrypted and merged into a local document.
     Applied {
         /// Which document changed.
         doc: DocumentUuid,
     },
+    /// A remote manifest replica was decrypted and merged.
+    ManifestUpdated,
 }
 
 /// One node's complete workspace state.
@@ -188,8 +236,12 @@ impl std::fmt::Debug for WorkspaceState {
 
 impl WorkspaceState {
     /// Build a node's state around an already-initialised CGKA controller.
+    ///
+    /// The manifest starts empty, which for a joiner is correct — theirs
+    /// arrives by sync. A *founder* must use [`Self::found`] instead, or the
+    /// workspace begins with no admin and can never gain one.
     #[must_use]
-    pub fn new(cgka: CgkaController, secret: WorkspaceSecret) -> Self {
+    pub fn joined(cgka: CgkaController, secret: WorkspaceSecret) -> Self {
         Self {
             cgka,
             secret,
@@ -199,6 +251,24 @@ impl WorkspaceState {
             pending_bytes: 0,
             evicted_chunks: 0,
         }
+    }
+
+    /// Build the founding node's state, recording it as the first admin.
+    ///
+    /// Distinct from [`Self::joined`] because the two cases genuinely differ and
+    /// getting it wrong is silent: a joiner that granted itself `Admin` would
+    /// concurrently edit the roles map with the real admin's copy, and Loro
+    /// would faithfully converge on a workspace with an administrator nobody
+    /// appointed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the initial role cannot be recorded.
+    pub fn found(cgka: CgkaController, secret: WorkspaceSecret) -> Result<Self, CoreError> {
+        let this = Self::joined(cgka, secret);
+        this.manifest
+            .set_role(&this.member_id().to_bytes(), Role::Admin)?;
+        Ok(this)
     }
 
     /// This node's CGKA identity.
@@ -232,6 +302,23 @@ impl WorkspaceState {
     #[must_use]
     pub fn parked_ops(&self) -> usize {
         self.cgka.parked_len()
+    }
+
+    /// Chunks discarded because the pending budget was exhausted.
+    ///
+    /// Should be zero in any healthy run. Unlike an evicted control operation,
+    /// an evicted chunk does not come back on the next neighbour exchange — it
+    /// waits for a resync — so a non-zero value here means content is
+    /// temporarily unreadable on this node.
+    #[must_use]
+    pub fn evicted_chunks(&self) -> u64 {
+        self.evicted_chunks
+    }
+
+    /// Control-plane operations discarded because the parking area was full.
+    #[must_use]
+    pub fn evicted_ops(&self) -> u64 {
+        self.cgka.evicted_ops()
     }
 
     /// The current text of a document, or the empty string if unknown.
@@ -288,10 +375,23 @@ impl WorkspaceState {
                 }
             }
             Event::AddMember { member, share_key } => {
+                self.require_admin()?;
                 let op = self.cgka.add_member(member, share_key)?;
-                Ok(op.map(|o| Effect::BroadcastOp(Box::new(o))).into_iter().collect())
+                if op.is_some() {
+                    // A new member is useless without a role: with none, every
+                    // peer's `author_may_write` check rejects their entries and
+                    // they would appear to join successfully and then silently
+                    // fail to publish anything.
+                    self.manifest.set_role(&member.to_bytes(), Role::Editor)?;
+                }
+                let mut effects: Vec<Effect> =
+                    op.map(|o| Effect::BroadcastOp(Box::new(o))).into_iter().collect();
+                effects.extend(self.publish_manifest(csprng)?);
+                Ok(effects)
             }
             Event::RemoveMember { member } => {
+                self.require_admin()?;
+                self.require_not_last_admin(&member.to_bytes())?;
                 let op = self.cgka.remove_member(member)?;
                 Ok(op.map(|o| Effect::BroadcastOp(Box::new(o))).into_iter().collect())
             }
@@ -299,7 +399,90 @@ impl WorkspaceState {
                 let op = self.cgka.rotate(csprng)?;
                 Ok(vec![Effect::BroadcastOp(Box::new(op))])
             }
+            Event::ManifestArrived { chunk } => {
+                // No parking queue for the manifest: it is re-published on every
+                // change and on every resync, so a copy that cannot be decrypted
+                // yet is replaced by one that can, rather than needing to be
+                // held. Holding it would also mean a second unbounded queue.
+                let Ok(plaintext) = self.cgka.decrypt(&chunk) else {
+                    return Ok(Vec::new());
+                };
+                self.manifest.import(&plaintext)?;
+                Ok(vec![Effect::ManifestUpdated])
+            }
+            Event::UpsertFile { entry } => {
+                self.manifest.upsert_file(&entry)?;
+                self.publish_manifest(csprng)
+            }
+            Event::RenameFile { doc, path } => {
+                self.manifest.rename(doc, &path)?;
+                self.publish_manifest(csprng)
+            }
+            Event::SetRole { member, role } => {
+                self.require_admin()?;
+                if !role.can_administer() {
+                    self.require_not_last_admin(&member)?;
+                }
+                self.manifest.set_role(&member, role)?;
+                self.publish_manifest(csprng)
+            }
+            Event::AnnounceAuthor { author } => {
+                self.manifest
+                    .set_author(&self.cgka.member_id().to_bytes(), &author)?;
+                self.publish_manifest(csprng)
+            }
         }
+    }
+
+    /// Refuse an administrative action unless the local member is an admin.
+    ///
+    /// This is the *permissions* layer, not the cryptographic one, and it binds
+    /// only well-behaved peers: a member holding a leaf can still decrypt
+    /// whatever the manifest says. Genuine read revocation is a CGKA removal.
+    fn require_admin(&self) -> Result<(), CoreError> {
+        let me = self.cgka.member_id().to_bytes();
+        if self.manifest.role_of(&me).is_some_and(Role::can_administer) {
+            return Ok(());
+        }
+        Err(CoreError::NotAnAdmin)
+    }
+
+    /// Refuse to strip the last admin of their powers.
+    ///
+    /// A workspace with no admin can never gain one — promoting someone is
+    /// itself an admin action — so this is unrecoverable rather than merely
+    /// inconvenient. [`Manifest::admin_count`] has documented this rule since
+    /// before there was a caller to enforce it.
+    fn require_not_last_admin(&self, member: &[u8; 32]) -> Result<(), CoreError> {
+        let is_admin = self
+            .manifest
+            .role_of(member)
+            .is_some_and(Role::can_administer);
+        if is_admin && self.manifest.admin_count() <= 1 {
+            return Err(CoreError::LastAdmin);
+        }
+        Ok(())
+    }
+
+    /// Encrypt the manifest and emit it for storage at its well-known key.
+    fn publish_manifest<R: CryptoRng + RngCore>(
+        &mut self,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        let snapshot = self.manifest.export_snapshot()?;
+        let (chunk, implicit_op) = self.cgka.encrypt(&snapshot, &[], csprng)?;
+
+        let mut effects = Vec::new();
+        // As in `publish`: an implicit PCS update has to reach peers before the
+        // ciphertext it keys, or nobody can read what follows.
+        if let Some(op) = implicit_op {
+            effects.push(Effect::BroadcastOp(Box::new(op)));
+        }
+        effects.push(Effect::StoreManifest {
+            key: self.secret.manifest_key(),
+            chunk: Box::new(chunk),
+        });
+        Ok(effects)
     }
 
     fn on_control_op(&mut self, op: ControlOp) -> Result<Vec<Effect>, CoreError> {
@@ -364,19 +547,44 @@ impl WorkspaceState {
         Ok(effects)
     }
 
+    /// Park a chunk that is not yet applicable, enforcing the pending budget.
+    ///
+    /// Eviction is oldest-first. A chunk that has been waiting longest is the
+    /// one whose key material has had the most time to show up and has not, so
+    /// it is the least likely of the queue to still be worth holding.
+    fn park_chunk(&mut self, doc: DocumentUuid, chunk: Chunk) {
+        let size = chunk.ciphertext.len();
+        while !self.pending_chunks.is_empty()
+            && (self.pending_chunks.len() >= MAX_PENDING_CHUNKS
+                || self.pending_bytes + size > MAX_PENDING_CHUNK_BYTES)
+        {
+            if let Some((_, evicted)) = self.pending_chunks.pop_front() {
+                self.pending_bytes = self.pending_bytes.saturating_sub(evicted.ciphertext.len());
+                self.evicted_chunks += 1;
+            }
+        }
+        self.pending_bytes += size;
+        self.pending_chunks.push_back((doc, chunk));
+    }
+
     /// Retry every parked chunk, repeating while progress is being made.
     fn drain_pending(&mut self) -> Result<Vec<Effect>, CoreError> {
         let mut effects = Vec::new();
         loop {
             let candidates = std::mem::take(&mut self.pending_chunks);
+            self.pending_bytes = 0;
             let before = effects.len();
             for (doc, chunk) in candidates {
                 if self.try_apply(doc, &chunk) {
                     effects.push(Effect::Applied { doc });
                 } else {
-                    // Not applicable yet: park it and try again next time new
-                    // key material or new operations arrive.
-                    self.pending_chunks.push((doc, chunk));
+                    // Not applicable yet: re-queue and try again next time new
+                    // key material or new operations arrive. Re-queueing goes
+                    // through the plain path rather than `park_chunk`, because
+                    // these chunks were already admitted under the budget and
+                    // re-checking it here could evict a chunk mid-drain.
+                    self.pending_bytes += chunk.ciphertext.len();
+                    self.pending_chunks.push_back((doc, chunk));
                 }
             }
             if effects.len() == before {

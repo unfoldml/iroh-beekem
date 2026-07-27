@@ -79,6 +79,21 @@ pub enum CoreError {
     /// The manifest has no record of the requested document.
     #[error("no such document in the workspace manifest")]
     UnknownDocument,
+
+    /// An administrative action was attempted by a member without the role.
+    ///
+    /// Advisory against a cryptographically capable member — anyone holding a
+    /// leaf can still decrypt — but it is what stops a well-behaved peer from
+    /// issuing membership changes it has no authority to make.
+    #[error("this member does not hold an administrative role")]
+    NotAnAdmin,
+
+    /// The action would leave the workspace with no administrator.
+    ///
+    /// Promoting an admin is itself an admin action, so a workspace that loses
+    /// its last one can never get another. Refusing is the only recovery.
+    #[error("refusing to remove or demote the last remaining admin")]
+    LastAdmin,
 }
 
 impl From<chacha20poly1305::Error> for CoreError {

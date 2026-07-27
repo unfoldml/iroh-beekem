@@ -36,6 +36,20 @@ const FILES_CONTAINER: &str = "files";
 /// Root container holding role assignments, keyed by hex member id.
 const ROLES_CONTAINER: &str = "roles";
 
+/// Root container mapping hex data-plane author id to hex CGKA member id.
+///
+/// The two identities are necessarily distinct. A member is an Ed25519 key in
+/// the CGKA tree; an `iroh-docs` author is a *separate*, per-workspace key that
+/// signs index entries and syncs in the clear. Without this mapping there is no
+/// way to answer the only question that matters when an entry arrives — "is the
+/// author of this entry someone the manifest says may write?" — because the
+/// entry names an author and the roles name a member.
+///
+/// Each member publishes its own mapping. That is self-attestation, and it is
+/// safe precisely because it grants nothing: the entry is still worthless
+/// unless an *admin* separately assigned that member a writing role.
+const AUTHORS_CONTAINER: &str = "authors";
+
 /// What a member is authorised to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -162,6 +176,50 @@ impl Manifest {
 
     fn roles_map(&self) -> LoroMap {
         self.doc.get_map(ROLES_CONTAINER)
+    }
+
+    fn authors_map(&self) -> LoroMap {
+        self.doc.get_map(AUTHORS_CONTAINER)
+    }
+
+    /// Record that `author` is the data-plane identity of `member`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the Loro write fails.
+    pub fn set_author(&self, member: &[u8; 32], author: &[u8; 32]) -> Result<(), CoreError> {
+        self.authors_map()
+            .insert(&hex(author), hex(member).as_str())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// The member an author id belongs to, if one has claimed it.
+    #[must_use]
+    pub fn member_for_author(&self, author: &[u8; 32]) -> Option<[u8; 32]> {
+        self.authors_map()
+            .get(&hex(author))
+            .and_then(|v| v.into_value().ok())
+            .and_then(|v| v.into_string().ok())
+            .and_then(|s| unhex(&s))
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    }
+
+    /// Whether an entry signed by `author` should be accepted.
+    ///
+    /// Requires *both* halves: a member must have claimed the author id, and an
+    /// admin must have given that member a role that can write. An unclaimed
+    /// author, or a claimed one belonging to a viewer, fails.
+    ///
+    /// This is advisory in the same sense as every other role check — it
+    /// constrains what a well-behaved peer accepts, not what a peer holding the
+    /// namespace write capability can push into the replica.
+    #[must_use]
+    pub fn author_may_write(&self, author: &[u8; 32]) -> bool {
+        self.member_for_author(author)
+            .and_then(|member| self.role_of(&member))
+            .is_some_and(Role::can_write)
     }
 
     /// Record or replace a document's metadata.

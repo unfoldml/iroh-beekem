@@ -346,6 +346,62 @@ mod control_plane_is_authenticated {
 }
 
 #[test]
+fn the_parking_area_is_bounded_against_a_flood() {
+    use beekem::{id::MemberId, operation::CgkaOperation};
+    use iroh_beekem_core::keys::MAX_PARKED_OPS;
+    use keyhive_crypto::digest::Digest;
+
+    let Invited { mut bob, .. } = invite_bob();
+
+    // Alice's signer, regenerated from the same seed `invite_bob` used. That
+    // matters: these operations are validly signed *by a member*, so they clear
+    // both the signature and the membership checks. The only thing keeping them
+    // out of the tree is a predecessor that will never arrive — which is the
+    // worst case for the cap, since no cheaper check can filter them out first.
+    let alice_signer = MemorySigner::generate(&mut rng(1));
+    let orphan_secret = ShareSecretKey::generate(&mut rng(77));
+    let orphan_id = MemberId::from(MemorySigner::generate(&mut rng(78)).verifying_key());
+
+    let flood = MAX_PARKED_OPS + 200;
+    for i in 0..flood {
+        // A distinct unreachable predecessor per operation, so nothing is
+        // deduplicated and each one genuinely occupies a slot.
+        let mut missing = [0xEE_u8; 32];
+        missing[..8].copy_from_slice(&(i as u64).to_le_bytes());
+
+        let op = CgkaOperation::Add {
+            added_id: orphan_id,
+            pk: orphan_secret.share_key(),
+            leaf_index: 2,
+            predecessors: vec![Digest::from(missing)],
+            add_predecessors: Vec::new(),
+            doc_id: workspace_id(0),
+        };
+        let signed = alice_signer
+            .try_sign_sync(op)
+            .expect("alice's signer works");
+
+        assert_eq!(
+            bob.merge(Arc::new(signed))
+                .expect("an unresolvable operation is deferred, not an error"),
+            MergeOutcome::Deferred,
+            "operation {i} should have been parked"
+        );
+    }
+
+    assert!(
+        bob.parked_len() <= MAX_PARKED_OPS,
+        "the parking area must stay bounded under a flood, got {} entries",
+        bob.parked_len()
+    );
+    assert_eq!(
+        bob.evicted_ops(),
+        (flood - MAX_PARKED_OPS) as u64,
+        "every operation past the cap should be accounted for as an eviction"
+    );
+}
+
+#[test]
 fn out_of_order_operations_are_parked_then_applied() {
     let Invited { mut alice, .. } = invite_bob();
 

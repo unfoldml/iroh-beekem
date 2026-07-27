@@ -128,6 +128,20 @@ fn no_control_operation_stays_parked_forever() {
 }
 
 #[test]
+fn a_healthy_run_never_evicts_anything() {
+    // The parking limits are there for a peer flooding the control or data
+    // plane. Under ordinary lossy, unordered delivery they must never bind: if
+    // they do, the eviction path is discarding content that was going to
+    // become applicable, which converges to the wrong answer silently rather
+    // than failing. This is the property that catches that.
+    base_plan(vec![property::always(
+        "no queue overflows under honest traffic",
+        |w: &World<'_, WorkspaceNode>| joined(w).iter().all(|n| n.evictions() == 0),
+    )])
+    .run(deterministic());
+}
+
+#[test]
 fn the_simulation_is_reproducible() {
     // Guards the whole harness: if any nondeterminism (a hash map iteration
     // order, an unseeded RNG, a clock read) crept into the core, the same seed

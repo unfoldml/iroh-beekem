@@ -114,6 +114,16 @@ impl Drop for Workspace {
     }
 }
 
+/// How many operations a peer's log-repair broadcast may contain.
+///
+/// `ControlMsg::Log` is the repair mechanism: any peer may send its whole
+/// history when a neighbour appears, and the receiver merges all of it. That
+/// makes it the cheapest amplification point on the control plane, since one
+/// message can cost the receiver an unbounded number of signature checks. The
+/// limit is well above any realistic workspace history and exists purely to
+/// bound that cost.
+const MAX_LOG_OPS: usize = 100_000;
+
 /// Derive the gossip topic for a workspace.
 ///
 /// The topic is derived from the tree id rather than being random so that every
@@ -279,6 +289,13 @@ impl Workspace {
                         ingest_all(&control).await;
                     }
                     ControlMsg::Log(ops) => {
+                        if ops.len() > MAX_LOG_OPS {
+                            tracing::warn!(
+                                len = ops.len(),
+                                "discarding an oversized operation log"
+                            );
+                            continue;
+                        }
                         let mut effects = Vec::new();
                         {
                             let mut state = control.state.lock().await;
