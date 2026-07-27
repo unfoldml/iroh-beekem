@@ -226,6 +226,125 @@ fn revoked_member_cannot_decrypt_later_content() {
     );
 }
 
+/// beekem verifies nothing — `merge_concurrent_operation` checks only the op
+/// hash and the causal predecessors, and `apply_operation` mutates the tree
+/// without ever consulting the issuer. The control plane is a public gossip
+/// topic, so these three tests cover the only thing standing between that topic
+/// and an attacker rewriting the group.
+mod control_plane_is_authenticated {
+    use super::{invite_bob, rng, workspace_id, Invited};
+    use iroh_beekem_core::{CgkaController, CoreError};
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner,
+        verifiable::Verifiable,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn a_validly_signed_operation_from_a_non_member_is_rejected() {
+        let Invited { mut alice, .. } = invite_bob();
+
+        let mallory_signer = MemorySigner::generate(&mut rng(99));
+        let mallory_id = beekem::id::MemberId::from(mallory_signer.verifying_key());
+        let mallory_secret = ShareSecretKey::generate(&mut rng(98));
+
+        // A well-formed `Add` admitting mallory, genuinely signed by mallory.
+        // The signature is perfectly valid; what she does not have is any `Add`
+        // naming her, which is the whole point of the second check. Note the
+        // empty predecessor set: nothing defers this, so it reaches the
+        // authorisation check immediately.
+        let forged = mallory_signer
+            .try_sign_sync(beekem::operation::CgkaOperation::init_add(
+                workspace_id(0),
+                mallory_id,
+                mallory_secret.share_key(),
+            ))
+            .expect("mallory can sign her own message");
+
+        let result = alice.merge(Arc::new(forged));
+
+        assert!(
+            matches!(result, Err(CoreError::Unauthorized { .. })),
+            "an operation signed by a key no add ever introduced must be refused, got {result:?}"
+        );
+        assert_eq!(
+            alice.group_size(),
+            2,
+            "the forged add must not have widened the group"
+        );
+        assert!(
+            !alice.is_known_member(mallory_id),
+            "a rejected operation must not register its issuer as a member"
+        );
+        assert_eq!(
+            alice.parked_len(),
+            0,
+            "unauthorised traffic must not be allowed to occupy the parking queue"
+        );
+    }
+
+    #[test]
+    fn an_operation_with_a_tampered_payload_is_rejected() {
+        let Invited {
+            mut alice, mut bob, ..
+        } = invite_bob();
+
+        let genuine = alice.rotate(&mut rng(40)).expect("alice rotates her leaf");
+        let mallory_secret = ShareSecretKey::generate(&mut rng(97));
+
+        // Alice's real issuer key and real signature, attached to a payload she
+        // never signed — an attacker splicing a membership change onto traffic
+        // they observed. Only the signature check catches this: the issuer is a
+        // bona fide member, so authorisation alone would wave it through.
+        let tampered = Signed::new(
+            beekem::operation::CgkaOperation::init_add(
+                workspace_id(0),
+                alice.member_id(),
+                mallory_secret.share_key(),
+            ),
+            *genuine.issuer(),
+            *genuine.signature(),
+        );
+
+        let result = bob.merge(Arc::new(tampered));
+
+        assert!(
+            matches!(result, Err(CoreError::BadSignature)),
+            "a payload that does not match its signature must be refused, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn join_rejects_a_log_whose_founding_add_was_not_self_issued() {
+        let Invited { log, .. } = invite_bob();
+
+        let mallory_signer = MemorySigner::generate(&mut rng(99));
+        let carol_signer = MemorySigner::generate(&mut rng(3));
+        let carol_secret = ShareSecretKey::generate(&mut rng(21));
+
+        // The founding `Add` bypasses `merge` entirely — it is handed straight
+        // to `Cgka::new_from_init_add` — so it needs its own check. Here
+        // mallory re-signs alice's genuine payload: the signature verifies, but
+        // the log now claims mallory crowned alice.
+        let mut forged_log = log.clone();
+        forged_log[0] = mallory_signer
+            .try_sign_sync(log[0].payload().clone())
+            .expect("mallory can sign");
+
+        let result = CgkaController::join(
+            workspace_id(0),
+            carol_signer,
+            carol_secret,
+            &forged_log,
+        );
+
+        assert!(
+            matches!(result, Err(CoreError::Unauthorized { .. })),
+            "a founding add issued by someone other than the founder must be refused, got {result:?}"
+        );
+    }
+}
+
 #[test]
 fn out_of_order_operations_are_parked_then_applied() {
     let Invited { mut alice, .. } = invite_bob();

@@ -12,6 +12,27 @@
 //! predecessors have not arrived yet is normal under gossip, not a fault. The
 //! caller is expected to park it and retry — see
 //! [`CgkaController::merge_pending`].
+//!
+//! # Authentication is also the caller's job
+//!
+//! beekem verifies no signatures at all — `Cgka::merge_concurrent_operation`
+//! checks only the operation hash and the causal predecessors, and
+//! `Cgka::apply_operation` mutates the tree without ever consulting the issuer.
+//! Since the control plane is a public broadcast topic, an unverified `merge`
+//! would let anyone splice their own leaf into the tree and read everything
+//! written afterwards.
+//!
+//! [`CgkaController::merge`] therefore applies two checks that beekem does not:
+//!
+//! 1. **Signature.** The operation must verify against its own embedded issuer
+//!    key, or it is rejected as [`CoreError::BadSignature`].
+//! 2. **Membership.** That issuer must be someone an accepted `Add` introduced,
+//!    or it is rejected as [`CoreError::Unauthorized`]. A valid signature alone
+//!    proves only that the issuer signed its own message, which a freshly
+//!    minted keypair can do just as well as a member.
+//!
+//! Neither check is a substitute for the other, and both are cheap next to the
+//! tree operations they guard.
 
 use beekem::{
     cgka::Cgka,
@@ -27,7 +48,10 @@ use keyhive_crypto::{
     verifiable::Verifiable,
 };
 use rand::{CryptoRng, RngCore};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
 
 use crate::{
     content::{Chunk, ChunkRef},
@@ -37,6 +61,20 @@ use crate::{
 
 /// A signed CGKA operation as it travels over the control plane.
 pub type ControlOp = Arc<Signed<CgkaOperation>>;
+
+/// How many out-of-order operations may wait for their predecessors at once.
+///
+/// Parking is unavoidable — gossip does not deliver in causal order — but an
+/// unbounded parking area is a remote memory-exhaustion vector: an operation
+/// naming predecessors that will never exist waits forever, and nothing stops a
+/// peer from sending a great many of them. Signature and membership checks run
+/// before anything is parked, so reaching this limit means a *member* is
+/// misbehaving or the local node is very far behind.
+///
+/// Overflow evicts oldest-first. That is safe rather than merely expedient: the
+/// operation log is re-exchanged whenever a neighbour appears, so an evicted
+/// operation is recoverable, whereas exhausted memory is not.
+const MAX_PARKED_OPS: usize = 1024;
 
 /// What happened when an operation was offered to the local CGKA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +100,25 @@ pub struct CgkaController {
     member_id: MemberId,
     share_secret: ShareSecretKey,
     share_key: ShareKey,
+    /// Every identity an accepted `Add` has ever introduced.
+    ///
+    /// Deliberately monotone: a `Remove` does *not* retract an entry. Two peers
+    /// that observe a removal and a concurrent operation by the removed member
+    /// in opposite orders would otherwise disagree about whether that operation
+    /// is admissible, and one of them would drop an operation the other kept —
+    /// divergence, from a check meant to prevent tampering. Nothing is lost by
+    /// being permissive here: a removed member's operations cannot reach the
+    /// root key, so beekem's own tree semantics already neutralise them. What
+    /// this set exists to stop is the *unrelated* keypair, which no `Add` names
+    /// under any ordering.
+    known_members: HashSet<MemberId>,
     /// Operations received out of causal order, awaiting their predecessors.
-    parked: Vec<ControlOp>,
+    ///
+    /// A queue rather than a stack: eviction takes the oldest, which is the one
+    /// least likely to still be waiting on something in flight.
+    parked: VecDeque<ControlOp>,
+    /// Operations dropped because [`MAX_PARKED_OPS`] was reached.
+    evicted_ops: u64,
 }
 
 impl std::fmt::Debug for CgkaController {
@@ -72,6 +127,7 @@ impl std::fmt::Debug for CgkaController {
             .field("member_id", &self.member_id)
             .field("group_size", &self.cgka.group_size())
             .field("ops_count", &self.cgka.ops_count())
+            .field("known_members", &self.known_members.len())
             .field("parked", &self.parked.len())
             .finish_non_exhaustive()
     }
@@ -111,7 +167,11 @@ impl CgkaController {
             member_id,
             share_secret,
             share_key,
-            parked: Vec::new(),
+            // The founder is a member by construction: their own init `Add` is
+            // self-issued and has no predecessors to authorise it against.
+            known_members: HashSet::from([member_id]),
+            parked: VecDeque::new(),
+            evicted_ops: 0,
         })
     }
 
@@ -156,6 +216,20 @@ impl CgkaController {
             return Err(CoreError::MissingInitAdd);
         }
 
+        // The init `Add` bypasses `merge` — it is handed straight to
+        // `Cgka::new_from_init_add` — so its two checks have to be repeated
+        // here, or the entire replayed history would rest on an unverified
+        // root. The founder's `Add` is self-issued, which is the one case where
+        // "the issuer introduced themselves" is legitimate; requiring that
+        // stops an attacker from presenting a log that crowns someone else.
+        init.try_verify().map_err(|_| CoreError::BadSignature)?;
+        let init_issuer = MemberId::from(*init.issuer());
+        if init_issuer != founder_id {
+            return Err(CoreError::Unauthorized {
+                issuer: init_issuer.to_bytes(),
+            });
+        }
+
         let cgka = Cgka::new_from_init_add(tree_id, founder_id, founder_pk, init.clone())?;
 
         let mut this = Self {
@@ -164,7 +238,9 @@ impl CgkaController {
             member_id,
             share_secret,
             share_key,
-            parked: Vec::new(),
+            known_members: HashSet::from([founder_id]),
+            parked: VecDeque::new(),
+            evicted_ops: 0,
         };
 
         let mut invited = founder_id == member_id;
@@ -246,6 +322,35 @@ impl CgkaController {
         self.parked.len()
     }
 
+    /// Operations discarded because the parking area was full.
+    ///
+    /// Non-zero means this node has lost control-plane history it may still
+    /// need. That is recoverable — the next neighbour exchange re-sends the log
+    /// — but a value that climbs steadily indicates a peer flooding the topic.
+    #[must_use]
+    pub fn evicted_ops(&self) -> u64 {
+        self.evicted_ops
+    }
+
+    /// Park an out-of-order operation, evicting the oldest if the queue is full.
+    fn park(&mut self, op: ControlOp) {
+        if self.parked.len() >= MAX_PARKED_OPS {
+            self.parked.pop_front();
+            self.evicted_ops += 1;
+        }
+        self.parked.push_back(op);
+    }
+
+    /// Whether an accepted `Add` has ever introduced this identity.
+    ///
+    /// This is the authorisation predicate applied to every incoming operation.
+    /// It is monotone, so it answers "was ever a member", not "is a member
+    /// now"; [`Self::group_size`] answers the latter.
+    #[must_use]
+    pub fn is_known_member(&self, member: MemberId) -> bool {
+        self.known_members.contains(&member)
+    }
+
     /// Admit a new member who has published `share_key`.
     ///
     /// Returns `None` if the member is already present. The returned operation
@@ -261,6 +366,12 @@ impl CgkaController {
     ) -> Result<Option<Signed<CgkaOperation>>, CoreError> {
         let op = now_or_never(self.cgka.add::<Local, _>(member, share_key, &self.signer))
             .ok_or(CoreError::SignerYielded)??;
+        // A locally issued `Add` applies straight to the tree without passing
+        // through `merge`, so it has to register the new member here or we
+        // would reject their very first operation as unauthorised.
+        if op.is_some() {
+            self.known_members.insert(member);
+        }
         Ok(op)
     }
 
@@ -356,21 +467,63 @@ impl CgkaController {
 
     /// Offer a remote operation to the local CGKA.
     ///
-    /// Out-of-order arrivals are parked rather than rejected; call
-    /// [`Self::merge_pending`] after any successful merge to drain them.
+    /// The operation's signature is checked first, then — once its causal
+    /// predecessors are present — its issuer is checked against the membership
+    /// this controller has accepted. Out-of-order arrivals are parked rather
+    /// than rejected; call [`Self::merge_pending`] after any successful merge to
+    /// drain them.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Cgka`] for genuine failures — an out-of-order
-    /// operation is *not* one of them.
+    /// Returns [`CoreError::BadSignature`] if the operation is forged or
+    /// tampered with, [`CoreError::Unauthorized`] if it is validly signed by a
+    /// non-member, and [`CoreError::Cgka`] for genuine tree failures. An
+    /// out-of-order operation is *not* an error.
     pub fn merge(&mut self, op: ControlOp) -> Result<MergeOutcome, CoreError> {
+        // Cheapest meaningful check, and the only context-free one: do it
+        // before the operation is allowed to occupy a slot in `parked`, so
+        // unverifiable traffic cannot accumulate.
+        op.try_verify().map_err(|_| CoreError::BadSignature)?;
+        self.merge_verified(op)
+    }
+
+    /// Merge an operation whose signature has already been checked.
+    ///
+    /// Parked operations were verified on the way in, so re-verifying them on
+    /// every drain would repeat an Ed25519 check per operation per round.
+    fn merge_verified(&mut self, op: ControlOp) -> Result<MergeOutcome, CoreError> {
         let preds: HashSet<_> = op.payload.predecessors().into_iter().collect();
         if !self.cgka.contains_predecessors(&preds) {
-            self.parked.push(op);
+            self.park(op);
             return Ok(MergeOutcome::Deferred);
         }
+
+        // Authorise only once the predecessors are in hand. Causality is what
+        // makes this sound: an operation naming its predecessors can only have
+        // been issued by someone who already saw them, so the `Add` that
+        // introduced a legitimate issuer is necessarily among the operations
+        // already accepted. Checking earlier would reject a member whose own
+        // `Add` is still in flight.
+        let issuer = MemberId::from(*op.issuer());
+        if !self.known_members.contains(&issuer) {
+            return Err(CoreError::Unauthorized {
+                issuer: issuer.to_bytes(),
+            });
+        }
+
+        // Read this before the merge consumes the operation.
+        let introduces = match op.payload {
+            CgkaOperation::Add { added_id, .. } => Some(added_id),
+            CgkaOperation::Remove { .. } | CgkaOperation::Update { .. } => None,
+        };
+
         match self.cgka.merge_concurrent_operation(op) {
-            Ok(true) => Ok(MergeOutcome::Applied),
+            Ok(true) => {
+                if let Some(added) = introduces {
+                    self.known_members.insert(added);
+                }
+                Ok(MergeOutcome::Applied)
+            }
             Ok(false) => Ok(MergeOutcome::Duplicate),
             // beekem re-checks predecessors internally; treat a race here the
             // same way we treat the check above rather than failing the peer.
@@ -383,23 +536,43 @@ impl CgkaController {
     ///
     /// Returns the number of operations that became applicable.
     ///
+    /// A parked operation that turns out to be unauthorised once its
+    /// predecessors arrive is discarded rather than reported: it was hostile,
+    /// and it must not take the legitimate operations queued behind it with it.
+    /// Anything depending on a discarded operation stays parked, which is what
+    /// surfaces the gap to the caller.
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::Cgka`] if a parked operation fails for a reason
-    /// other than missing predecessors.
+    /// other than missing predecessors — but only after the round has finished,
+    /// so the rest of the queue survives the report.
     pub fn merge_pending(&mut self) -> Result<usize, CoreError> {
         let mut total = 0;
+        let mut first_error = None;
         loop {
             let candidates = std::mem::take(&mut self.parked);
             let before = total;
             for op in candidates {
-                match self.merge(op)? {
-                    MergeOutcome::Applied => total += 1,
-                    MergeOutcome::Duplicate | MergeOutcome::Deferred => {}
+                #[allow(
+                    clippy::match_same_arms,
+                    reason = "a benign no-op and a discarded hostile operation \
+                              are the same statement but not the same decision; \
+                              collapsing them would erase why each is ignored"
+                )]
+                match self.merge_verified(op) {
+                    Ok(MergeOutcome::Applied) => total += 1,
+                    // Already known, or still waiting on predecessors — it was
+                    // re-parked by `merge_verified` either way.
+                    Ok(MergeOutcome::Duplicate | MergeOutcome::Deferred) => {}
+                    // Hostile: drop it, and specifically do not let it abort the
+                    // round and strand the legitimate operations behind it.
+                    Err(CoreError::Unauthorized { .. }) => {}
+                    Err(err) => first_error = first_error.or(Some(err)),
                 }
             }
             if total == before {
-                return Ok(total);
+                return first_error.map_or(Ok(total), Err);
             }
         }
     }

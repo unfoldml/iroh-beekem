@@ -2,8 +2,15 @@
 //!
 //! Control-plane messages carry no secrets: a `Signed<CgkaOperation>` is public,
 //! signed data, and its confidentiality is not what protects the workspace. It
-//! is broadcast over `iroh-gossip` in the clear (inside QUIC's own encryption),
-//! and every peer verifies the signature before acting on it.
+//! is broadcast over `iroh-gossip` in the clear (inside QUIC's own encryption).
+//!
+//! What *does* protect the workspace is authentication, and it happens on the
+//! receiving side rather than here. Decoding a message says nothing about who
+//! wrote it: the topic is derived from a tree id every past invitee knows, so
+//! anyone who has ever held an invite can broadcast onto it. Every operation is
+//! therefore checked for a valid signature and a known-member issuer by
+//! `CgkaController::merge` in `iroh-beekem-core` before it can touch the tree —
+//! beekem itself verifies neither. This module only frames bytes.
 
 use beekem::operation::CgkaOperation;
 use keyhive_crypto::signed::Signed;

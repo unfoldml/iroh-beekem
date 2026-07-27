@@ -271,9 +271,9 @@ impl Workspace {
                     ControlMsg::Op(op) => {
                         let effects = {
                             let mut state = control.state.lock().await;
-                            state
-                                .handle(Event::ControlOp(Arc::new(*op)), &mut rand::rngs::OsRng)
-                                .unwrap_or_default()
+                            let outcome =
+                                state.handle(Event::ControlOp(Arc::new(*op)), &mut rand::rngs::OsRng);
+                            report_rejection(outcome)
                         };
                         apply_effects(&control, effects).await;
                         ingest_all(&control).await;
@@ -283,11 +283,9 @@ impl Workspace {
                         {
                             let mut state = control.state.lock().await;
                             for op in ops {
-                                if let Ok(mut produced) = state
-                                    .handle(Event::ControlOp(Arc::new(op)), &mut rand::rngs::OsRng)
-                                {
-                                    effects.append(&mut produced);
-                                }
+                                let outcome = state
+                                    .handle(Event::ControlOp(Arc::new(op)), &mut rand::rngs::OsRng);
+                                effects.append(&mut report_rejection(outcome));
                             }
                         }
                         apply_effects(&control, effects).await;
@@ -534,6 +532,22 @@ impl Workspace {
     /// Propagates router shutdown failures.
     pub async fn shutdown(&self) -> Result<(), WorkspaceError> {
         self.node.shutdown().await
+    }
+}
+
+/// Unwrap the effects of handling a control operation, logging any rejection.
+///
+/// A rejected operation is a normal, expected outcome on a public topic that
+/// anyone with an old invite can reach — it is not a reason to tear down the
+/// pump. It is, however, exactly the event an operator wants to see, so it is
+/// logged rather than discarded the way an ordinary `unwrap_or_default` would.
+fn report_rejection(outcome: Result<Vec<Effect>, iroh_beekem_core::CoreError>) -> Vec<Effect> {
+    match outcome {
+        Ok(effects) => effects,
+        Err(err) => {
+            tracing::warn!(%err, "rejected an incoming control operation");
+            Vec::new()
+        }
     }
 }
 

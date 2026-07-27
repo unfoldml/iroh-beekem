@@ -2,12 +2,40 @@
 
 use beekem::error::CgkaError;
 
+use crate::manifest::hex;
+
 /// Everything that can go wrong inside the I/O-free core.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
     /// A CGKA operation failed.
     #[error(transparent)]
     Cgka(#[from] CgkaError),
+
+    /// A control-plane operation carried an invalid signature.
+    ///
+    /// beekem verifies nothing: neither `Cgka::merge_concurrent_operation` nor
+    /// `Cgka::apply_operation` looks at the signature, and the control plane is
+    /// a public gossip topic derived from a tree id that every past invitee
+    /// knows. This check is therefore the only thing between that topic and a
+    /// forged membership change.
+    #[error("control operation signature verification failed")]
+    BadSignature,
+
+    /// A correctly-signed operation was issued by a key that no `Add` in the
+    /// accepted history ever named.
+    ///
+    /// A valid signature only proves the issuer signed its own message; it says
+    /// nothing about whether that issuer belongs to this group. Without this
+    /// second check anyone could mint a keypair and sign themselves an `Add`.
+    ///
+    /// The issuer is kept as raw bytes rather than a `MemberId`, which wraps an
+    /// expanded Ed25519 point and would make every `Result` in the crate pay
+    /// for the error variant.
+    #[error("control operation issued by a non-member: {}", hex(issuer))]
+    Unauthorized {
+        /// The issuing verifying key, which no accepted `Add` introduced.
+        issuer: [u8; 32],
+    },
 
     /// Authenticated decryption or encryption failed.
     #[error("AEAD operation failed")]

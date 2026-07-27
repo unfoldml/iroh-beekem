@@ -19,7 +19,7 @@
 //! source of silent data loss in the whole system, which is why
 //! [`WorkspaceState::pending_len`] is exposed for properties to assert on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use beekem::{id::MemberId, operation::CgkaOperation};
 use keyhive_crypto::{share_key::ShareKey, signed::Signed};
@@ -33,6 +33,22 @@ use crate::{
     keys::{CgkaController, ControlOp, MergeOutcome},
     manifest::Manifest,
 };
+
+/// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
+///
+/// A count limit would be the wrong shape here: chunks carry whole document
+/// histories, so a hundred of them and a hundred thousand of them differ by
+/// orders of magnitude in memory. The budget is on bytes for that reason, with
+/// [`MAX_PENDING_CHUNKS`] as a second guard against a flood of tiny ones.
+///
+/// Unlike a parked control operation, an evicted chunk is *not* recoverable
+/// from a peer exchange — it comes back only on the next resync. The budget is
+/// therefore generous: eviction here means losing content until someone
+/// re-announces, so it should be a genuine last resort.
+const MAX_PENDING_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many chunks may be parked at once, regardless of their size.
+const MAX_PENDING_CHUNKS: usize = 4096;
 
 /// Something that happened to this node.
 #[derive(Debug, Clone)]
@@ -110,7 +126,14 @@ pub struct WorkspaceState {
     manifest: Manifest,
     docs: HashMap<DocumentUuid, LoroDoc>,
     /// Chunks that could not yet be decrypted or merged.
-    pending_chunks: Vec<(DocumentUuid, Chunk)>,
+    pending_chunks: VecDeque<(DocumentUuid, Chunk)>,
+    /// Running total of `ciphertext` bytes held in `pending_chunks`.
+    ///
+    /// Tracked incrementally because the budget is checked on every arrival and
+    /// summing the queue each time would make ingestion quadratic.
+    pending_bytes: usize,
+    /// Chunks dropped because the pending budget was exhausted.
+    evicted_chunks: u64,
 }
 
 impl Clone for WorkspaceState {
@@ -146,6 +169,8 @@ impl Clone for WorkspaceState {
             manifest,
             docs,
             pending_chunks: self.pending_chunks.clone(),
+            pending_bytes: self.pending_bytes,
+            evicted_chunks: self.evicted_chunks,
         }
     }
 }
@@ -170,7 +195,9 @@ impl WorkspaceState {
             secret,
             manifest: Manifest::new(),
             docs: HashMap::new(),
-            pending_chunks: Vec::new(),
+            pending_chunks: VecDeque::new(),
+            pending_bytes: 0,
+            evicted_chunks: 0,
         }
     }
 
@@ -247,7 +274,7 @@ impl WorkspaceState {
                         && c.pcs_key_hash == chunk.pcs_key_hash
                 });
                 if !already_parked {
-                    self.pending_chunks.push((doc, *chunk));
+                    self.park_chunk(doc, *chunk);
                 }
                 self.drain_pending()
             }
