@@ -189,6 +189,113 @@ async fn edits_propagate_from_a_joiner_back_to_the_founder() {
 }
 
 #[tokio::test]
+async fn the_manifest_and_its_roles_reach_a_joiner_over_quic() {
+    use iroh_beekem_core::{FileEntry, Role};
+
+    let Pair { alice, bob, bob_id } = invited_pair(50).await;
+
+    alice
+        .upsert_file(FileEntry {
+            uuid: DOC,
+            logical_path: "/finance/q3.json".into(),
+            mime_type: "application/json".into(),
+        })
+        .await
+        .expect("alice records the document's path");
+
+    // Logical paths exist only inside the encrypted manifest — `iroh-docs` sees
+    // a blinded 32-byte key and nothing else — so this arriving at all proves
+    // the manifest was encrypted, stored at its well-known key, synced, fetched
+    // and decrypted.
+    eventually(
+        "bob sees the document's logical path",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.files()
+                .await
+                .iter()
+                .any(|f| f.logical_path == "/finance/q3.json")
+        },
+    )
+    .await;
+
+    let roles = bob.roles().await;
+    assert!(
+        roles
+            .iter()
+            .any(|(m, r)| *m == bob_id.to_bytes() && *r == Role::Editor),
+        "an admitted member should have been given a writing role, got {roles:?}"
+    );
+
+    alice.shutdown().await.expect("alice shuts down");
+    bob.shutdown().await.expect("bob shuts down");
+}
+
+#[tokio::test]
+async fn content_still_flows_across_a_key_rotation() {
+    let Pair { alice, bob, .. } = invited_pair(70).await;
+
+    alice.append("before rotation. ").await.expect("alice writes");
+    eventually(
+        "bob reads before the rotation",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.text().await.contains("before rotation")
+        },
+    )
+    .await;
+
+    // Post-compromise security: after this, alice's old leaf secret derives no
+    // further group key. The group must keep working across it, which is the
+    // part a rotation can silently break.
+    bob.rotate().await.expect("bob rotates his leaf key");
+
+    alice.append("after rotation.").await.expect("alice writes again");
+    eventually(
+        "bob reads across the rotation",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.text().await.contains("after rotation")
+        },
+    )
+    .await;
+
+    alice.shutdown().await.expect("alice shuts down");
+    bob.shutdown().await.expect("bob shuts down");
+}
+
+#[tokio::test]
+async fn a_joiner_cannot_revoke_the_founder() {
+    let Pair { alice, bob, .. } = invited_pair(60).await;
+    let alice_id = alice.member_id().await;
+
+    // Bob is an editor, not an admin. Membership changes are an admin action,
+    // and this is the check that was specified in the manifest but never called.
+    let result = bob.revoke(alice_id).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(iroh_beekem::WorkspaceError::Core(
+                iroh_beekem_core::CoreError::NotAnAdmin
+            ))
+        ),
+        "a non-admin member must not be able to revoke anyone, got {result:?}"
+    );
+    assert_eq!(
+        alice.group_size().await,
+        2,
+        "the refused revocation must have left the group intact"
+    );
+
+    alice.shutdown().await.expect("alice shuts down");
+    bob.shutdown().await.expect("bob shuts down");
+}
+
+#[tokio::test]
 async fn a_revoked_member_cannot_read_later_edits() {
     let Pair { alice, bob, bob_id } = invited_pair(40).await;
 

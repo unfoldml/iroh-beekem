@@ -182,6 +182,14 @@ pub struct WorkspaceState {
     pending_bytes: usize,
     /// Chunks dropped because the pending budget was exhausted.
     evicted_chunks: u64,
+    /// The most recent chunk this node published or applied, per document.
+    ///
+    /// This is what makes each chunk's key causally bound rather than bound to
+    /// nothing: beekem mixes the predecessor refs into the derived application
+    /// secret, so a chunk names the state it follows. The receiver does not
+    /// need the predecessor chunk to decrypt — the digest travels inside the
+    /// ciphertext's metadata — so this costs nothing in liveness.
+    last_ref: HashMap<DocumentUuid, ChunkRef>,
 }
 
 impl Clone for WorkspaceState {
@@ -219,6 +227,7 @@ impl Clone for WorkspaceState {
             pending_chunks: self.pending_chunks.clone(),
             pending_bytes: self.pending_bytes,
             evicted_chunks: self.evicted_chunks,
+            last_ref: self.last_ref.clone(),
         }
     }
 }
@@ -250,6 +259,7 @@ impl WorkspaceState {
             pending_chunks: VecDeque::new(),
             pending_bytes: 0,
             evicted_chunks: 0,
+            last_ref: HashMap::new(),
         }
     }
 
@@ -530,8 +540,10 @@ impl WorkspaceState {
             .export(ExportMode::all_updates())
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
 
-        let preds: Vec<ChunkRef> = Vec::new();
+        // Bind this chunk to the last state we know of for this document.
+        let preds: Vec<ChunkRef> = self.last_ref.get(&doc).copied().into_iter().collect();
         let (chunk, implicit_op) = self.cgka.encrypt(&update, &preds, csprng)?;
+        self.last_ref.insert(doc, chunk.content_ref);
 
         let mut effects = Vec::new();
         // The implicit PCS update must go out *before* anything else can read
@@ -606,6 +618,12 @@ impl WorkspaceState {
         let loro = self.docs.entry(doc).or_default();
         // Loro reports its own missing dependencies separately from the
         // key-availability question; both mean "not yet".
-        matches!(loro.import(&plaintext), Ok(status) if status.pending.is_none())
+        let applied = matches!(loro.import(&plaintext), Ok(status) if status.pending.is_none());
+        if applied {
+            // Anything we publish next genuinely follows this chunk, so it is
+            // the predecessor to name.
+            self.last_ref.insert(doc, chunk.content_ref);
+        }
+        applied
     }
 }

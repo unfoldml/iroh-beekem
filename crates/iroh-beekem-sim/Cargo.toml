@@ -14,13 +14,16 @@ beekem.workspace = true
 keyhive_crypto.workspace = true
 rand.workspace = true
 rand_chacha = "0.3"
-propsim-core = { git = "https://github.com/unfoldml/propsim" }
+# Pinned to a revision: `propsim` is unpublished and has no semver, so an
+# unpinned git dependency would silently change what the property tests mean
+# from one checkout to the next.
+propsim-core = { git = "https://github.com/unfoldml/propsim", rev = "fc358b00afe68478b9a575d5e2814c3b75438e26" }
 
 [dev-dependencies]
 # `propsim` is not published on crates.io; only propsim-core and propsim-sim
 # (Tiers 1 and 2) are usable today. The Elle/Jepsen backends and `propsim-iroh`
 # are shape-only stubs, so nothing here depends on them.
-propsim = { git = "https://github.com/unfoldml/propsim" }
+propsim = { git = "https://github.com/unfoldml/propsim", rev = "fc358b00afe68478b9a575d5e2814c3b75438e26" }
 
 [lints]
 workspace = true

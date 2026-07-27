@@ -14,7 +14,7 @@ use beekem::{
 use bytes::Bytes;
 use iroh::EndpointId;
 use iroh_beekem_core::{
-    CgkaController, DocumentUuid, Effect, Event, WorkspaceSecret, WorkspaceState,
+    CgkaController, DocumentUuid, Effect, Event, FileEntry, Role, WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{
@@ -240,7 +240,7 @@ impl Workspace {
             .subscribe(topic, bootstrap)
             .await
             .map_err(|e| WorkspaceError::Gossip(e.to_string()))?;
-        let (gossip_tx, mut gossip_rx) = gossip_topic.split();
+        let (gossip_tx, gossip_rx) = gossip_topic.split();
 
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
@@ -269,87 +269,15 @@ impl Workspace {
 
         // Control plane: CGKA operations arriving over gossip.
         let control = Arc::clone(&inner);
-        let control_task = tokio::spawn(async move {
-            while let Some(event) = gossip_rx.next().await {
-                let msg = match event {
-                    Ok(GossipEvent::Received(msg)) => msg,
-                    // A peer just joined the overlay. They cannot decrypt
-                    // anything written before they were admitted — that is
-                    // forward secrecy — so re-publish current state under the
-                    // present epoch key, which they *can* derive. This is the
-                    // moment to do it: before now they were not listening.
-                    Ok(GossipEvent::NeighborUp(_)) => {
-                        // Order matters: the peer needs our operation log
-                        // before it can derive the key for anything we
-                        // re-publish afterwards.
-                        send_log(&control).await;
-                        republish(&control).await;
-                        continue;
-                    }
-                    _ => continue,
-                };
-                let Ok(decoded) = ControlMsg::decode(&msg.content) else {
-                    continue;
-                };
-                match decoded {
-                    ControlMsg::Op(op) => {
-                        let effects = {
-                            let mut state = control.state.lock().await;
-                            let outcome =
-                                state.handle(Event::ControlOp(Arc::new(*op)), &mut rand::rngs::OsRng);
-                            report_rejection(outcome)
-                        };
-                        apply_effects(&control, effects).await;
-                        ingest_all(&control).await;
-                    }
-                    ControlMsg::Log(ops) => {
-                        if ops.len() > MAX_LOG_OPS {
-                            tracing::warn!(
-                                len = ops.len(),
-                                "discarding an oversized operation log"
-                            );
-                            continue;
-                        }
-                        let mut effects = Vec::new();
-                        {
-                            let mut state = control.state.lock().await;
-                            for op in ops {
-                                let outcome = state
-                                    .handle(Event::ControlOp(Arc::new(op)), &mut rand::rngs::OsRng);
-                                effects.append(&mut report_rejection(outcome));
-                            }
-                        }
-                        apply_effects(&control, effects).await;
-                        // Newly recovered key material may unlock chunks that
-                        // have been parked since before this peer caught up.
-                        ingest_all(&control).await;
-                    }
-                    // The index sync will surface the entry; the announce only
-                    // prompts us to look sooner.
-                    ControlMsg::Announce { .. } => {
-                        ingest_all(&control).await;
-                    }
-                }
-            }
-        });
+        let control_task = tokio::spawn(control_loop(control, gossip_rx));
 
         // Data plane: entries and content arriving over docs and blobs.
         let data = Arc::clone(&inner);
-        let mut doc_events = doc
+        let doc_events = doc
             .subscribe()
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
-        let data_task = tokio::spawn(async move {
-            while let Some(event) = doc_events.next().await {
-                // `InsertRemote` fires when the index entry lands, which may be
-                // before the payload has been fetched; `ContentReady` fires
-                // once the bytes are actually local. React to both, so a
-                // payload that happened to be present already is not missed.
-                if let Ok(LiveEvent::InsertRemote { .. } | LiveEvent::ContentReady { .. }) = event {
-                    ingest_all(&data).await;
-                }
-            }
-        });
+        let data_task = tokio::spawn(data_loop(data, doc_events));
 
         Ok(Self {
             node,
@@ -390,6 +318,11 @@ impl Workspace {
     #[must_use]
     pub fn tree_id(&self) -> TreeId {
         self.tree_id
+    }
+
+    /// This node's identity in the CGKA tree.
+    pub async fn member_id(&self) -> MemberId {
+        self.inner.state.lock().await.member_id()
     }
 
     /// The control-plane gossip topic.
@@ -449,6 +382,29 @@ impl Workspace {
         Ok(())
     }
 
+    /// Rotate this member's leaf key, re-keying its path to the root.
+    ///
+    /// This is the post-compromise security primitive, and the reason BeeKEM is
+    /// here rather than a static group key: an attacker holding this member's
+    /// old leaf secret can derive no group key produced after the rotation.
+    /// Recovery from a compromise is therefore something a member can do
+    /// unilaterally, without the group re-forming around them.
+    ///
+    /// Needs no administrative role — rotating your own key harms nobody, and
+    /// requiring permission to recover from a compromise would be backwards.
+    ///
+    /// # Errors
+    ///
+    /// Propagates CGKA failures.
+    pub async fn rotate(&self) -> Result<(), WorkspaceError> {
+        let effects = {
+            let mut state = self.inner.state.lock().await;
+            state.handle(Event::Rotate, &mut rand::rngs::OsRng)?
+        };
+        apply_effects(&self.inner, effects).await;
+        Ok(())
+    }
+
     /// Append text to the workspace document.
     ///
     /// # Errors
@@ -492,6 +448,81 @@ impl Workspace {
             state.handle(
                 Event::Resync {
                     doc: self.inner.document,
+                },
+                &mut rand::rngs::OsRng,
+            )?
+        };
+        apply_effects(&self.inner, effects).await;
+        Ok(())
+    }
+
+    /// Every document the manifest records, with its logical path.
+    pub async fn files(&self) -> Vec<FileEntry> {
+        self.inner.state.lock().await.manifest().files()
+    }
+
+    /// Every role assignment the manifest records.
+    pub async fn roles(&self) -> Vec<([u8; 32], Role)> {
+        self.inner.state.lock().await.manifest().roles()
+    }
+
+    /// Record or replace a document's metadata in the manifest.
+    ///
+    /// Logical paths live only here, never in `iroh-docs`, which sees a blinded
+    /// 32-byte key and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and manifest failures.
+    pub async fn upsert_file(&self, entry: FileEntry) -> Result<(), WorkspaceError> {
+        let effects = {
+            let mut state = self.inner.state.lock().await;
+            state.handle(Event::UpsertFile { entry }, &mut rand::rngs::OsRng)?
+        };
+        apply_effects(&self.inner, effects).await;
+        Ok(())
+    }
+
+    /// Move or rename a document.
+    ///
+    /// Touches only the manifest: the document's UUID, and therefore its
+    /// blinded key and every chunk already stored under it, are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Core`] wrapping `UnknownDocument` if the
+    /// manifest has no such document.
+    pub async fn rename(&self, doc: DocumentUuid, path: &str) -> Result<(), WorkspaceError> {
+        let effects = {
+            let mut state = self.inner.state.lock().await;
+            state.handle(
+                Event::RenameFile {
+                    doc,
+                    path: path.to_string(),
+                },
+                &mut rand::rngs::OsRng,
+            )?
+        };
+        apply_effects(&self.inner, effects).await;
+        Ok(())
+    }
+
+    /// Assign a role to a member.
+    ///
+    /// Demoting an admin who stays in the workspace is a pure manifest edit
+    /// with no key rotation; removing them entirely also needs [`Self::revoke`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` if this node is
+    /// not an admin, or `LastAdmin` if the change would leave none.
+    pub async fn set_role(&self, member: MemberId, role: Role) -> Result<(), WorkspaceError> {
+        let effects = {
+            let mut state = self.inner.state.lock().await;
+            state.handle(
+                Event::SetRole {
+                    member: member.to_bytes(),
+                    role,
                 },
                 &mut rand::rngs::OsRng,
             )?
@@ -563,6 +594,86 @@ impl Workspace {
     /// Propagates router shutdown failures.
     pub async fn shutdown(&self) -> Result<(), WorkspaceError> {
         self.node.shutdown().await
+    }
+}
+
+/// Pump the control plane: verified CGKA operations arriving over gossip.
+async fn control_loop<E>(
+    inner: Arc<Inner>,
+    mut gossip_rx: impl n0_future::Stream<Item = Result<GossipEvent, E>> + Unpin,
+) {
+    while let Some(event) = gossip_rx.next().await {
+        let msg = match event {
+            Ok(GossipEvent::Received(msg)) => msg,
+            // A peer just joined the overlay. They cannot decrypt anything
+            // written before they were admitted — that is forward secrecy — so
+            // re-publish current state under the present epoch key, which they
+            // *can* derive. This is the moment to do it: before now they were
+            // not listening.
+            Ok(GossipEvent::NeighborUp(_)) => {
+                // Order matters: the peer needs our operation log before it can
+                // derive the key for anything we re-publish afterwards.
+                send_log(&inner).await;
+                republish(&inner).await;
+                continue;
+            }
+            _ => continue,
+        };
+        let Ok(decoded) = ControlMsg::decode(&msg.content) else {
+            continue;
+        };
+        match decoded {
+            ControlMsg::Op(op) => {
+                let effects = {
+                    let mut state = inner.state.lock().await;
+                    report_rejection(
+                        state.handle(Event::ControlOp(Arc::new(*op)), &mut rand::rngs::OsRng),
+                    )
+                };
+                apply_effects(&inner, effects).await;
+                ingest_all(&inner).await;
+            }
+            ControlMsg::Log(ops) => {
+                if ops.len() > MAX_LOG_OPS {
+                    tracing::warn!(len = ops.len(), "discarding an oversized operation log");
+                    continue;
+                }
+                let mut effects = Vec::new();
+                {
+                    let mut state = inner.state.lock().await;
+                    for op in ops {
+                        let outcome =
+                            state.handle(Event::ControlOp(Arc::new(op)), &mut rand::rngs::OsRng);
+                        effects.append(&mut report_rejection(outcome));
+                    }
+                }
+                apply_effects(&inner, effects).await;
+                // Newly recovered key material may unlock chunks that have been
+                // parked since before this peer caught up.
+                ingest_all(&inner).await;
+            }
+            // The index sync will surface the entry; the announce only prompts
+            // us to look sooner.
+            ControlMsg::Announce { .. } => {
+                ingest_all(&inner).await;
+            }
+        }
+    }
+}
+
+/// Pump the data plane: entries and payloads arriving over docs and blobs.
+async fn data_loop<E>(
+    inner: Arc<Inner>,
+    mut doc_events: impl n0_future::Stream<Item = Result<LiveEvent, E>> + Unpin,
+) {
+    while let Some(event) = doc_events.next().await {
+        // `InsertRemote` fires when the index entry lands, which may be before
+        // the payload has been fetched; `ContentReady` fires once the bytes are
+        // actually local. React to both, so a payload that happened to be
+        // present already is not missed.
+        if let Ok(LiveEvent::InsertRemote { .. } | LiveEvent::ContentReady { .. }) = event {
+            ingest_all(&inner).await;
+        }
     }
 }
 

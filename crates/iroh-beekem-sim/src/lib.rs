@@ -24,7 +24,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::{sync::Arc, time::Duration};
+use std::{marker::PhantomData, sync::Arc, time::Duration};
 
 use beekem::{
     id::{MemberId, TreeId},
@@ -75,6 +75,63 @@ const RESYNC_INTERVAL: Duration = Duration::from_millis(400);
 /// How many times a node re-announces before going quiet, so runs terminate.
 const MAX_RESYNCS: u32 = 8;
 
+/// How often a rotating node re-keys its leaf.
+const ROTATE_INTERVAL: Duration = Duration::from_millis(350);
+
+/// When the first rotation happens, once the group has had time to form.
+const FIRST_ROTATE: Duration = Duration::from_millis(700);
+
+/// How many times a node rotates before going quiet, so runs terminate.
+const MAX_ROTATIONS: u32 = 12;
+
+/// When the founder revokes the victim, in scenarios that revoke.
+///
+/// Deliberately late enough that the victim has stopped writing, and early
+/// enough that rotations are still in flight — a `Remove` concurrent with an
+/// `Update` is the interleaving BeeKEM claims to handle and MLS/TreeKEM cannot.
+const REVOKE_AT: Duration = Duration::from_millis(3600);
+
+/// How often a forging node emits an operation signed by a non-member key.
+const FORGE_INTERVAL: Duration = Duration::from_millis(300);
+
+/// How many forgeries an attacking node attempts.
+const MAX_FORGERIES: u32 = 10;
+
+/// What a simulated run exercises beyond the honest base protocol.
+///
+/// A compile-time parameter rather than a runtime field because `propsim`
+/// builds nodes through [`Default`]: there is no constructor to pass a config
+/// to, and a global would break the determinism the whole harness rests on.
+pub trait Scenario: Clone + Default + 'static {
+    /// Whether nodes periodically re-key their leaf (post-compromise security).
+    const ROTATE: bool = false;
+    /// Which node the founder revokes partway through, if any.
+    const REVOKE: Option<u64> = None;
+    /// Whether non-founder nodes also broadcast operations signed by a key that
+    /// no `Add` ever introduced.
+    const FORGE: bool = false;
+}
+
+/// The base protocol: joins, edits and anti-entropy, nothing adversarial.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Honest;
+impl Scenario for Honest {}
+
+/// Concurrent key rotation and membership revocation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Churn;
+impl Scenario for Churn {
+    const ROTATE: bool = true;
+    const REVOKE: Option<u64> = Some(2);
+}
+
+/// An attacker on the control plane, signing operations with an unrelated key.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Forging;
+impl Scenario for Forging {
+    const FORGE: bool = true;
+}
+
 /// Messages exchanged between simulated nodes.
 #[derive(Clone, Debug)]
 pub enum Msg {
@@ -123,6 +180,12 @@ pub enum Tick {
     Edit,
     /// Time to re-announce local document state (anti-entropy).
     Resync,
+    /// Time to re-key this node's leaf.
+    Rotate,
+    /// Time for the founder to revoke the scenario's victim.
+    Revoke,
+    /// Time for an attacking node to emit a forged operation.
+    Forge,
 }
 
 /// One simulated workspace participant.
@@ -130,7 +193,7 @@ pub enum Tick {
 /// Constructed by the simulator via [`Default`], then bootstrapped in
 /// [`Node::on_start`] once `cx.me()` reveals which node this is.
 #[derive(Clone, Default)]
-pub struct WorkspaceNode {
+pub struct WorkspaceNode<S: Scenario = Honest> {
     state: Option<WorkspaceState>,
     signer: Option<MemorySigner>,
     share_secret: Option<ShareSecretKey>,
@@ -138,11 +201,16 @@ pub struct WorkspaceNode {
     inbox: Vec<Msg>,
     edits_made: u32,
     resyncs_done: u32,
+    rotations_done: u32,
+    forgeries_made: u32,
+    /// This node's own id, recorded at start so properties can identify it.
+    me: u64,
     /// Text this node has contributed locally, for convergence assertions.
     contributed: Vec<String>,
+    _scenario: PhantomData<S>,
 }
 
-impl std::fmt::Debug for WorkspaceNode {
+impl<S: Scenario> std::fmt::Debug for WorkspaceNode<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkspaceNode")
             .field("joined", &self.state.is_some())
@@ -171,7 +239,19 @@ fn workspace_secret_bytes() -> [u8; 32] {
     [0x5Au8; 32]
 }
 
-impl WorkspaceNode {
+impl<S: Scenario> WorkspaceNode<S> {
+    /// This node's simulator id.
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.me
+    }
+
+    /// Whether this node is the one the scenario revokes.
+    #[must_use]
+    pub fn is_revocation_target(&self) -> bool {
+        S::REVOKE == Some(self.me)
+    }
+
     /// Whether this node has joined the group.
     #[must_use]
     pub fn has_joined(&self) -> bool {
@@ -267,6 +347,25 @@ impl WorkspaceNode {
         }
     }
 
+    /// Broadcast an operation signed by a key no `Add` ever introduced.
+    ///
+    /// The signature is genuine — the attacker really does hold this key — so
+    /// only the membership check can stop it. A well-formed `Add` naming the
+    /// attacker is the highest-value forgery available: applied, it would splice
+    /// an attacker's leaf into the tree and hand them every subsequent key.
+    fn forge(&mut self, cx: &mut dyn Ctx<Self>) {
+        let rogue = MemorySigner::generate(&mut node_rng(NodeId(self.me), 0xDEAD));
+        let rogue_secret = ShareSecretKey::generate(&mut node_rng(NodeId(self.me), 0xBEE5));
+        let op = CgkaOperation::init_add(
+            tree_id(),
+            MemberId::from(rogue.verifying_key()),
+            rogue_secret.share_key(),
+        );
+        if let Ok(signed) = rogue.try_sign_sync(op) {
+            cx.broadcast(Msg::Op(Box::new(signed)));
+        }
+    }
+
     fn on_hello(
         &mut self,
         from: NodeId,
@@ -314,7 +413,7 @@ impl WorkspaceNode {
     }
 }
 
-impl Node for WorkspaceNode {
+impl<S: Scenario> Node for WorkspaceNode<S> {
     type Msg = Msg;
     type Timer = Tick;
     type Op = ();
@@ -322,6 +421,7 @@ impl Node for WorkspaceNode {
 
     fn on_start(&mut self, cx: &mut dyn Ctx<Self>) {
         let me = cx.me();
+        self.me = me.0;
         let signer = MemorySigner::generate(&mut node_rng(me, 0xA1));
         let share_secret = ShareSecretKey::generate(&mut node_rng(me, 0xB2));
         self.signer = Some(signer.clone());
@@ -343,6 +443,20 @@ impl Node for WorkspaceNode {
 
         cx.set_timer(Tick::Edit, FIRST_EDIT);
         cx.set_timer(Tick::Resync, RESYNC_INTERVAL);
+
+        // The victim does not rotate: an operation it issued after its own
+        // removal could never be applied by anyone, and would sit parked on
+        // every honest node forever — a property failure about the scenario
+        // rather than about the protocol.
+        if S::ROTATE && !self.is_revocation_target() {
+            cx.set_timer(Tick::Rotate, FIRST_ROTATE);
+        }
+        if me.0 == FOUNDER && S::REVOKE.is_some() {
+            cx.set_timer(Tick::Revoke, REVOKE_AT);
+        }
+        if S::FORGE && me.0 != FOUNDER {
+            cx.set_timer(Tick::Forge, FORGE_INTERVAL);
+        }
     }
 
     fn on_msg(&mut self, from: NodeId, msg: Msg, cx: &mut dyn Ctx<Self>) {
@@ -385,6 +499,31 @@ impl Node for WorkspaceNode {
                 self.resyncs_done += 1;
                 if self.resyncs_done < MAX_RESYNCS {
                     cx.set_timer(Tick::Resync, RESYNC_INTERVAL);
+                }
+            }
+            Tick::Rotate => {
+                if self.state.is_some() {
+                    self.drive(Event::Rotate, cx, 7 + u64::from(self.rotations_done));
+                    self.rotations_done += 1;
+                }
+                if self.rotations_done < MAX_ROTATIONS {
+                    cx.set_timer(Tick::Rotate, ROTATE_INTERVAL);
+                }
+            }
+            Tick::Revoke => {
+                if let Some(victim) = S::REVOKE {
+                    // Every node's key material is a pure function of its id,
+                    // so the founder can name the victim without a lookup.
+                    let victim_signer = MemorySigner::generate(&mut node_rng(NodeId(victim), 0xA1));
+                    let member = MemberId::from(victim_signer.verifying_key());
+                    self.drive(Event::RemoveMember { member }, cx, 0xBEEF);
+                }
+            }
+            Tick::Forge => {
+                self.forge(cx);
+                self.forgeries_made += 1;
+                if self.forgeries_made < MAX_FORGERIES {
+                    cx.set_timer(Tick::Forge, FORGE_INTERVAL);
                 }
             }
         }
