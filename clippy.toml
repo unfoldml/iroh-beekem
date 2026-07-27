@@ -1,0 +1,19 @@
+# Protocol, product and algorithm names that appear in prose. Without these,
+# `clippy::doc_markdown` demands backticks, which would wrongly render them as
+# code items.
+doc-valid-idents = [
+    "BeeKEM",
+    "TreeKEM",
+    "CGKA",
+    "MLS",
+    "QUIC",
+    "BLAKE3",
+    "ChaCha20",
+    "CRDT",
+    "CRDTs",
+    "RBSR",
+    "NAT",
+    "PCS",
+    "AEAD",
+    "..",
+]

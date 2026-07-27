@@ -1,0 +1,26 @@
+[package]
+name = "iroh-beekem-sim"
+description = "Deterministic simulation and property tests for the iroh-beekem workspace protocol."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+iroh-beekem-core = { path = "../iroh-beekem-core" }
+beekem.workspace = true
+keyhive_crypto.workspace = true
+rand.workspace = true
+rand_chacha = "0.3"
+propsim-core = { git = "https://github.com/unfoldml/propsim" }
+
+[dev-dependencies]
+# `propsim` is not published on crates.io; only propsim-core and propsim-sim
+# (Tiers 1 and 2) are usable today. The Elle/Jepsen backends and `propsim-iroh`
+# are shape-only stubs, so nothing here depends on them.
+propsim = { git = "https://github.com/unfoldml/propsim" }
+
+[lints]
+workspace = true
