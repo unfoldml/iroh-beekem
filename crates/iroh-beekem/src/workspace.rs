@@ -155,7 +155,8 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
-        Self::assemble(node, cgka, secret, doc, tree_id, document, Vec::new()).await
+        let state = WorkspaceState::found(cgka, WorkspaceSecret::new(secret.to_bytes()))?;
+        Self::assemble(node, state, secret, doc, tree_id, document, Vec::new()).await
     }
 
     /// Join an existing workspace from an [`Invite`].
@@ -196,9 +197,10 @@ impl Workspace {
         // peer each node forms its own disjoint overlay and no CGKA operation
         // ever crosses between them — the data plane would sync while the
         // control plane silently did not, leaving every chunk undecryptable.
+        let state = WorkspaceState::joined(cgka, WorkspaceSecret::new(secret.to_bytes()));
         let workspace = Self::assemble(
             node,
-            cgka,
+            state,
             secret,
             doc,
             tree_id,
@@ -213,7 +215,7 @@ impl Workspace {
     /// Wire up the pump loops shared by [`Self::create`] and [`Self::join`].
     async fn assemble(
         node: Node,
-        cgka: CgkaController,
+        state: WorkspaceState,
         secret: WorkspaceSecret,
         doc: Doc,
         tree_id: TreeId,
@@ -241,10 +243,7 @@ impl Workspace {
         let (gossip_tx, mut gossip_rx) = gossip_topic.split();
 
         let inner = Arc::new(Inner {
-            state: Mutex::new(WorkspaceState::new(
-                cgka,
-                WorkspaceSecret::new(secret.to_bytes()),
-            )),
+            state: Mutex::new(state),
             blobs: node.blobs().clone(),
             doc: doc.clone(),
             author,
@@ -252,6 +251,21 @@ impl Workspace {
             secret,
             document,
         });
+
+        // Claim this workspace's author identity in the manifest. Until a peer
+        // has seen this, it has no way to connect entries signed by this author
+        // to the member the roles are written about, and will refuse them. This
+        // also performs the manifest's first write to the replica.
+        let announce = {
+            let mut state = inner.state.lock().await;
+            report_rejection(state.handle(
+                Event::AnnounceAuthor {
+                    author: author.to_bytes(),
+                },
+                &mut rand::rngs::OsRng,
+            ))
+        };
+        apply_effects(&inner, announce).await;
 
         // Control plane: CGKA operations arriving over gossip.
         let control = Arc::clone(&inner);
@@ -617,7 +631,12 @@ async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
                     tracing::error!(%err, "failed to store an encrypted chunk");
                 }
             }
-            Effect::Applied { .. } => {}
+            Effect::StoreManifest { key, chunk } => {
+                if let Err(err) = store_chunk(inner, key.as_bytes(), &chunk).await {
+                    tracing::error!(%err, "failed to store the encrypted manifest");
+                }
+            }
+            Effect::Applied { .. } | Effect::ManifestUpdated => {}
         }
     }
 }
@@ -654,40 +673,91 @@ async fn store_chunk(
 /// Entries whose payload has not been fetched yet are skipped; the next
 /// `ContentReady` event brings us back here.
 async fn ingest_all(inner: &Inner) {
+    // Manifest first. Document entries are accepted based on whether their
+    // author holds a writing role, and that mapping lives in the manifest — so
+    // ingesting documents first would reject entries purely because the roles
+    // proving them legitimate had not been read yet.
+    let manifest_key = inner.secret.manifest_key();
+    for chunk in fetch_chunks(inner, manifest_key.as_bytes(), false).await {
+        let effects = {
+            let mut state = inner.state.lock().await;
+            report_rejection(state.handle(
+                Event::ManifestArrived {
+                    chunk: Box::new(chunk),
+                },
+                &mut rand::rngs::OsRng,
+            ))
+        };
+        apply_effects(inner, effects).await;
+    }
+
     let key = inner.secret.storage_key(inner.document);
+    for chunk in fetch_chunks(inner, key.as_bytes(), true).await {
+        let effects = {
+            let mut state = inner.state.lock().await;
+            report_rejection(state.handle(
+                Event::ChunkArrived {
+                    doc: inner.document,
+                    chunk: Box::new(chunk),
+                },
+                &mut rand::rngs::OsRng,
+            ))
+        };
+        apply_effects(inner, effects).await;
+    }
+}
+
+/// Read and decode every locally-available payload stored under one blinded key.
+///
+/// When `check_author` is set, entries whose author the manifest does not
+/// recognise as a writer are skipped. This is the check README limitation 1
+/// asks for: the `iroh-docs` write capability is all-or-nothing, so a revoked
+/// member keeps it and can still push entries into the replica — including
+/// overwriting the entry at a document's key, since every chunk for a document
+/// lands at the same one. Refusing their entries here is what stops that from
+/// being a rollback channel.
+///
+/// The manifest itself is exempt, and has to be: the mapping that identifies
+/// legitimate authors is *inside* it, so requiring the check to pass before
+/// reading it could never bootstrap. It is protected instead by the CGKA — a
+/// non-member cannot produce a manifest this node can decrypt.
+async fn fetch_chunks(
+    inner: &Inner,
+    key: &[u8; 32],
+    check_author: bool,
+) -> Vec<iroh_beekem_core::Chunk> {
     let Ok(entries) = inner
         .doc
-        .get_many(Query::key_exact(Bytes::copy_from_slice(key.as_bytes())))
+        .get_many(Query::key_exact(Bytes::copy_from_slice(key)))
         .await
     else {
-        return;
+        return Vec::new();
     };
     let mut entries = std::pin::pin!(entries);
 
     let mut chunks = Vec::new();
     while let Some(Ok(entry)) = entries.next().await {
+        if check_author {
+            let author = entry.author().to_bytes();
+            // Our own entries always pass: we have not necessarily read back
+            // our own author claim from the manifest yet, and refusing our own
+            // writes would be a startup deadlock.
+            let accepted = author == inner.author.to_bytes() || {
+                let state = inner.state.lock().await;
+                state.manifest().author_may_write(&author)
+            };
+            if !accepted {
+                tracing::warn!("skipping an entry from an author with no writing role");
+                continue;
+            }
+        }
         if let Ok(bytes) = inner.blobs.get_bytes(entry.content_hash()).await
             && let Ok(chunk) = decode_chunk(&bytes)
         {
             chunks.push(chunk);
         }
     }
-
-    for chunk in chunks {
-        let effects = {
-            let mut state = inner.state.lock().await;
-            state
-                .handle(
-                    Event::ChunkArrived {
-                        doc: inner.document,
-                        chunk: Box::new(chunk),
-                    },
-                    &mut rand::rngs::OsRng,
-                )
-                .unwrap_or_default()
-        };
-        apply_effects(inner, effects).await;
-    }
+    chunks
 }
 
 /// Rebuild a verifying key from raw bytes.

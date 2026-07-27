@@ -102,6 +102,12 @@ pub enum Msg {
     Op(Box<Signed<CgkaOperation>>),
     /// Data plane: an encrypted content chunk.
     Chunk(Box<Chunk>),
+    /// Data plane: an encrypted manifest replica.
+    ///
+    /// Carried separately from [`Msg::Chunk`] because it lands at the manifest's
+    /// well-known key rather than a document's, and because a receiver must not
+    /// try to import it into a CRDT document.
+    Manifest(Box<Chunk>),
 }
 
 /// Timers a node arms for itself.
@@ -241,8 +247,9 @@ impl WorkspaceNode {
             match effect {
                 Effect::BroadcastOp(op) => cx.broadcast(Msg::Op(op)),
                 Effect::StoreChunk { chunk, .. } => cx.broadcast(Msg::Chunk(chunk)),
+                Effect::StoreManifest { chunk, .. } => cx.broadcast(Msg::Manifest(chunk)),
                 // Purely local; nothing to tell the network about.
-                Effect::Applied { .. } => {}
+                Effect::Applied { .. } | Effect::ManifestUpdated => {}
             }
         }
     }
@@ -253,6 +260,7 @@ impl WorkspaceNode {
             match msg {
                 Msg::Op(op) => self.drive(Event::ControlOp(Arc::new(*op)), cx, 0),
                 Msg::Chunk(chunk) => self.drive(Event::ChunkArrived { doc: DOC, chunk }, cx, 0),
+                Msg::Manifest(chunk) => self.drive(Event::ManifestArrived { chunk }, cx, 0),
                 // Join-protocol messages; by the time we flush, joining is done.
                 Msg::Hello { .. } | Msg::Welcome { .. } => {}
             }
@@ -349,6 +357,7 @@ impl Node for WorkspaceNode {
             }
             Msg::Op(op) => self.drive(Event::ControlOp(Arc::new(*op)), cx, 2),
             Msg::Chunk(chunk) => self.drive(Event::ChunkArrived { doc: DOC, chunk }, cx, 3),
+            Msg::Manifest(chunk) => self.drive(Event::ManifestArrived { chunk }, cx, 6),
         }
     }
 
