@@ -365,3 +365,167 @@ mod a_removed_member_still_watches {
 
     use std::time::Duration;
 }
+
+/// The CRUD surface an application actually calls, driven by generated
+/// operations rather than a fixed script.
+///
+/// Everything above this point exercises one hardcoded sequence: each node
+/// appends twice, on a timer, to one document. These plans instead sample from
+/// [`crud_workload`] — appends, whole-document writes, positional inserts and
+/// deletes, and reads, spread across a pool of documents and across processes —
+/// so the properties hold over many op orderings rather than one.
+///
+/// No linearizability oracle: a CRDT workspace is deliberately not linearizable,
+/// concurrent writes commute rather than serialising, and checking it against a
+/// sequential model would report anomalies for correct behaviour. Convergence is
+/// the right specification, and it is what these assert.
+mod generated_crud_workloads {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{Crud, CrudChurn, Scenario, WorkspaceNode, WorkspaceSpec, crud_workload};
+    use propsim::prelude::*;
+
+    use super::{NODES, SEEDS};
+
+    fn workload_plan<S: Scenario>(
+        properties: Vec<Property<WorkspaceNode<S>>>,
+    ) -> TestPlan<WorkspaceNode<S>> {
+        Simulation::plan::<WorkspaceNode<S>>()
+            .nodes(NODES)
+            .transport(InMemory::unordered_lossy())
+            .state_machine()
+            .workload(crud_workload(NODES))
+            .client(WorkspaceSpec)
+            .check(properties)
+            .seeds(SEEDS)
+            .finish()
+    }
+
+    fn joined<'a, S: Scenario>(w: &'a World<'a, WorkspaceNode<S>>) -> Vec<&'a WorkspaceNode<S>> {
+        w.nodes().filter(|n| n.has_joined()).collect()
+    }
+
+    /// Full convergence across every document under a generated workload.
+    ///
+    /// **Currently failing, and left here on purpose.** Under a fixed script
+    /// every node has joined before the first write, so nothing is ever written
+    /// that a peer cannot decrypt. A generated workload removes that accident:
+    /// the founder is live at t=0 and writes before anyone else has joined, so
+    /// joiners receive chunks encrypted under a key they will never hold. That
+    /// much is forward secrecy working as designed — the re-announcement is
+    /// supposed to repair it by re-encrypting current state under a key they
+    /// *can* derive.
+    ///
+    /// What the diagnosis showed is that the repair does not always land: at the
+    /// horizon a joiner can still be missing a fragment while holding chunks
+    /// parked that it will never decrypt. Two candidates, neither yet
+    /// eliminated:
+    ///
+    /// * `WorkspaceState::on_chunk_arrived` drops an arrival that matches a
+    ///   parked chunk on `(doc, content_ref, pcs_key_hash)`. A re-announcement
+    ///   of unchanged content reproduces the same `content_ref`, so if the PCS
+    ///   key has not moved either, the repair is deduped away against the very
+    ///   chunk it was meant to replace.
+    /// * `publish` names `last_ref` as the predecessor, and for unchanged
+    ///   content that is the chunk's own ref — a self-referential edge whose
+    ///   effect on `decryption_key_for` has not been checked.
+    ///
+    /// Ruled out already: entries not being routed to the right document, and
+    /// RNG salt reuse across documents and rounds. Both were harness bugs, both
+    /// are fixed, and neither accounts for what is left.
+    ///
+    /// Un-ignore this once the cause is understood; it should not be weakened
+    /// into something that passes.
+    #[test]
+    #[ignore = "known gap: re-announcement does not always repair a joiner; see the doc comment"]
+    fn every_document_converges_under_a_generated_workload() {
+        // Byte-identical, not merely "contains what I wrote". Concurrent inserts
+        // have no canonical order, so the assertion is that all replicas agree —
+        // never that they agree on a particular string, which would be asserting
+        // Loro's internal ordering rather than our convergence.
+        workload_plan::<Crud>(vec![property::eventually_within(
+            "all documents converge",
+            Duration::from_secs(9),
+            |w: &World<'_, WorkspaceNode<Crud>>| {
+                let nodes = joined(w);
+                let Some(first) = nodes.first() else {
+                    return false;
+                };
+                nodes.len() == NODES && nodes.iter().all(|n| n.all_text() == first.all_text())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn a_generated_workload_never_evicts_anything() {
+        // The queue limits exist for hostile traffic. A generated but honest
+        // workload reaching them would mean the eviction logic fires when it
+        // should not, which shows up as silent data loss rather than a failure.
+        workload_plan::<Crud>(vec![property::always(
+            "no evictions",
+            |w: &World<'_, WorkspaceNode<Crud>>| joined(w).iter().all(|n| n.evictions() == 0),
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn no_chunk_stays_parked_under_a_generated_workload() {
+        workload_plan::<Crud>(vec![property::eventually_within(
+            "parking drains",
+            Duration::from_secs(9),
+            |w: &World<'_, WorkspaceNode<Crud>>| {
+                joined(w)
+                    .iter()
+                    .all(|n| n.pending_chunks() == 0 && n.parked_ops() == 0)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn generated_operations_actually_reach_the_documents() {
+        // Guards the harness, not the protocol. If the codec stopped decoding,
+        // or ops were never dispatched, every property above would pass
+        // vacuously over an empty workspace — so assert the workload did work.
+        workload_plan::<Crud>(vec![property::sometimes(
+            "some document has content",
+            |w: &World<'_, WorkspaceNode<Crud>>| {
+                joined(w)
+                    .iter()
+                    .any(|n| n.all_text().iter().any(|t| !t.is_empty()))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn the_remaining_members_converge_under_workload_and_churn() {
+        // The hardest combination the simulator can express today: generated
+        // CRUD against a group that is concurrently rotating keys and losing a
+        // member.
+        workload_plan::<CrudChurn>(vec![property::eventually_within(
+            "survivors converge",
+            Duration::from_secs(9),
+            |w: &World<'_, WorkspaceNode<CrudChurn>>| {
+                let remaining: Vec<_> = w
+                    .nodes()
+                    .filter(|n| n.has_joined() && !n.is_revocation_target())
+                    .collect();
+                let Some(first) = remaining.first() else {
+                    return false;
+                };
+                remaining.iter().all(|n| n.all_text() == first.all_text())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn a_generated_run_is_reproducible() {
+        // The workload is sampled from the seed, so this covers op generation as
+        // well as scheduling: a fixed seed must produce the same ops in the same
+        // order, or a failing run could never be replayed.
+        assert_deterministic(|| workload_plan::<Crud>(Vec::new()), Seed(0x0C0D_E123));
+    }
+}

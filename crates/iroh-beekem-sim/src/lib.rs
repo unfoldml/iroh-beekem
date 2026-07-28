@@ -40,15 +40,29 @@ use keyhive_crypto::{
     signer::memory::MemorySigner,
     verifiable::Verifiable,
 };
+use proptest::{prelude::prop_oneof, strategy::{BoxedStrategy, Strategy}};
 use propsim_core::{
-    NodeId,
-    node::{Ctx, Node},
+    ClientCodec, FrozenOp, NodeId,
+    history::{Function, Value},
+    node::{Completion, Ctx, Node, OpOutcome, OpToken},
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-/// The single document every simulated node edits.
-pub const DOC: DocumentUuid = DocumentUuid([7u8; 16]);
+/// The documents every simulated node knows about.
+///
+/// A fixed pool rather than UUIDs invented per node: generated operations name
+/// a document by *index*, and an index only means the same thing everywhere if
+/// the pool is agreed in advance. Generating random UUIDs would produce
+/// operations that address documents nobody else has, which tests nothing.
+pub const DOCS: [DocumentUuid; 3] = [
+    DocumentUuid([7u8; 16]),
+    DocumentUuid([8u8; 16]),
+    DocumentUuid([9u8; 16]),
+];
+
+/// The document the timer-driven scenarios edit.
+pub const DOC: DocumentUuid = DOCS[0];
 
 /// Which node founds the workspace.
 const FOUNDER: u64 = 0;
@@ -74,7 +88,18 @@ const JOIN_RETRY: Duration = Duration::from_millis(100);
 const RESYNC_INTERVAL: Duration = Duration::from_millis(400);
 
 /// How many times a node re-announces before going quiet, so runs terminate.
+///
+/// A real node re-announces forever; this budget exists only so a run ends. The
+/// fixed-script scenarios finish writing within the first second, so eight
+/// rounds comfortably outlast them — but a generated workload keeps issuing
+/// writes for the whole run, and anti-entropy that stopped first would leave a
+/// late chunk lost by the lossy transport with nothing to recover it. That
+/// would look exactly like a convergence bug while being an artefact of the
+/// harness, so workload scenarios get a budget that outlasts the run.
 const MAX_RESYNCS: u32 = 8;
+
+/// The re-announcement budget when generated operations drive the run.
+const MAX_RESYNCS_UNDER_WORKLOAD: u32 = 32;
 
 /// How often a rotating node re-keys its leaf.
 const ROTATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -106,6 +131,12 @@ const MAX_FORGERIES: u32 = 10;
 pub trait Scenario: Clone + Default + 'static {
     /// Whether nodes periodically re-key their leaf (post-compromise security).
     const ROTATE: bool = false;
+    /// Whether content changes come from generated client operations.
+    ///
+    /// When set, nodes stop scheduling their own edits: the workload drives
+    /// every mutation instead. Leaving both on would mix a fixed script into
+    /// the generated one and make it impossible to say which produced a result.
+    const WORKLOAD: bool = false;
     /// Which node the founder revokes partway through, if any.
     const REVOKE: Option<u64> = None;
     /// Whether non-founder nodes also broadcast operations signed by a key that
@@ -131,6 +162,22 @@ impl Scenario for Churn {
 pub struct Forging;
 impl Scenario for Forging {
     const FORGE: bool = true;
+}
+
+/// Content driven entirely by generated CRUD operations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Crud;
+impl Scenario for Crud {
+    const WORKLOAD: bool = true;
+}
+
+/// Generated CRUD operations while members rotate keys and one is revoked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrudChurn;
+impl Scenario for CrudChurn {
+    const WORKLOAD: bool = true;
+    const ROTATE: bool = true;
+    const REVOKE: Option<u64> = Some(2);
 }
 
 /// Messages exchanged between simulated nodes.
@@ -175,6 +222,75 @@ pub enum Msg {
         /// The ciphertext.
         chunk: Box<Chunk>,
     },
+}
+
+/// A generated client operation: the CRUD surface an application drives.
+///
+/// This mirrors the public `Workspace` API rather than the internal `Event`
+/// enum, because the point is to check the workspace as an application uses it.
+/// Documents are named by index into [`DOCS`]; see there for why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsOp {
+    /// Append text to a document.
+    Append {
+        /// Index into [`DOCS`].
+        doc: usize,
+        /// Text to append.
+        text: String,
+    },
+    /// Replace a document's contents.
+    Write {
+        /// Index into [`DOCS`].
+        doc: usize,
+        /// The new contents.
+        text: String,
+    },
+    /// Insert text at an offset, clamped to the document's length.
+    Insert {
+        /// Index into [`DOCS`].
+        doc: usize,
+        /// Character offset.
+        pos: usize,
+        /// Text to insert.
+        text: String,
+    },
+    /// Delete a range, clamped to what the document holds.
+    Remove {
+        /// Index into [`DOCS`].
+        doc: usize,
+        /// Character offset.
+        pos: usize,
+        /// How many characters.
+        len: usize,
+    },
+    /// Read a document's current text.
+    Read {
+        /// Index into [`DOCS`].
+        doc: usize,
+    },
+}
+
+impl WsOp {
+    /// Which document in [`DOCS`] this operation names.
+    #[must_use]
+    pub fn doc_index(&self) -> usize {
+        match self {
+            Self::Append { doc, .. }
+            | Self::Write { doc, .. }
+            | Self::Insert { doc, .. }
+            | Self::Remove { doc, .. }
+            | Self::Read { doc } => *doc,
+        }
+    }
+}
+
+/// What a completed [`WsOp`] yields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WsResp {
+    /// A read, carrying the text observed.
+    Text(String),
+    /// A mutation that took effect locally.
+    Applied,
 }
 
 /// What a node can observe about an index entry without decrypting it.
@@ -238,6 +354,13 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     index: BTreeMap<StorageKey, EntryMeta>,
     /// Control-plane operations seen, whether or not they applied.
     observed_ops: u64,
+    /// Client operations that arrived before this node finished joining.
+    ///
+    /// Held rather than failed. The harness allows one operation in flight per
+    /// process, so failing them during onboarding would burn the workload before
+    /// any node could apply anything — and a real client queues an edit made
+    /// while it is still connecting rather than discarding it.
+    deferred_ops: Vec<(OpToken, WsOp)>,
     _scenario: PhantomData<S>,
 }
 
@@ -265,6 +388,12 @@ fn node_rng(me: NodeId, salt: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(me.0.wrapping_mul(0x9E37_79B9).wrapping_add(salt))
 }
 
+/// The blinded key a document is stored under, as every node computes it.
+#[must_use]
+pub fn doc_key(doc: DocumentUuid) -> StorageKey {
+    WorkspaceSecret::new(workspace_secret_bytes()).storage_key(doc)
+}
+
 /// The blinding secret, fixed so every simulated node agrees on storage keys.
 fn workspace_secret_bytes() -> [u8; 32] {
     [0x5Au8; 32]
@@ -289,12 +418,24 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.state.is_some()
     }
 
-    /// The document text as this node currently sees it.
+    /// The default document's text as this node currently sees it.
     #[must_use]
     pub fn document_text(&self) -> String {
+        self.document_text_of(DOC)
+    }
+
+    /// One document's text as this node currently sees it.
+    #[must_use]
+    pub fn document_text_of(&self, doc: DocumentUuid) -> String {
         self.state
             .as_ref()
-            .map_or_else(String::new, |s| s.document_text(DOC))
+            .map_or_else(String::new, |s| s.document_text(doc))
+    }
+
+    /// Every document's text, in pool order — the whole visible state.
+    #[must_use]
+    pub fn all_text(&self) -> Vec<String> {
+        DOCS.iter().map(|d| self.document_text_of(*d)).collect()
     }
 
     /// Chunks parked awaiting keys or CRDT dependencies.
@@ -412,8 +553,61 @@ impl<S: Scenario> WorkspaceNode<S> {
         let secret = WorkspaceSecret::new(workspace_secret_bytes());
         if key == secret.manifest_key() {
             self.drive(Event::ManifestArrived { chunk }, cx, salt);
-        } else if key == secret.storage_key(DOC) {
-            self.drive(Event::ChunkArrived { doc: DOC, chunk }, cx, salt);
+            return;
+        }
+        // Every document in the pool, not just the first. Matching only one key
+        // would leave entries for the others sitting in the index, seen but
+        // never applied — which looks exactly like a convergence bug and is
+        // really a receiver that never tried.
+        if let Some(doc) = DOCS.into_iter().find(|d| key == secret.storage_key(*d)) {
+            self.drive(Event::ChunkArrived { doc, chunk }, cx, salt);
+        }
+    }
+
+    /// Apply one client operation to the local replica.
+    fn apply_op(&mut self, op: &WsOp, cx: &mut dyn Ctx<Self>) -> WsResp {
+        // Local-first: a write takes effect on the local replica immediately, so
+        // it completes synchronously. That is the semantics, not a shortcut —
+        // there is no acknowledgement to wait for, and convergence is checked by
+        // properties over the world rather than by an oracle waiting on a quorum.
+        let doc = DOCS[op.doc_index() % DOCS.len()];
+        let event = match op {
+            WsOp::Read { .. } => return WsResp::Text(self.document_text_of(doc)),
+            WsOp::Append { text, .. } => {
+                self.contributed.push(text.clone());
+                Event::LocalEdit {
+                    doc,
+                    text: text.clone(),
+                }
+            }
+            // Deliberately *not* recorded as contributed: a whole-document write
+            // or a deletion can remove text an earlier append added, so counting
+            // it as a contribution would make the "own edits survive" property
+            // assert something false.
+            WsOp::Write { text, .. } => Event::WriteFile {
+                doc,
+                text: text.clone(),
+            },
+            WsOp::Insert { pos, text, .. } => Event::InsertText {
+                doc,
+                pos: *pos,
+                text: text.clone(),
+            },
+            WsOp::Remove { pos, len, .. } => Event::RemoveText {
+                doc,
+                pos: *pos,
+                len: *len,
+            },
+        };
+        self.drive(event, cx, 11);
+        WsResp::Applied
+    }
+
+    /// Apply and complete everything queued while this node was still joining.
+    fn flush_deferred_ops(&mut self, cx: &mut dyn Ctx<Self>) {
+        for (token, op) in std::mem::take(&mut self.deferred_ops) {
+            let resp = self.apply_op(&op, cx);
+            cx.complete_op(token, Completion::Ok(resp));
         }
     }
 
@@ -539,14 +733,17 @@ impl<S: Scenario> WorkspaceNode<S> {
         };
         self.state = Some(WorkspaceState::joined(cgka, WorkspaceSecret::new(secret)));
         self.flush_inbox(cx);
+        // Client operations issued while this node was still onboarding apply
+        // now, in arrival order, rather than having been discarded.
+        self.flush_deferred_ops(cx);
     }
 }
 
 impl<S: Scenario> Node for WorkspaceNode<S> {
     type Msg = Msg;
     type Timer = Tick;
-    type Op = ();
-    type Response = ();
+    type Op = WsOp;
+    type Response = WsResp;
 
     fn on_start(&mut self, cx: &mut dyn Ctx<Self>) {
         let me = cx.me();
@@ -607,6 +804,25 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         }
     }
 
+    fn on_client_op(
+        &mut self,
+        op: WsOp,
+        token: OpToken,
+        cx: &mut dyn Ctx<Self>,
+    ) -> OpOutcome<WsResp> {
+        // Not joined yet, so there is nothing to apply this to. Held open rather
+        // than failed: the harness allows one operation in flight per process,
+        // so failing during onboarding would burn the workload before any node
+        // could apply anything — and a real client queues an edit made while it
+        // is still connecting rather than throwing it away.
+        if self.state.is_none() {
+            self.deferred_ops.push((token, op));
+            return OpOutcome::Pending;
+        }
+        let resp = self.apply_op(&op, cx);
+        OpOutcome::Done(resp)
+    }
+
     fn on_timer(&mut self, timer: Tick, cx: &mut dyn Ctx<Self>) {
         match timer {
             Tick::Join => {
@@ -615,6 +831,10 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                     cx.set_timer(Tick::Join, JOIN_RETRY);
                 }
             }
+            // Suppressed under a generated workload: content changes come from
+            // client operations there, and running both would blend a fixed
+            // script into the generated one.
+            Tick::Edit if S::WORKLOAD => {}
             Tick::Edit => {
                 if self.state.is_some() && self.edits_made < EDITS_PER_NODE {
                     let text = format!("<{}:{}>", cx.me().0, self.edits_made);
@@ -627,9 +847,21 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 }
             }
             Tick::Resync => {
-                self.drive(Event::Resync { doc: DOC }, cx, 5);
+                // A distinct salt per document *and* per round. `drive` seeds a
+                // fresh RNG from the salt, so reusing one would hand three
+                // different encryptions the identical random stream, and hand
+                // successive rounds the same one again.
+                for (i, doc) in DOCS.into_iter().enumerate() {
+                    let salt = 5000 + u64::from(self.resyncs_done) * 16 + i as u64;
+                    self.drive(Event::Resync { doc }, cx, salt);
+                }
                 self.resyncs_done += 1;
-                if self.resyncs_done < MAX_RESYNCS {
+                let budget = if S::WORKLOAD {
+                    MAX_RESYNCS_UNDER_WORKLOAD
+                } else {
+                    MAX_RESYNCS
+                };
+                if self.resyncs_done < budget {
                     cx.set_timer(Tick::Resync, RESYNC_INTERVAL);
                 }
             }
@@ -660,4 +892,114 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
             }
         }
     }
+}
+
+/// Bridges generated workload values to typed [`WsOp`]s and back.
+///
+/// One struct so the `:f` names and the value encoding are written once; the
+/// engine decodes with it at invoke time and any history-reading property
+/// decodes with the same shapes at check time.
+///
+/// Deliberately *not* paired with a `SequentialModel`. propsim ships a
+/// linearizability oracle, but a CRDT workspace is not linearizable by design —
+/// concurrent writes commute rather than serialising — so that oracle would
+/// report anomalies for entirely correct behaviour. Convergence is checked by
+/// properties over the world instead.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkspaceSpec;
+
+impl<S: Scenario> ClientCodec<WorkspaceNode<S>> for WorkspaceSpec {
+    fn decode(&self, value: &Value) -> Option<(Function, WsOp)> {
+        let Value::List(items) = value else {
+            return None;
+        };
+        let idx = |v: &Value| -> Option<usize> {
+            match v {
+                Value::Int(i) => usize::try_from(*i).ok(),
+                _ => None,
+            }
+        };
+        match items.as_slice() {
+            [Value::Keyword(f), d, Value::Str(text)] if f == "append" => Some((
+                Function::new("append"),
+                WsOp::Append {
+                    doc: idx(d)?,
+                    text: text.clone(),
+                },
+            )),
+            [Value::Keyword(f), d, Value::Str(text)] if f == "write" => Some((
+                Function::new("write"),
+                WsOp::Write {
+                    doc: idx(d)?,
+                    text: text.clone(),
+                },
+            )),
+            [Value::Keyword(f), d, p, Value::Str(text)] if f == "insert" => Some((
+                Function::new("insert"),
+                WsOp::Insert {
+                    doc: idx(d)?,
+                    pos: idx(p)?,
+                    text: text.clone(),
+                },
+            )),
+            [Value::Keyword(f), d, p, l] if f == "remove" => Some((
+                Function::new("remove"),
+                WsOp::Remove {
+                    doc: idx(d)?,
+                    pos: idx(p)?,
+                    len: idx(l)?,
+                },
+            )),
+            [Value::Keyword(f), d] if f == "read" => {
+                Some((Function::new("read"), WsOp::Read { doc: idx(d)? }))
+            }
+            _ => None,
+        }
+    }
+
+    fn encode_response(&self, _op_f: &Function, resp: &WsResp) -> Value {
+        match resp {
+            WsResp::Text(text) => Value::Str(text.clone()),
+            WsResp::Applied => Value::keyword("applied"),
+        }
+    }
+}
+
+/// A generated stream of CRUD operations across `nodes` processes.
+///
+/// Offsets and lengths are drawn small and are allowed to run past the end of a
+/// document: the core clamps them, and that clamping is exactly the behaviour a
+/// caller holding a view a concurrent edit has already shortened depends on. A
+/// strategy that only ever produced in-range offsets would never exercise it.
+#[must_use]
+pub fn crud_workload(nodes: usize) -> BoxedStrategy<FrozenOp> {
+    // Rebuilt per branch rather than cloned: `RegexGeneratorStrategy` is not
+    // `Clone`, and a closure keeps the intent obvious at each use.
+    let text = || proptest::string::string_regex("[a-z]{1,6}").expect("valid regex");
+    let doc = || (0..DOCS.len()).prop_map(|d| Value::Int(d as i64));
+    let small = || (0usize..12).prop_map(|n| Value::Int(n as i64));
+
+    let op = prop_oneof![
+        // Weighted towards appends: they are the operation whose effect a
+        // convergence property can state without ambiguity, since an append
+        // can only ever add text.
+        4 => (doc(), text())
+            .prop_map(|(d, t)| Value::List(vec![Value::keyword("append"), d, Value::Str(t)])),
+        1 => (doc(), text())
+            .prop_map(|(d, t)| Value::List(vec![Value::keyword("write"), d, Value::Str(t)])),
+        2 => (doc(), small(), text())
+            .prop_map(|(d, p, t)| Value::List(vec![
+                Value::keyword("insert"),
+                d,
+                p,
+                Value::Str(t)
+            ])),
+        1 => (doc(), small(), small())
+            .prop_map(|(d, p, l)| Value::List(vec![Value::keyword("remove"), d, p, l])),
+        2 => doc().prop_map(|d| Value::List(vec![Value::keyword("read"), d])),
+    ];
+
+    (0..nodes, op)
+        .prop_map(|(process, value)| FrozenOp::new(NodeId(process as u64), value))
+        .boxed()
 }

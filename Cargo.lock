@@ -2112,6 +2112,7 @@ dependencies = [
  "keyhive_crypto",
  "propsim",
  "propsim-core",
+ "proptest",
  "rand 0.8.7",
  "rand_chacha 0.3.1",
 ]

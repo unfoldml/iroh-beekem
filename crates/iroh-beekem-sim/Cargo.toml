@@ -16,6 +16,10 @@ beekem.workspace = true
 keyhive_crypto.workspace = true
 rand.workspace = true
 rand_chacha = "0.3"
+# Part of propsim-core's public API: the `Strategy` handed to `.workload(..)`.
+# Must stay semver-compatible with the version propsim-core resolves, or the
+# `BoxedStrategy` types will not unify.
+proptest = "1"
 # Pinned to a revision: `propsim` is unpublished and has no semver, so an
 # unpinned git dependency would silently change what the property tests mean
 # from one checkout to the next.
