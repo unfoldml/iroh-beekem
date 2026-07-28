@@ -3,6 +3,9 @@
 Group-confidential, local-first collaborative workspaces: groups of people editing a shared set of
 documents, every edit versioned, signed and concurrent-safe, with no trusted server anywhere.
 
+The goals this is built against are in [docs/USER_STORIES.md](docs/USER_STORIES.md). The project is
+early; what follows describes the current implementation, not a settled specification.
+
 - **[iroh](https://crates.io/crates/iroh)** — P2P QUIC transport, NAT hole punching, peer identity by public key.
 - **[beekem](https://crates.io/crates/beekem)** — decentralized Continuous Group Key Agreement. Forward
   secrecy and post-compromise security over a dynamic group and, unlike MLS/TreeKEM, merges *concurrent*
@@ -90,9 +93,11 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
 Note: `cargo clippy --all-features` pulls in a substantially larger dependency set (`arbitrary`,
 `objc2`, …) and needs several GB of free disk.
 
-## Deliberate trade-offs
+## Current trade-offs
 
-These are consequences of the design, not work left undone. Each one buys something.
+These follow from the choices the implementation makes today, and each one buys something. They are
+not work left undone — but nor are they permanent: a user story that needs a different answer is
+reason enough to revisit the choice underneath.
 
 1. **`iroh-docs` write capability is all-or-nothing.** Every writer holds the same `NamespaceSecret`,
    so a revoked member keeps it and can still push entries into the replica. They cannot *read*
@@ -102,17 +107,19 @@ These are consequences of the design, not work left undone. Each one buys someth
 2. **A new member cannot read content written before they joined.** They reconstruct the group from
    the operation log but not the historical PCS keys. This is forward secrecy working as intended;
    `Workspace` re-publishes current state when a peer joins the overlay so they can catch up.
-3. **Timestamp quantization is not achievable.** `Doc::set_bytes`/`set_hash` do not accept a timestamp;
-   `iroh-docs` sets it internally. Modification times leak to any syncing peer.
+3. **Timestamp quantization is not achievable with `iroh-docs` as the index.** `Doc::set_bytes`/`set_hash`
+   do not accept a timestamp; `iroh-docs` sets it internally. Modification times leak to any syncing
+   peer. This is a property of the index we chose, not of the problem.
 4. **Blinding hides names, not traffic.** Entry count, sizes, write frequency and author activity all
    remain visible during reconciliation.
 5. **Forward secrecy is bounded by retention.** Decryption keys are recovered from the CGKA operation
    graph, so pruning old operations to gain forward secrecy also destroys the ability to read old
    content. Retention is a policy knob, not a free win.
 6. **The workspace blinding secret does not rotate.** A revoked member can still recognise which
-   blinded key belongs to a document UUID they already knew. Rotating it would force every peer to
-   rewrite every entry. They learn nothing about documents created after their removal, and can
-   read no content either way.
+   blinded key belongs to a document UUID they already knew. Rotating it under the current scheme —
+   one secret keying every entry — would force every peer to rewrite every entry, which is why it is
+   not done. They learn nothing about documents created after their removal, and can read no content
+   either way.
 7. **Roles are advisory against a cryptographically capable member.** Anyone holding a leaf can
    decrypt, whatever the manifest says. Roles constrain what a well-behaved peer accepts, not what a
    malicious one can read. Genuine read revocation is a CGKA removal.

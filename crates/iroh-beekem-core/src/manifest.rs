@@ -139,7 +139,7 @@ fn unhex_16(raw: &str) -> Option<[u8; 16]> {
 }
 
 fn unhex(raw: &str) -> Option<Vec<u8>> {
-    if raw.len() % 2 != 0 {
+    if !raw.len().is_multiple_of(2) {
         return None;
     }
     (0..raw.len())
@@ -152,7 +152,9 @@ impl Manifest {
     /// Create an empty manifest.
     #[must_use]
     pub fn new() -> Self {
-        Self { doc: LoroDoc::new() }
+        Self {
+            doc: LoroDoc::new(),
+        }
     }
 
     /// Set the peer identity used to attribute this replica's Loro operations.
@@ -272,9 +274,11 @@ impl Manifest {
         // rather than read the shallow `get_value()` snapshot.
         self.files_map().for_each(|key, value| {
             let Some(uuid) = unhex_16(key) else { return };
-            let Ok(fields) = value.into_container().map_err(|_| ()).and_then(|c| {
-                c.into_map().map_err(|_| ())
-            }) else {
+            let Ok(fields) = value
+                .into_container()
+                .map_err(|_| ())
+                .and_then(|c| c.into_map().map_err(|_| ()))
+            else {
                 return;
             };
             let get = |name: &str| -> String {
@@ -448,7 +452,11 @@ mod tests {
         m.set_role(&alice, Role::Admin).unwrap();
 
         assert_eq!(m.role_of(&alice), Some(Role::Admin));
-        assert_eq!(m.role_of(&[2u8; 32]), None, "unassigned members have no role");
+        assert_eq!(
+            m.role_of(&[2u8; 32]),
+            None,
+            "unassigned members have no role"
+        );
     }
 
     #[test]

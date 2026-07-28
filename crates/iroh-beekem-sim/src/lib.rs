@@ -40,8 +40,8 @@ use keyhive_crypto::{
     verifiable::Verifiable,
 };
 use propsim_core::{
-    node::{Ctx, Node},
     NodeId,
+    node::{Ctx, Node},
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -429,10 +429,8 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
 
         if me.0 == FOUNDER {
             if let Ok(cgka) = CgkaController::create(tree_id(), signer, &mut node_rng(me, 0xC3))
-                && let Ok(state) = WorkspaceState::found(
-                    cgka,
-                    WorkspaceSecret::new(workspace_secret_bytes()),
-                )
+                && let Ok(state) =
+                    WorkspaceState::found(cgka, WorkspaceSecret::new(workspace_secret_bytes()))
             {
                 self.state = Some(state);
             }

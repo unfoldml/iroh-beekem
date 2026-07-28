@@ -236,7 +236,10 @@ async fn the_manifest_and_its_roles_reach_a_joiner_over_quic() {
 async fn content_still_flows_across_a_key_rotation() {
     let Pair { alice, bob, .. } = invited_pair(70).await;
 
-    alice.append("before rotation. ").await.expect("alice writes");
+    alice
+        .append("before rotation. ")
+        .await
+        .expect("alice writes");
     eventually(
         "bob reads before the rotation",
         Duration::from_secs(30),
@@ -252,7 +255,10 @@ async fn content_still_flows_across_a_key_rotation() {
     // part a rotation can silently break.
     bob.rotate().await.expect("bob rotates his leaf key");
 
-    alice.append("after rotation.").await.expect("alice writes again");
+    alice
+        .append("after rotation.")
+        .await
+        .expect("alice writes again");
     eventually(
         "bob reads across the rotation",
         Duration::from_secs(30),

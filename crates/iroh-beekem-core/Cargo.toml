@@ -1,8 +1,14 @@
 [package]
 name = "iroh-beekem-core"
 description = "Pure, I/O-free core of iroh-beekem: CGKA group state, key blinding, and content encryption for confidential local-first workspaces."
+readme = "README.md"
+keywords = ["crdt", "cgka", "encryption", "local-first", "beekem"]
+categories = ["cryptography", "data-structures"]
 edition.workspace = true
-rust-version.workspace = true
+# Lower than the workspace default: this crate never depends on `iroh`, so its
+# floor is set by `beekem`/`keyhive_crypto` instead. Keeping it honest is the
+# point of a separate I/O-free crate.
+rust-version = "1.90"
 license.workspace = true
 repository.workspace = true
 version.workspace = true

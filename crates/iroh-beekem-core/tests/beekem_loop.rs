@@ -6,15 +6,15 @@
 //! Everything here is deterministic: a seeded `ChaCha20Rng` stands in for the
 //! system CSPRNG, so a failure reproduces exactly.
 
+use std::sync::Arc;
+
 use beekem::{id::TreeId, operation::CgkaOperation};
 use iroh_beekem_core::{CgkaController, MergeOutcome};
 use keyhive_crypto::{
-    share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner,
-    verifiable::Verifiable,
+    share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use std::sync::Arc;
 
 fn rng(seed: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(seed)
@@ -52,7 +52,9 @@ fn invite_bob() -> Invited {
         .expect("adding bob should succeed")
         .expect("bob is not yet a member, so an operation must be produced");
 
-    let log = alice.op_log().expect("alice should be able to export her log");
+    let log = alice
+        .op_log()
+        .expect("alice should be able to export her log");
 
     let bob = CgkaController::join(doc, bob_signer, bob_secret, &log)
         .expect("bob should be able to join by replaying the log");
@@ -67,8 +69,12 @@ fn invite_bob() -> Invited {
 
 #[test]
 fn founder_starts_as_the_only_member() {
-    let alice = CgkaController::create(workspace_id(0), MemorySigner::generate(&mut rng(1)), &mut rng(10))
-        .expect("founding a workspace should succeed");
+    let alice = CgkaController::create(
+        workspace_id(0),
+        MemorySigner::generate(&mut rng(1)),
+        &mut rng(10),
+    )
+    .expect("founding a workspace should succeed");
 
     assert_eq!(
         alice.group_size(),
@@ -152,9 +158,7 @@ fn join_fails_for_a_member_who_was_never_added() {
 #[test]
 fn member_decrypts_content_written_by_another_member() {
     let Invited {
-        mut alice,
-        mut bob,
-        ..
+        mut alice, mut bob, ..
     } = invite_bob();
 
     let plaintext = b"the q3 numbers are confidential";
@@ -185,9 +189,7 @@ fn member_decrypts_content_written_by_another_member() {
 #[test]
 fn revoked_member_cannot_decrypt_later_content() {
     let Invited {
-        mut alice,
-        mut bob,
-        ..
+        mut alice, mut bob, ..
     } = invite_bob();
 
     // Establish that bob really could read before the revocation, so that the
@@ -211,7 +213,8 @@ fn revoked_member_cannot_decrypt_later_content() {
 
     // Bob observes his own removal — he cannot be prevented from seeing the
     // public control plane.
-    bob.merge(Arc::new(remove_op)).expect("bob merges his own removal");
+    bob.merge(Arc::new(remove_op))
+        .expect("bob merges his own removal");
 
     let (after, after_op) = alice
         .encrypt(b"not readable by bob", &[], &mut rng(31))
@@ -232,13 +235,15 @@ fn revoked_member_cannot_decrypt_later_content() {
 /// topic, so these three tests cover the only thing standing between that topic
 /// and an attacker rewriting the group.
 mod control_plane_is_authenticated {
-    use super::{invite_bob, rng, workspace_id, Invited};
+    use std::sync::Arc;
+
     use iroh_beekem_core::{CgkaController, CoreError};
     use keyhive_crypto::{
         share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner,
         verifiable::Verifiable,
     };
-    use std::sync::Arc;
+
+    use super::{Invited, invite_bob, rng, workspace_id};
 
     #[test]
     fn a_validly_signed_operation_from_a_non_member_is_rejected() {
@@ -331,12 +336,7 @@ mod control_plane_is_authenticated {
             .try_sign_sync(log[0].payload().clone())
             .expect("mallory can sign");
 
-        let result = CgkaController::join(
-            workspace_id(0),
-            carol_signer,
-            carol_secret,
-            &forged_log,
-        );
+        let result = CgkaController::join(workspace_id(0), carol_signer, carol_secret, &forged_log);
 
         assert!(
             matches!(result, Err(CoreError::Unauthorized { .. })),
@@ -425,7 +425,9 @@ fn out_of_order_operations_are_parked_then_applied() {
 
     // Deliver out of causal order: the later rotation arrives first.
     assert_eq!(
-        carol.merge(Arc::new(second)).expect("merging the later op first"),
+        carol
+            .merge(Arc::new(second))
+            .expect("merging the later op first"),
         MergeOutcome::Deferred,
         "an operation whose predecessors are missing should be parked, not rejected"
     );

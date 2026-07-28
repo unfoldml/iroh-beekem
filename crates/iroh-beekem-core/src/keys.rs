@@ -34,6 +34,11 @@
 //! Neither check is a substitute for the other, and both are cheap next to the
 //! tree operations they guard.
 
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+};
+
 use beekem::{
     cgka::Cgka,
     error::CgkaError,
@@ -48,10 +53,6 @@ use keyhive_crypto::{
     verifiable::Verifiable,
 };
 use rand::{CryptoRng, RngCore};
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::Arc,
-};
 
 use crate::{
     content::{Chunk, ChunkRef},
@@ -150,10 +151,7 @@ impl CgkaController {
         let share_key = share_secret.share_key();
 
         let mut cgka = now_or_never(Cgka::new::<Local, _>(
-            tree_id,
-            member_id,
-            share_key,
-            &signer,
+            tree_id, member_id, share_key, &signer,
         ))
         .ok_or(CoreError::SignerYielded)??;
 

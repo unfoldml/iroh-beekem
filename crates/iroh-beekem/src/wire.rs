@@ -109,11 +109,12 @@ mod tests {
     /// past invitee can reach. Neither may panic on anything it is handed —
     /// a panic in a pump loop takes the task down and stops the node syncing.
     mod decoders_survive_hostile_input {
-        use super::super::{decode_chunk, encode_chunk, ControlMsg};
         use iroh_beekem_core::{Chunk, ChunkRef};
         use keyhive_crypto::{digest::Digest, siv::Siv, symmetric_key::SymmetricKey};
         use rand::{RngCore, SeedableRng};
         use rand_chacha::ChaCha20Rng;
+
+        use super::super::{ControlMsg, decode_chunk, encode_chunk};
 
         fn sample_chunk() -> Chunk {
             let ciphertext = b"not really encrypted, but the right shape".to_vec();

@@ -2,7 +2,9 @@
 name = "iroh-beekem-sim"
 description = "Deterministic simulation and property tests for the iroh-beekem workspace protocol."
 edition.workspace = true
-rust-version.workspace = true
+# Higher than the workspace default, and unpublished, so it constrains only
+# local development: `propsim` requires 1.96.
+rust-version = "1.96"
 license.workspace = true
 repository.workspace = true
 version.workspace = true

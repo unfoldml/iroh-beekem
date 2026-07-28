@@ -4,7 +4,13 @@ members = ["crates/iroh-beekem", "crates/iroh-beekem-core", "crates/iroh-beekem-
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# The workspace default is the published facade's floor, set by `iroh 1.0.3`.
+# Crates whose dependencies demand more override it; see each crate's manifest.
+# Verify with:
+#   cargo metadata --format-version 1 | \
+#     python3 -c 'import json,sys; print(max((p["rust_version"],p["name"]) \
+#       for p in json.load(sys.stdin)["packages"] if p.get("rust_version")))'
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ocramz/iroh-beekem"
 version = "0.1.0"

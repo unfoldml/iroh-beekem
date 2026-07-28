@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A superseded run tells us nothing; cancel it rather than pay for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces cost nothing until something fails, and a property-test failure
+  # without one is far more expensive to chase down.
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Run the three suites separately rather than as one `--workspace` pass:
+      # they prove different things, and a failure should say which layer broke.
+      - name: core — unit, handshake, state machine, forgery rejection
+        run: cargo test -p iroh-beekem-core
+
+      - name: sim — property tests over simulated user stories
+        run: cargo test -p iroh-beekem-sim
+
+      - name: facade — two real endpoints over real QUIC
+        run: cargo test -p iroh-beekem
+
+      - name: example builds and runs
+        run: cargo run -p iroh-beekem --example two_node
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # `rustfmt.toml` sets `imports_granularity` and `group_imports`, both of
+      # which are nightly-only. Stable rustfmt does not error on them, it
+      # silently ignores them and then demands a different layout — so checking
+      # with stable would fight the repo's own configuration on every import.
+      # Pinned rather than floating: an unpinned nightly changes the expected
+      # formatting without anyone touching the code.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-11-21
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo +nightly-2025-11-21 fmt --all --check
+
+      # Default features only. `--all-features` pulls in `arbitrary`, `objc2`
+      # and friends, needing several GB more disk for no extra signal here.
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  purity:
+    name: core is I/O-free
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # `iroh-beekem-core` returns every effect as data so the whole protocol can
+      # run under a deterministic simulator. That property is worth nothing if it
+      # is only a convention, so it is enforced here: a networking or async-runtime
+      # dependency in the core's normal (non-dev) tree fails the build.
+      - name: no tokio, iroh or quinn in the core dependency tree
+        run: |
+          set -euo pipefail
+          matches=$(cargo tree -p iroh-beekem-core -e normal --prefix none \
+            | sort -u | grep -Ev '^iroh-beekem' | grep -E '^(tokio|iroh|quinn)\b' || true)
+          if [ -n "$matches" ]; then
+            echo "::error::iroh-beekem-core gained a networking or async-runtime dependency:"
+            echo "$matches"
+            exit 1
+          fi
+          echo "core is clean"
+
+  msrv:
+    name: msrv (${{ matrix.crate }} @ ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each published crate is checked at the version its own manifest
+        # declares, so `rust-version` cannot quietly drift from the truth.
+        # `iroh-beekem-sim` is unpublished and tracks stable in the `test` job.
+        include:
+          - { crate: iroh-beekem-core, rust: "1.90" }
+          - { crate: iroh-beekem, rust: "1.91" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p ${{ matrix.crate }} --all-targets
+
+  publish:
+    name: publish dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Workspace mode, not two per-crate invocations: `iroh-beekem` depends on
+      # `iroh-beekem-core` by version as well as by path, so a per-crate dry run
+      # fails to resolve it against the registry until core is actually released.
+      # Publishing the workspace in one invocation lets cargo satisfy the
+      # dependency from the crate being published alongside it.
+      - name: cargo publish --dry-run --workspace
+        run: cargo publish --dry-run --workspace

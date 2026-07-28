@@ -50,9 +50,7 @@ fn joined_nodes_never_disagree_about_group_size_beyond_the_cluster() {
     base_plan(vec![property::always(
         "group size is bounded by the cluster",
         |w: &World<'_, WorkspaceNode<Honest>>| {
-            joined(w)
-                .iter()
-                .all(|n| n.group_size() as usize <= NODES)
+            joined(w).iter().all(|n| n.group_size() as usize <= NODES)
         },
     )])
     .run(deterministic());
@@ -150,10 +148,12 @@ fn a_healthy_run_never_evicts_anything() {
 /// membership and key-rotation operations with no central sequencer. Nothing
 /// exercised that: the simulator only ever added members and edited text.
 mod concurrent_rotation_and_revocation {
-    use super::{plan, NODES};
+    use std::time::Duration;
+
     use iroh_beekem_sim::{Churn, WorkspaceNode};
     use propsim::prelude::*;
-    use std::time::Duration;
+
+    use super::{NODES, plan};
 
     /// The nodes still in the group after the scenario's revocation.
     fn remaining<'a>(w: &'a World<'a, WorkspaceNode<Churn>>) -> Vec<&'a WorkspaceNode<Churn>> {
@@ -215,10 +215,12 @@ mod concurrent_rotation_and_revocation {
 /// operations without checking signatures or issuers, so these properties hold
 /// only because the core checks both before merging.
 mod a_forging_peer_is_rejected {
-    use super::{plan, NODES};
+    use std::time::Duration;
+
     use iroh_beekem_sim::{Forging, WorkspaceNode};
     use propsim::prelude::*;
-    use std::time::Duration;
+
+    use super::{NODES, plan};
 
     #[test]
     fn no_forged_member_ever_enters_the_group() {
@@ -271,7 +273,9 @@ mod a_forging_peer_is_rejected {
         plan::<Forging>(vec![property::always(
             "no evictions under forgery traffic",
             |w: &World<'_, WorkspaceNode<Forging>>| {
-                w.nodes().filter(|n| n.has_joined()).all(|n| n.evictions() == 0)
+                w.nodes()
+                    .filter(|n| n.has_joined())
+                    .all(|n| n.evictions() == 0)
             },
         )])
         .run(deterministic());

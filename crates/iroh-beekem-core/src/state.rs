@@ -394,8 +394,10 @@ impl WorkspaceState {
                     // fail to publish anything.
                     self.manifest.set_role(&member.to_bytes(), Role::Editor)?;
                 }
-                let mut effects: Vec<Effect> =
-                    op.map(|o| Effect::BroadcastOp(Box::new(o))).into_iter().collect();
+                let mut effects: Vec<Effect> = op
+                    .map(|o| Effect::BroadcastOp(Box::new(o)))
+                    .into_iter()
+                    .collect();
                 effects.extend(self.publish_manifest(csprng)?);
                 Ok(effects)
             }
@@ -403,7 +405,10 @@ impl WorkspaceState {
                 self.require_admin()?;
                 self.require_not_last_admin(&member.to_bytes())?;
                 let op = self.cgka.remove_member(member)?;
-                Ok(op.map(|o| Effect::BroadcastOp(Box::new(o))).into_iter().collect())
+                Ok(op
+                    .map(|o| Effect::BroadcastOp(Box::new(o)))
+                    .into_iter()
+                    .collect())
             }
             Event::Rotate => {
                 let op = self.cgka.rotate(csprng)?;

@@ -91,13 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             mime_type: "text/markdown".into(),
         })
         .await?;
-    settle("bob sees the logical path", Duration::from_secs(30), || async {
-        bob.ingest().await;
-        bob.files()
-            .await
-            .iter()
-            .any(|f| f.logical_path == "/notes/greetings.md")
-    })
+    settle(
+        "bob sees the logical path",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.files()
+                .await
+                .iter()
+                .any(|f| f.logical_path == "/notes/greetings.md")
+        },
+    )
     .await;
 
     println!("  manifest as bob sees it:");
@@ -113,10 +117,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nbob rotates his leaf key...");
     bob.rotate().await?;
     alice.append("Written after Bob's rotation. ").await?;
-    settle("bob reads across the rotation", Duration::from_secs(30), || async {
-        bob.ingest().await;
-        bob.text().await.contains("after Bob's rotation")
-    })
+    settle(
+        "bob reads across the rotation",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.text().await.contains("after Bob's rotation")
+        },
+    )
     .await;
 
     // Roles are enforced, not decorative: bob is an editor, not an admin.

@@ -5,17 +5,17 @@
 //! Reordering and partitioning are expressed by choosing when to hand a message
 //! to a node, which is exactly the seam the `propsim` harness plugs into.
 
+use std::sync::Arc;
+
 use beekem::{id::TreeId, operation::CgkaOperation};
 use iroh_beekem_core::{
     CgkaController, DocumentUuid, Effect, Event, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
-    share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner,
-    verifiable::Verifiable,
+    share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
-use std::sync::Arc;
 
 fn rng(seed: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(seed)
@@ -53,8 +53,7 @@ fn two_node_workspace() -> Bus {
         .expect("bob is new");
 
     let log = alice_cgka.op_log().expect("exporting log");
-    let bob_cgka =
-        CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
+    let bob_cgka = CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
 
     Bus {
         alice: WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
@@ -239,13 +238,7 @@ fn concurrent_edits_from_both_members_converge() {
             }
             Effect::StoreChunk { chunk, .. } => {
                 bus.alice
-                    .handle(
-                        Event::ChunkArrived {
-                            doc: DOC,
-                            chunk,
-                        },
-                        &mut rng(0),
-                    )
+                    .handle(Event::ChunkArrived { doc: DOC, chunk }, &mut rng(0))
                     .expect("alice handles bob's chunk");
             }
             Effect::StoreManifest { chunk, .. } => {
@@ -271,22 +264,29 @@ fn concurrent_edits_from_both_members_converge() {
             "no concurrent edit should be lost; {expected:?} missing from {alice_text:?}"
         );
     }
-    assert_eq!(bus.alice.pending_len(), 0, "alice should have nothing parked");
+    assert_eq!(
+        bus.alice.pending_len(),
+        0,
+        "alice should have nothing parked"
+    );
     assert_eq!(bus.bob.pending_len(), 0, "bob should have nothing parked");
 }
 
 /// Roles were fully implemented in the manifest but had no caller: nothing
 /// consulted them before acting. These cover the enforcement points.
 mod roles_are_enforced {
-    use super::{rng, two_node_workspace, DOC};
     use iroh_beekem_core::{CoreError, Event, FileEntry, Role};
+
+    use super::{DOC, rng, two_node_workspace};
 
     #[test]
     fn the_founder_is_an_admin_and_a_joiner_is_not() {
         let bus = two_node_workspace();
 
         assert_eq!(
-            bus.alice.manifest().role_of(&bus.alice.member_id().to_bytes()),
+            bus.alice
+                .manifest()
+                .role_of(&bus.alice.member_id().to_bytes()),
             Some(Role::Admin),
             "founding a workspace must make you its first admin"
         );
@@ -425,12 +425,13 @@ mod roles_are_enforced {
 /// checked here against chunks that can never become applicable, which is what
 /// a flood looks like.
 mod the_pending_queue_is_bounded {
-    use super::{rng, two_node_workspace, DOC};
     use iroh_beekem_core::{
-        state::{MAX_PENDING_CHUNKS, MAX_PENDING_CHUNK_BYTES},
         Chunk, ChunkRef, Event,
+        state::{MAX_PENDING_CHUNK_BYTES, MAX_PENDING_CHUNKS},
     };
     use keyhive_crypto::{digest::Digest, siv::Siv, symmetric_key::SymmetricKey};
+
+    use super::{DOC, rng, two_node_workspace};
 
     /// A syntactically valid chunk that no key in the workspace can open.
     ///

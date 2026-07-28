@@ -1,6 +1,9 @@
 [package]
 name = "iroh-beekem"
 description = "Group-confidential, local-first collaborative workspaces over iroh, with BeeKEM continuous group key agreement."
+readme = "README.md"
+keywords = ["p2p", "crdt", "local-first", "encryption", "iroh"]
+categories = ["cryptography", "network-programming", "asynchronous"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,7 +11,9 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-iroh-beekem-core = { path = "../iroh-beekem-core" }
+# The `version` is not redundant with `path`: cargo refuses to publish a crate
+# whose dependencies carry only a path, since crates.io has no path to resolve.
+iroh-beekem-core = { path = "../iroh-beekem-core", version = "0.1.0" }
 beekem.workspace = true
 keyhive_crypto.workspace = true
 rand.workspace = true
