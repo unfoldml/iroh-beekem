@@ -40,11 +40,14 @@ use keyhive_crypto::{
     signer::memory::MemorySigner,
     verifiable::Verifiable,
 };
-use proptest::{prelude::prop_oneof, strategy::{BoxedStrategy, Strategy}};
 use propsim_core::{
     ClientCodec, FrozenOp, NodeId,
     history::{Function, Value},
     node::{Completion, Ctx, Node, OpOutcome, OpToken},
+};
+use proptest::{
+    prelude::prop_oneof,
+    strategy::{BoxedStrategy, Strategy},
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -603,8 +606,20 @@ impl<S: Scenario> WorkspaceNode<S> {
         WsResp::Applied
     }
 
+    /// Re-announce every document this node holds.
+    ///
+    /// The simulator's counterpart to the facade's republish-on-neighbour-up.
+    fn republish(&mut self, cx: &mut dyn Ctx<Self>) {
+        for (i, doc) in DOCS.into_iter().enumerate() {
+            self.drive(Event::Resync { doc }, cx, 9000 + i as u64);
+        }
+    }
+
     /// Apply and complete everything queued while this node was still joining.
     fn flush_deferred_ops(&mut self, cx: &mut dyn Ctx<Self>) {
+        if self.state.is_none() {
+            return;
+        }
         for (token, op) in std::mem::take(&mut self.deferred_ops) {
             let resp = self.apply_op(&op, cx);
             cx.complete_op(token, Completion::Ok(resp));
@@ -651,6 +666,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                 Msg::Op(op) => {
                     self.observed_ops += 1;
                     self.drive(Event::ControlOp(Arc::new(*op)), cx, 0);
+                    self.flush_deferred_ops(cx);
                 }
                 Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 0),
                 // Join-protocol messages; by the time we flush, joining is done.
@@ -712,6 +728,17 @@ impl<S: Scenario> WorkspaceNode<S> {
                 secret: workspace_secret_bytes(),
             },
         );
+
+        // Re-announce current state, exactly as `Workspace` does when a peer
+        // appears on the gossip overlay. Without this the simulator omits a
+        // protocol step the real facade performs, and the omission is not
+        // cosmetic: a joiner cannot derive the key for anything written before
+        // its `Add`, so content that predates it stays unreadable forever
+        // unless somebody re-encrypts it under a key the joiner *can* reach.
+        // Ordering matters for the same reason it does in the facade — the
+        // `Welcome` above carries the operation log the joiner needs before any
+        // of this becomes decryptable.
+        self.republish(cx);
     }
 
     fn on_welcome(
@@ -799,6 +826,7 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 // question the revocation properties ask.
                 self.observed_ops += 1;
                 self.drive(Event::ControlOp(Arc::new(*op)), cx, 2);
+                self.flush_deferred_ops(cx);
             }
             Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 3),
         }
@@ -971,13 +999,16 @@ impl<S: Scenario> ClientCodec<WorkspaceNode<S>> for WorkspaceSpec {
 /// document: the core clamps them, and that clamping is exactly the behaviour a
 /// caller holding a view a concurrent edit has already shortened depends on. A
 /// strategy that only ever produced in-range offsets would never exercise it.
-#[must_use]
+/// # Panics
+///
+/// Panics if the built-in text pattern is not a valid regex, which would be a
+/// bug in this function rather than anything a caller can cause.
 pub fn crud_workload(nodes: usize) -> BoxedStrategy<FrozenOp> {
     // Rebuilt per branch rather than cloned: `RegexGeneratorStrategy` is not
     // `Clone`, and a closure keeps the intent obvious at each use.
     let text = || proptest::string::string_regex("[a-z]{1,6}").expect("valid regex");
-    let doc = || (0..DOCS.len()).prop_map(|d| Value::Int(d as i64));
-    let small = || (0usize..12).prop_map(|n| Value::Int(n as i64));
+    let doc = || (0..DOCS.len()).prop_map(|d| Value::Int(i64::try_from(d).unwrap_or(0)));
+    let small = || (0usize..12).prop_map(|n| Value::Int(i64::try_from(n).unwrap_or(0)));
 
     let op = prop_oneof![
         // Weighted towards appends: they are the operation whose effect a

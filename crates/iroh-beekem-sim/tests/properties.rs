@@ -437,7 +437,6 @@ mod generated_crud_workloads {
     /// Un-ignore this once the cause is understood; it should not be weakened
     /// into something that passes.
     #[test]
-    #[ignore = "known gap: re-announcement does not always repair a joiner; see the doc comment"]
     fn every_document_converges_under_a_generated_workload() {
         // Byte-identical, not merely "contains what I wrote". Concurrent inserts
         // have no canonical order, so the assertion is that all replicas agree —
