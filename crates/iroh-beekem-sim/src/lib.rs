@@ -24,7 +24,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    marker::PhantomData,
+    sync::Arc,
+    time::Duration,
+};
 
 use beekem::{
     id::{MemberId, TreeId},
@@ -88,21 +93,35 @@ const JOIN_RETRY: Duration = Duration::from_millis(100);
 /// snapshot, and a deep clone here means serializing every CRDT document. The
 /// interval and [`MAX_RESYNCS`] are therefore tuned to keep runs to seconds
 /// while still giving lost chunks several chances to be re-announced.
-const RESYNC_INTERVAL: Duration = Duration::from_millis(400);
+const RESYNC_INTERVAL: Duration = Duration::from_millis(600);
 
 /// How many times a node re-announces before going quiet, so runs terminate.
 ///
-/// A real node re-announces forever; this budget exists only so a run ends. The
-/// fixed-script scenarios finish writing within the first second, so eight
-/// rounds comfortably outlast them — but a generated workload keeps issuing
-/// writes for the whole run, and anti-entropy that stopped first would leave a
-/// late chunk lost by the lossy transport with nothing to recover it. That
-/// would look exactly like a convergence bug while being an artefact of the
-/// harness, so workload scenarios get a budget that outlasts the run.
-const MAX_RESYNCS: u32 = 8;
+/// A real node re-announces forever — `iroh-docs` reconciles continuously — and
+/// this budget exists only so a simulated run ends. It must therefore outlast
+/// **the faults**, not merely the writes. A partition that heals after the last
+/// re-announcement leaves the two sides permanently disagreeing, which reads as
+/// a convergence bug and is really a harness that stopped trying: the very
+/// artefact this comment used to warn about, one cause further out.
+///
+/// Sized against the fault schedule rather than the write schedule: at
+/// [`RESYNC_INTERVAL`] this covers the horizon of every property in the suite.
+/// Raising the *interval* rather than the count is deliberate — every event
+/// makes the simulator deep-clone all node state, so coverage is bought far
+/// more cheaply in duration than in frequency.
+const MAX_RESYNCS: u32 = 24;
 
 /// The re-announcement budget when generated operations drive the run.
-const MAX_RESYNCS_UNDER_WORKLOAD: u32 = 32;
+const MAX_RESYNCS_UNDER_WORKLOAD: u32 = 24;
+
+/// How many anti-entropy rounds pass between control-plane log repairs.
+///
+/// The control plane needs its own repair — a lost operation is unrecoverable
+/// by any amount of data-plane re-announcement — but a log broadcast carries the
+/// whole history to every peer, which makes it the most expensive message in the
+/// simulation. Production is event-driven and cooldown-limited here; this is the
+/// closest cheap analogue.
+const LOG_REPAIR_EVERY: u32 = 4;
 
 /// How often a rotating node re-keys its leaf.
 const ROTATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -145,6 +164,13 @@ pub trait Scenario: Clone + Default + 'static {
     /// Whether non-founder nodes also broadcast operations signed by a key that
     /// no `Add` ever introduced.
     const FORGE: bool = false;
+    /// Which node never asks to be admitted, if any.
+    ///
+    /// Distinct from [`Self::FORGE`]: a forging node attacks the control plane
+    /// with signatures it genuinely holds, while an outsider does nothing at
+    /// all. It is on the network and receives every broadcast, and the only
+    /// thing standing between it and the workspace is the roster.
+    const OUTSIDER: Option<u64> = None;
 }
 
 /// The base protocol: joins, edits and anti-entropy, nothing adversarial.
@@ -165,6 +191,19 @@ impl Scenario for Churn {
 pub struct Forging;
 impl Scenario for Forging {
     const FORGE: bool = true;
+}
+
+/// A node that never asks to join, sitting on the network and listening.
+///
+/// The scenario for the claim admission control is supposed to make true: that
+/// confidentiality against a stranger rests on them not being a member, and not
+/// merely on them not knowing the topic id. Node 3 is chosen rather than node 1
+/// so that the honest group still has more than two members and the properties
+/// about *them* stay meaningful.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Outsider;
+impl Scenario for Outsider {
+    const OUTSIDER: Option<u64> = Some(3);
 }
 
 /// Content driven entirely by generated CRUD operations.
@@ -208,6 +247,21 @@ pub enum Msg {
     },
     /// Control plane: a signed CGKA operation.
     Op(Box<Signed<CgkaOperation>>),
+    /// Control plane repair: the sender's whole operation log.
+    ///
+    /// The counterpart of `ControlMsg::Log`, which the real `Workspace` ships
+    /// whenever a neighbour appears. Without it a single lost [`Msg::Op`] is
+    /// lost *forever*, and the consequences are unrecoverable rather than
+    /// merely slow: a peer that misses the operation establishing a PCS key can
+    /// never derive it, so every later chunk and every later manifest encrypted
+    /// under that key is permanently undecryptable to it. Anti-entropy on the
+    /// data plane cannot repair that, because re-announcing re-encrypts under
+    /// the same key the peer already could not derive.
+    ///
+    /// Modelling the data plane's repair but not the control plane's would have
+    /// made the simulator strictly more fragile than production, and every
+    /// resulting failure an artefact of the harness.
+    Log(Vec<Signed<CgkaOperation>>),
     /// Data plane: one entry in the replicated index.
     ///
     /// Carries the *blinded key* rather than a document id, because that is all
@@ -355,6 +409,22 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// distinguish "cannot read the content" from "cannot even tell the content
     /// exists" — and a revoked member is supposed to be denied both.
     index: BTreeMap<StorageKey, EntryMeta>,
+    /// The modelled overlay: peers this node currently accepts messages from.
+    ///
+    /// Recomputed from [`WorkspaceState::roster`] — the same derivation the real
+    /// `RosterGuard` is fed — and mapped back to node ids through
+    /// [`node_of_endpoint`]. Messages from anyone else are dropped on receipt,
+    /// before they are observed, which models the *effect* of refusing the
+    /// connection. The real-QUIC suite is what proves the guard is actually
+    /// wired to `iroh`; this proves the membership rule feeding it is right.
+    roster: BTreeSet<NodeId>,
+    /// Peers accepted unconditionally, to break the bootstrap circle.
+    ///
+    /// A joiner cannot derive a roster until a manifest reaches it, and no
+    /// manifest can reach it until it accepts something — so it accepts its
+    /// inviter on faith, exactly as `Workspace::join` seeds the real roster from
+    /// `Invite.inviter`. Deliberately one peer, and never pruned.
+    bootstrap: BTreeSet<NodeId>,
     /// Control-plane operations seen, whether or not they applied.
     observed_ops: u64,
     /// Client operations that arrived before this node finished joining.
@@ -400,6 +470,43 @@ pub fn doc_key(doc: DocumentUuid) -> StorageKey {
 /// The blinding secret, fixed so every simulated node agrees on storage keys.
 fn workspace_secret_bytes() -> [u8; 32] {
     [0x5Au8; 32]
+}
+
+/// Tag distinguishing a simulated transport address from anything else.
+///
+/// Present so that a stray 32-byte value cannot be mistaken for an address of
+/// node zero, which is the founder and the most damaging one to impersonate.
+const ENDPOINT_TAG: [u8; 8] = *b"propsim\0";
+
+/// The transport address a simulated node publishes.
+///
+/// Stands in for an `iroh` `EndpointId`. It is derived from — and invertible
+/// back to — the node id, which is what lets the modelled overlay check the
+/// *real* roster [`WorkspaceState::roster`] computes, rather than a parallel
+/// membership model maintained alongside it. Deriving a roster twice by two
+/// different rules is how a simulation ends up proving something the production
+/// code does not do.
+#[must_use]
+pub fn endpoint_of(node: NodeId) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&ENDPOINT_TAG);
+    bytes[8..16].copy_from_slice(&node.0.to_le_bytes());
+    bytes
+}
+
+/// Which node published this transport address, if any.
+///
+/// Returns `None` for anything this simulation did not mint, so a malformed or
+/// forged address is treated as "not on the roster" rather than resolving to
+/// some node by accident.
+#[must_use]
+fn node_of_endpoint(bytes: &[u8; 32]) -> Option<NodeId> {
+    if bytes[..8] != ENDPOINT_TAG || bytes[16..] != [0u8; 16] {
+        return None;
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&bytes[8..16]);
+    Some(NodeId(u64::from_le_bytes(id)))
 }
 
 impl<S: Scenario> WorkspaceNode<S> {
@@ -511,6 +618,35 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.state.as_ref().map_or(0, WorkspaceState::group_size)
     }
 
+    /// The peers this node currently accepts messages from, bootstrap included.
+    ///
+    /// Sorted, because it comes from a `BTreeSet`, so two nodes with the same
+    /// membership produce identical vectors and a convergence property can
+    /// compare them directly.
+    #[must_use]
+    pub fn roster(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self.roster.union(&self.bootstrap).copied().collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether this node currently accepts messages from `peer`.
+    #[must_use]
+    pub fn is_on_roster(&self, peer: NodeId) -> bool {
+        self.roster.contains(&peer) || self.bootstrap.contains(&peer)
+    }
+
+    /// The peers this node derived from workspace membership alone.
+    ///
+    /// Excludes the bootstrap exception, so a property can assert that eviction
+    /// reaches the *derived* set even while a stale bootstrap entry lingers.
+    #[must_use]
+    pub fn derived_roster(&self) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = self.roster.iter().copied().collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Announce this node's leaf key so the founder can admit it.
     fn send_hello(&self, cx: &mut dyn Ctx<Self>) {
         let (Some(signer), Some(share_secret)) = (self.signer.as_ref(), self.share_secret) else {
@@ -520,6 +656,68 @@ impl<S: Scenario> WorkspaceNode<S> {
             member: MemberId::from(signer.verifying_key()),
             share_key: share_secret.share_key(),
         });
+    }
+
+    /// Broadcast this node's whole operation log, so peers can fill in gaps.
+    ///
+    /// Bounded by nothing here because the simulated log is tiny; the real
+    /// `Workspace` caps the receive side with `MAX_LOG_OPS` and rate-limits the
+    /// send side with a per-peer cooldown, both of which are transport concerns
+    /// rather than protocol ones.
+    fn send_log(&mut self, cx: &mut dyn Ctx<Self>) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let Ok(log) = state.op_log() else {
+            return;
+        };
+        if !log.is_empty() {
+            cx.broadcast(Msg::Log(log));
+        }
+    }
+
+    /// Merge every operation in a peer's repair broadcast.
+    ///
+    /// Counted as observed one operation at a time, exactly like [`Msg::Op`]:
+    /// what a node saw on the control plane is the question the revocation
+    /// properties ask, and a repair carrying ten operations is ten things seen.
+    fn on_log(&mut self, log: Vec<Signed<CgkaOperation>>, cx: &mut dyn Ctx<Self>) {
+        for op in log {
+            self.observed_ops += 1;
+            self.drive(Event::ControlOp(Arc::new(op)), cx, 4);
+        }
+        self.flush_deferred_ops(cx);
+    }
+
+    /// Recompute the modelled overlay from the workspace state.
+    ///
+    /// Called after every drive rather than only after membership events: the
+    /// roster derives from the manifest, and a manifest arrives as an ordinary
+    /// chunk, so there is no event this node can look at locally that reliably
+    /// says "membership just moved". The recompute is a scan of the device list,
+    /// which in a simulation of a handful of nodes is free.
+    fn refresh_roster(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        self.roster = state.roster().iter().filter_map(node_of_endpoint).collect();
+    }
+
+    /// Whether a message from `from` should be accepted at all.
+    ///
+    /// The join handshake is exempt, and only the join handshake. [`Msg::Hello`]
+    /// carries a public leaf key and is broadcast, so accepting one from a
+    /// stranger reveals nothing; [`Msg::Welcome`] carries the workspace secret
+    /// but is *unicast* to a peer the sender chose to admit, so a node only ever
+    /// receives one it was meant to have. Everything else — the control plane
+    /// and the index — is gated.
+    fn admits(&self, from: NodeId, msg: &Msg) -> bool {
+        match msg {
+            Msg::Hello { .. } | Msg::Welcome { .. } => true,
+            Msg::Op(_) | Msg::Log(_) | Msg::Entry { .. } => {
+                self.roster.contains(&from) || self.bootstrap.contains(&from)
+            }
+        }
     }
 
     /// Record an entry in the modelled replica.
@@ -613,6 +811,13 @@ impl<S: Scenario> WorkspaceNode<S> {
         for (i, doc) in DOCS.into_iter().enumerate() {
             self.drive(Event::Resync { doc }, cx, 9000 + i as u64);
         }
+        // The manifest too, and it is not an afterthought: it is published only
+        // when it *changes*, so a dropped manifest chunk has nothing behind it
+        // to carry the content. Device records live there, and the roster is
+        // derived from device records — omit this and a peer whose record was
+        // lost in transit is refused forever, which looks like a membership bug
+        // and is really a missing re-announcement.
+        self.drive(Event::ResyncManifest, cx, 9100);
     }
 
     /// Apply and complete everything queued while this node was still joining.
@@ -657,6 +862,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                 Effect::Applied { .. } | Effect::ManifestUpdated => {}
             }
         }
+        self.refresh_roster();
     }
 
     /// Replay everything buffered while this node was still joining.
@@ -668,6 +874,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                     self.drive(Event::ControlOp(Arc::new(*op)), cx, 0);
                     self.flush_deferred_ops(cx);
                 }
+                Msg::Log(log) => self.on_log(log, cx),
                 Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 0),
                 // Join-protocol messages; by the time we flush, joining is done.
                 Msg::Hello { .. } | Msg::Welcome { .. } => {}
@@ -712,6 +919,9 @@ impl<S: Scenario> WorkspaceNode<S> {
                 share_key,
                 role: Role::Editor,
                 display_name: format!("node-{}", from.0),
+                // Recorded by the admitter, which is the only way the joiner
+                // reaches anyone's roster before it has synced a manifest.
+                endpoint: Some(endpoint_of(from)),
             },
             cx,
             1,
@@ -743,6 +953,7 @@ impl<S: Scenario> WorkspaceNode<S> {
 
     fn on_welcome(
         &mut self,
+        from: NodeId,
         log: &[Signed<CgkaOperation>],
         secret: [u8; 32],
         cx: &mut dyn Ctx<Self>,
@@ -759,10 +970,34 @@ impl<S: Scenario> WorkspaceNode<S> {
             return;
         };
         self.state = Some(WorkspaceState::joined(cgka, WorkspaceSecret::new(secret)));
+        // The inviter, accepted on faith until a manifest arrives to derive a
+        // real roster from. `Invite.inviter` plays exactly this role in
+        // `Workspace::join`; without it the joiner would refuse the very
+        // manifest that would tell it whom to accept.
+        self.bootstrap.insert(from);
+        self.announce_endpoint(cx);
         self.flush_inbox(cx);
         // Client operations issued while this node was still onboarding apply
         // now, in arrival order, rather than having been discarded.
         self.flush_deferred_ops(cx);
+    }
+
+    /// Publish this node's transport address into the manifest.
+    ///
+    /// A joiner has no device record to attach it to yet, so the core holds it
+    /// and re-applies it when the first manifest arrives. Skipping this would
+    /// leave the node off every peer's derived roster, and every peer would go
+    /// on refusing it once its inviter's bootstrap entry stopped being the only
+    /// thing carrying it.
+    fn announce_endpoint(&mut self, cx: &mut dyn Ctx<Self>) {
+        let me = cx.me();
+        self.drive(
+            Event::AnnounceEndpoint {
+                endpoint_id: endpoint_of(me),
+            },
+            cx,
+            0xE7,
+        );
     }
 }
 
@@ -786,8 +1021,31 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                     WorkspaceState::found(cgka, WorkspaceSecret::new(workspace_secret_bytes()))
             {
                 self.state = Some(state);
+                // The founder already holds its own device record, so this
+                // lands immediately and puts it on its own derived roster.
+                self.announce_endpoint(cx);
             }
+        } else if S::OUTSIDER == Some(me.0) {
+            // Deliberately silent, and deliberately given no bootstrap peer: an
+            // outsider holds no invite, so there is nobody it accepts on faith
+            // and nobody who accepts it. It still receives every broadcast the
+            // simulator delivers, which is what makes "observes nothing" a
+            // claim about the roster rather than about the network.
         } else {
+            // A joiner accepts its inviter from the outset, before it has any
+            // state of its own. This models `Invite.inviter`, which reaches the
+            // joiner out of band and which `Workspace::join` puts on the roster
+            // *before* subscribing to anything.
+            //
+            // Seeding it here rather than on `Welcome` is not a convenience.
+            // A joiner must accept operations and entries that arrive while it
+            // is still onboarding — under an unordered transport the `Welcome`
+            // routinely loses the race against them, which is why there is an
+            // inbox at all — and a node that refused them until the `Welcome`
+            // landed would discard exactly the messages the inbox exists to
+            // keep. That is the difference between a joiner and an outsider:
+            // holding an invite, not having already joined.
+            self.bootstrap.insert(NodeId(FOUNDER));
             self.send_hello(cx);
             cx.set_timer(Tick::Join, JOIN_RETRY);
         }
@@ -811,9 +1069,17 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
     }
 
     fn on_msg(&mut self, from: NodeId, msg: Msg, cx: &mut dyn Ctx<Self>) {
+        // Refused before it is observed, not merely before it is applied. The
+        // distinction is the whole point: a node that recorded the entry and
+        // then declined to decrypt it would still have learned that the entry
+        // exists, how big it is and who wrote it — which is the metadata leak
+        // admission control exists to close.
+        if !self.admits(from, &msg) {
+            return;
+        }
         match msg {
             Msg::Hello { member, share_key } => self.on_hello(from, member, share_key, cx),
-            Msg::Welcome { log, secret } => self.on_welcome(&log, secret, cx),
+            Msg::Welcome { log, secret } => self.on_welcome(from, &log, secret, cx),
             other if self.state.is_none() => {
                 // Not joined yet: hold this rather than dropping it. A dropped
                 // control operation is unrecoverable — every later chunk becomes
@@ -828,6 +1094,7 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 self.drive(Event::ControlOp(Arc::new(*op)), cx, 2);
                 self.flush_deferred_ops(cx);
             }
+            Msg::Log(log) => self.on_log(log, cx),
             Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 3),
         }
     }
@@ -882,6 +1149,22 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 for (i, doc) in DOCS.into_iter().enumerate() {
                     let salt = 5000 + u64::from(self.resyncs_done) * 16 + i as u64;
                     self.drive(Event::Resync { doc }, cx, salt);
+                }
+                // The manifest shares the round's salt space, one slot past the
+                // documents. It is re-announced on the same schedule because it
+                // is lost the same way, and because the roster derives from it:
+                // a device record that never arrives costs its owner a place on
+                // that peer's roster indefinitely.
+                let manifest_salt = 5000 + u64::from(self.resyncs_done) * 16 + DOCS.len() as u64;
+                self.drive(Event::ResyncManifest, cx, manifest_salt);
+                // Control-plane repair, on a deliberately sparser cadence. The
+                // real `Workspace` ships its log on `NeighborUp` behind a
+                // ten-second per-peer cooldown, so a log broadcast every
+                // anti-entropy round would make the simulator *more* talkative
+                // than production — and it is the expensive message, since one
+                // carries the whole history to every peer.
+                if self.resyncs_done.is_multiple_of(LOG_REPAIR_EVERY) {
+                    self.send_log(cx);
                 }
                 self.resyncs_done += 1;
                 let budget = if S::WORKLOAD {

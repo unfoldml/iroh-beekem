@@ -14,6 +14,12 @@
 //!
 //! Spawn order matters: blobs and gossip must exist before docs, which is
 //! handed both.
+//!
+//! All three are wrapped in a [`RosterGuard`] before being registered, so a peer
+//! that is not a member of the workspace is refused at the connection level on
+//! every ALPN. Guarding only gossip would leave the docs index — and with it
+//! every document's existence, size, author and timing — readable by anyone who
+//! learned the namespace.
 
 use std::ops::Deref;
 
@@ -22,7 +28,10 @@ use iroh_blobs::{BlobsProtocol, store::mem::MemStore};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::net::Gossip;
 
-use crate::error::WorkspaceError;
+use crate::{
+    error::WorkspaceError,
+    roster::{Roster, RosterGuard},
+};
 
 /// A bound endpoint with all three workspace protocols running.
 #[derive(Debug, Clone)]
@@ -32,6 +41,13 @@ pub struct Node {
     blobs: MemStore,
     gossip: Gossip,
     docs: Docs,
+    /// Who this node accepts connections from.
+    ///
+    /// Owned by the node rather than by the workspace because the guards must
+    /// be installed when the router is built, which happens before any
+    /// workspace exists. The workspace populates it; until it does, the node
+    /// accepts nobody.
+    roster: Roster,
 }
 
 impl Node {
@@ -54,10 +70,23 @@ impl Node {
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
+        // Every ALPN behind the same roster. Adding a fourth protocol without
+        // wrapping it would silently reopen the hole this closes, which is why
+        // the guard is applied here rather than inside each protocol.
+        let admission = Roster::default();
         let router = Router::builder(endpoint.clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
-            .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(iroh_docs::ALPN, docs.clone())
+            .accept(
+                iroh_blobs::ALPN,
+                RosterGuard::new(admission.clone(), BlobsProtocol::new(&blobs, None)),
+            )
+            .accept(
+                iroh_gossip::ALPN,
+                RosterGuard::new(admission.clone(), gossip.clone()),
+            )
+            .accept(
+                iroh_docs::ALPN,
+                RosterGuard::new(admission.clone(), docs.clone()),
+            )
             .spawn();
 
         Ok(Self {
@@ -66,6 +95,7 @@ impl Node {
             blobs,
             gossip,
             docs,
+            roster: admission,
         })
     }
 
@@ -91,6 +121,15 @@ impl Node {
     #[must_use]
     pub fn docs(&self) -> &Docs {
         &self.docs
+    }
+
+    /// This node's admission list, shared with the guard on every ALPN.
+    ///
+    /// Crate-internal: the roster is derived from workspace membership, and
+    /// letting an application write to it directly would let it admit peers the
+    /// group never agreed on.
+    pub(crate) fn roster(&self) -> &Roster {
+        &self.roster
     }
 
     /// Shut the node down, closing all protocol handlers.

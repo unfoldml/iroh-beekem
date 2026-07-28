@@ -19,7 +19,7 @@
 //! source of silent data loss in the whole system, which is why
 //! [`WorkspaceState::pending_len`] is exposed for properties to assert on.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use beekem::{id::MemberId, operation::CgkaOperation};
 use keyhive_crypto::{share_key::ShareKey, signed::Signed};
@@ -115,6 +115,15 @@ pub enum Event {
         role: Role,
         /// Human-readable name, for display only.
         display_name: String,
+        /// The new device's transport address, if the admitter knows it.
+        ///
+        /// Recorded by the admitter rather than waiting for the joiner to
+        /// announce it, because the joiner cannot be admitted to the overlay
+        /// until it is on a roster, and it cannot get onto a roster until its
+        /// address is recorded. Supplying it here breaks that circle. `None` is
+        /// legitimate — the joiner's own `AnnounceEndpoint` fills it in — but
+        /// then somebody must let the joiner connect in the meantime.
+        endpoint: Option<[u8; 32]>,
     },
     /// The local user admitted another device for an existing person.
     ///
@@ -131,6 +140,9 @@ pub enum Event {
         user: [u8; 32],
         /// Human-readable label, for display only.
         label: String,
+        /// The new device's transport address, if the admitter knows it. See
+        /// [`Event::AddUser::endpoint`].
+        endpoint: Option<[u8; 32]>,
     },
     /// The local user revoked a member.
     RemoveMember {
@@ -187,6 +199,21 @@ pub enum Event {
         /// The local `iroh-docs` author id.
         author: [u8; 32],
     },
+    /// Publish the local device's transport address.
+    ///
+    /// Self-attestation, like [`Event::AnnounceAuthor`], and safe for the same
+    /// reason inverted: an endpoint id grants nothing on its own, because the
+    /// roster admits an address only when the *member* holding it is one the
+    /// group already accepted. Claiming somebody else's address would at worst
+    /// let them connect.
+    ///
+    /// Recorded locally even when the manifest cannot yet accept it, and
+    /// re-applied on every manifest arrival — a joiner announces before its
+    /// first sync, when it has no device record to attach the address to.
+    AnnounceEndpoint {
+        /// The local `iroh` endpoint id, as raw bytes.
+        endpoint_id: [u8; 32],
+    },
     /// Re-publish a document's current state without editing it.
     ///
     /// This is anti-entropy. Over a lossy transport a chunk can be dropped with
@@ -197,6 +224,24 @@ pub enum Event {
         /// Which document to re-publish.
         doc: DocumentUuid,
     },
+    /// Re-publish the manifest without changing it.
+    ///
+    /// Anti-entropy for the manifest, and needed for the same reason
+    /// [`Event::Resync`] is needed for a document: over a lossy transport a
+    /// manifest chunk can be dropped with no later chunk to carry its content,
+    /// because the manifest is otherwise published *only when it changes*.
+    ///
+    /// The consequence of omitting it is not cosmetic. Device records live in
+    /// the manifest, and the roster is derived from them — so a member whose
+    /// record was lost in transit is refused by that peer indefinitely, and the
+    /// group silently partitions along the lines of which manifest chunks
+    /// happened to arrive.
+    ///
+    /// Deliberately **not** gated on a writing role, unlike [`Event::Resync`].
+    /// A viewer has something legitimate to re-announce here — its own author
+    /// and endpoint records, which it published without needing a role in the
+    /// first place — and refusing would leave viewers permanently unreachable.
+    ResyncManifest,
 }
 
 /// Something the caller must do on this node's behalf.
@@ -272,6 +317,15 @@ pub struct WorkspaceState {
     /// need the predecessor chunk to decrypt — the digest travels inside the
     /// ciphertext's metadata — so this costs nothing in liveness.
     last_ref: HashMap<DocumentUuid, ChunkRef>,
+    /// This device's transport address, once the caller has announced one.
+    ///
+    /// Held here as well as in the manifest because the manifest cannot always
+    /// accept it. `Manifest::set_device_endpoint` needs a device record to
+    /// attach to, and a joiner's manifest is empty until its first sync — so
+    /// the announcement is remembered and re-applied every time a manifest
+    /// arrives. Without that a joiner never appears on any peer's roster, and
+    /// admission control would lock it out of the workspace it just joined.
+    endpoint_id: Option<[u8; 32]>,
 }
 
 impl Clone for WorkspaceState {
@@ -310,6 +364,7 @@ impl Clone for WorkspaceState {
             pending_bytes: self.pending_bytes,
             evicted_chunks: self.evicted_chunks,
             last_ref: self.last_ref.clone(),
+            endpoint_id: self.endpoint_id,
         }
     }
 }
@@ -342,6 +397,7 @@ impl WorkspaceState {
             pending_bytes: 0,
             evicted_chunks: 0,
             last_ref: HashMap::new(),
+            endpoint_id: None,
         }
     }
 
@@ -386,6 +442,50 @@ impl WorkspaceState {
     #[must_use]
     pub fn group_size(&self) -> u32 {
         self.cgka.group_size()
+    }
+
+    /// The transport addresses this node should currently accept connections
+    /// from: every device that is still a member and has published an address.
+    ///
+    /// Derived, never authored. Both halves converge on their own — membership
+    /// through the CGKA operation log, addresses through the manifest — so the
+    /// roster needs no distribution channel of its own and inherits the
+    /// admin-gating that already guards `AddUser` and `AddDevice`.
+    ///
+    /// Computed here rather than in the transport layer so the eviction rule is
+    /// testable without a socket, which is what the no-I/O rule buys.
+    ///
+    /// Two limits are inherent rather than incidental, and callers must not
+    /// mistake this for more than it is:
+    ///
+    /// * **Eviction is eventual.** A removed device stays on the roster of any
+    ///   peer that has not yet merged the `Remove`.
+    /// * **This is an availability boundary, not a confidentiality one.** It
+    ///   decides who may attempt to sync. What they can *read* is decided by
+    ///   the CGKA, and nothing here retracts data already synced.
+    ///
+    /// Sorted, so that two nodes with the same membership produce byte-identical
+    /// rosters and a property can compare them directly.
+    #[must_use]
+    pub fn roster(&self) -> Vec<[u8; 32]> {
+        // Compared as bytes rather than by rebuilding a `MemberId` per device:
+        // `MemberId` wraps a decompressed Ed25519 point, so parsing one costs a
+        // point decompression that would be paid per device per recompute, and
+        // a member id that fails to parse could never have entered the tree in
+        // the first place. The manifest is remote input, so "unparseable" must
+        // mean "not on the roster", not "propagate an error".
+        let members: HashSet<[u8; 32]> =
+            self.cgka.current_members().map(|m| m.to_bytes()).collect();
+        let mut out: Vec<[u8; 32]> = self
+            .manifest
+            .devices()
+            .into_iter()
+            .filter(|device| members.contains(&device.member))
+            .filter_map(|device| device.endpoint_id)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Chunks parked awaiting keys or CRDT dependencies.
@@ -495,47 +595,27 @@ impl WorkspaceState {
                 share_key,
                 role,
                 display_name,
+                endpoint,
             } => {
                 self.require_admin()?;
-                self.admit(member, share_key, csprng, |manifest, member| {
-                    // All three records, together. A leaf with no device record
-                    // has no user, so it has no role, so every peer's
-                    // `author_may_write` rejects its entries — it would appear
-                    // to join and then silently fail to publish anything.
-                    manifest.set_user(member, &display_name)?;
-                    manifest.set_device(member, member, "first device")?;
-                    manifest.set_role(member, role)
-                })
+                self.on_add_user(member, share_key, role, &display_name, endpoint, csprng)
             }
             Event::AddDevice {
                 member,
                 share_key,
                 user,
                 label,
+                endpoint,
             } => {
                 self.require_may_add_device_to(&user)?;
-                self.admit(member, share_key, csprng, |manifest, member| {
-                    // No role is granted here: the device inherits its user's,
-                    // which is the whole reason roles are keyed by user.
-                    manifest.set_device(member, &user, &label)
-                })
+                self.on_add_device(member, share_key, &user, &label, endpoint, csprng)
             }
             Event::RemoveMember { member } => self.on_remove_member(member),
             Event::Rotate => {
                 let op = self.cgka.rotate(csprng)?;
                 Ok(vec![Effect::BroadcastOp(Box::new(op))])
             }
-            // No parking queue for the manifest: it is re-published on every
-            // change and on every resync, so a copy that cannot be decrypted
-            // yet is replaced by one that can, rather than needing to be held.
-            // Holding it would also mean a second unbounded queue.
-            Event::ManifestArrived { chunk } => match self.cgka.decrypt(&chunk) {
-                Ok(plaintext) => {
-                    self.manifest.import(&plaintext)?;
-                    Ok(vec![Effect::ManifestUpdated])
-                }
-                Err(_) => Ok(Vec::new()),
-            },
+            Event::ManifestArrived { chunk } => self.on_manifest_arrived(&chunk, csprng),
             Event::UpsertFile { entry } => {
                 self.require_write()?;
                 self.manifest.upsert_file(&entry)?;
@@ -570,6 +650,44 @@ impl WorkspaceState {
                     .set_author(&self.cgka.member_id().to_bytes(), &author)?;
                 self.publish_manifest(csprng)
             }
+            Event::ResyncManifest => self.publish_manifest(csprng),
+            Event::AnnounceEndpoint { endpoint_id } => {
+                self.endpoint_id = Some(endpoint_id);
+                // The manifest may have nowhere to put it yet — a joiner has no
+                // device record until its first sync. Remembering it above is
+                // what makes that recoverable; `record_endpoint` reports
+                // whether the write landed so we only publish when it did.
+                if self.record_endpoint()? {
+                    self.publish_manifest(csprng)
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+        }
+    }
+
+    /// Write the announced endpoint id into the manifest if it will fit.
+    ///
+    /// Returns whether the manifest changed, so callers can avoid re-publishing
+    /// it for nothing — this runs on every manifest arrival, and an
+    /// unconditional publish would turn each arrival into an outgoing write and
+    /// two peers into a broadcast loop.
+    ///
+    /// `UnknownDevice` is not an error here: it is the ordinary state of a
+    /// joiner between announcing and first sync, and the next arrival retries.
+    fn record_endpoint(&mut self) -> Result<bool, CoreError> {
+        let Some(endpoint_id) = self.endpoint_id else {
+            return Ok(false);
+        };
+        let me = self.cgka.member_id().to_bytes();
+        // Already correct — most arrivals land here, since the record persists.
+        if self.manifest.device(&me).and_then(|d| d.endpoint_id) == Some(endpoint_id) {
+            return Ok(false);
+        }
+        match self.manifest.set_device_endpoint(&me, &endpoint_id) {
+            Ok(()) => Ok(true),
+            Err(CoreError::UnknownDevice) => Ok(false),
+            Err(err) => Err(err),
         }
     }
 
@@ -614,6 +732,85 @@ impl WorkspaceState {
             return Ok(());
         }
         Err(CoreError::NotThisUsersDevice)
+    }
+
+    /// Merge an arriving manifest replica.
+    ///
+    /// There is no parking queue for the manifest, unlike for document chunks:
+    /// it is re-published on every change and on every resync, so a copy that
+    /// cannot be decrypted yet is replaced by one that can rather than needing
+    /// to be held. Holding it would also mean a second unbounded queue.
+    fn on_manifest_arrived<R: CryptoRng + RngCore>(
+        &mut self,
+        chunk: &Chunk,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        let Ok(plaintext) = self.cgka.decrypt(chunk) else {
+            // Not yet decryptable, and not an error: forward secrecy means a
+            // replica published before this node joined never will be. The next
+            // re-announcement carries one it can read.
+            return Ok(Vec::new());
+        };
+        self.manifest.import(&plaintext)?;
+        // The arriving replica may be the one that finally carries this
+        // device's record, so retry the endpoint announcement that had nowhere
+        // to go before. This is the only path by which a joiner ever reaches a
+        // peer's roster.
+        let mut effects = vec![Effect::ManifestUpdated];
+        if self.record_endpoint()? {
+            effects.extend(self.publish_manifest(csprng)?);
+        }
+        Ok(effects)
+    }
+
+    /// Admit a new person along with their first device.
+    ///
+    /// The caller checks the permission; this writes the records. All three go
+    /// in together because a leaf with no device record has no user, so it has
+    /// no role, so every peer's `author_may_write` rejects its entries — the
+    /// new member would appear to join and then silently fail to publish
+    /// anything.
+    fn on_add_user<R: CryptoRng + RngCore>(
+        &mut self,
+        member: MemberId,
+        share_key: ShareKey,
+        role: Role,
+        display_name: &str,
+        endpoint: Option<[u8; 32]>,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.admit(member, share_key, csprng, |manifest, member| {
+            manifest.set_user(member, display_name)?;
+            manifest.set_device(member, member, "first device")?;
+            // Strictly after `set_device`, which creates the record this
+            // attaches to; reversed, it returns `UnknownDevice`.
+            if let Some(endpoint) = endpoint {
+                manifest.set_device_endpoint(member, &endpoint)?;
+            }
+            manifest.set_role(member, role)
+        })
+    }
+
+    /// Admit another device acting for an existing person.
+    ///
+    /// No role is granted here: the device inherits its user's, which is the
+    /// whole reason roles are keyed by user rather than by leaf.
+    fn on_add_device<R: CryptoRng + RngCore>(
+        &mut self,
+        member: MemberId,
+        share_key: ShareKey,
+        user: &[u8; 32],
+        label: &str,
+        endpoint: Option<[u8; 32]>,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.admit(member, share_key, csprng, |manifest, member| {
+            manifest.set_device(member, user, label)?;
+            if let Some(endpoint) = endpoint {
+                manifest.set_device_endpoint(member, &endpoint)?;
+            }
+            Ok(())
+        })
     }
 
     /// Park an arriving chunk if it is new, then retry the whole queue.

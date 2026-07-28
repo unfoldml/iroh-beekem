@@ -89,6 +89,20 @@ pub enum MergeOutcome {
     Deferred,
 }
 
+/// What an applied operation did to the group's membership.
+///
+/// Extracted before the merge consumes the operation, and applied after it
+/// succeeds. Named rather than left as a pair of `Option`s so that the two
+/// cases cannot both be set — an operation is an `Add` or a `Remove`, never
+/// both, and a tuple would let a future edit express otherwise.
+#[derive(Debug, Clone, Copy)]
+enum MembershipChange {
+    /// An `Add` introduced this identity.
+    Added(MemberId),
+    /// A `Remove` retracted this identity.
+    Removed(MemberId),
+}
+
 /// Synchronous, deterministic owner of the local CGKA state.
 ///
 /// Every method is pure with respect to the outside world: no clock, no
@@ -113,6 +127,35 @@ pub struct CgkaController {
     /// this set exists to stop is the *unrelated* keypair, which no `Add` names
     /// under any ordering.
     known_members: HashSet<MemberId>,
+    /// Every identity that is a member *right now*.
+    ///
+    /// Non-monotone: a `Remove` retracts an entry, which is exactly what
+    /// [`Self::known_members`] must never do.
+    ///
+    /// # Why these cannot be one set
+    ///
+    /// They answer different questions and pay for the answer differently.
+    ///
+    /// `known_members` is the **authorisation** predicate, applied to every
+    /// operation before it is merged. It must be monotone so that two peers
+    /// which observe a removal and a concurrent operation by the removed member
+    /// in opposite orders still agree on admissibility — the cost of
+    /// disagreeing there is a *dropped operation*, which diverges the group
+    /// permanently.
+    ///
+    /// `current_members` is the **enumeration and connection-policy** predicate:
+    /// who to list in the UI, and whose connections to accept. It is allowed to
+    /// be order-sensitive because the cost of disagreeing is a *refused
+    /// connection*, which the next merge repairs. Eviction is eventual by
+    /// construction, and no amount of set discipline here would make it
+    /// otherwise.
+    ///
+    /// Collapsing them into one set therefore has no safe direction. Made
+    /// monotone, a removed device stays on every roster forever and revocation
+    /// stops meaning anything. Made non-monotone, `merge` starts rejecting
+    /// operations on an order-dependent predicate and peers diverge. This field
+    /// is consequently never read from [`Self::merge_verified`].
+    current_members: HashSet<MemberId>,
     /// Operations received out of causal order, awaiting their predecessors.
     ///
     /// A queue rather than a stack: eviction takes the oldest, which is the one
@@ -129,6 +172,7 @@ impl std::fmt::Debug for CgkaController {
             .field("group_size", &self.cgka.group_size())
             .field("ops_count", &self.cgka.ops_count())
             .field("known_members", &self.known_members.len())
+            .field("current_members", &self.current_members.len())
             .field("parked", &self.parked.len())
             .finish_non_exhaustive()
     }
@@ -168,6 +212,7 @@ impl CgkaController {
             // The founder is a member by construction: their own init `Add` is
             // self-issued and has no predecessors to authorise it against.
             known_members: HashSet::from([member_id]),
+            current_members: HashSet::from([member_id]),
             parked: VecDeque::new(),
             evicted_ops: 0,
         })
@@ -237,6 +282,7 @@ impl CgkaController {
             share_secret,
             share_key,
             known_members: HashSet::from([founder_id]),
+            current_members: HashSet::from([founder_id]),
             parked: VecDeque::new(),
             evicted_ops: 0,
         };
@@ -349,6 +395,26 @@ impl CgkaController {
         self.known_members.contains(&member)
     }
 
+    /// Whether this identity is a member *now*, removals taken into account.
+    ///
+    /// This is the enumeration and connection-policy predicate. It is **not**
+    /// an authorisation predicate and must never be used as one — see the field
+    /// documentation on `current_members` for why the two cannot be the same
+    /// question.
+    #[must_use]
+    pub fn is_current_member(&self, member: MemberId) -> bool {
+        self.current_members.contains(&member)
+    }
+
+    /// Every identity that is a member now, in arbitrary order.
+    ///
+    /// Ordering is genuinely arbitrary — it comes from a `HashSet` — so callers
+    /// that need determinism must sort. The roster does not care, and a
+    /// simulation that did would be asserting on hash iteration order.
+    pub fn current_members(&self) -> impl Iterator<Item = MemberId> + '_ {
+        self.current_members.iter().copied()
+    }
+
     /// Admit a new member who has published `share_key`.
     ///
     /// Returns `None` if the member is already present. The returned operation
@@ -369,6 +435,7 @@ impl CgkaController {
         // would reject their very first operation as unauthorised.
         if op.is_some() {
             self.known_members.insert(member);
+            self.current_members.insert(member);
         }
         Ok(op)
     }
@@ -388,6 +455,13 @@ impl CgkaController {
     ) -> Result<Option<Signed<CgkaOperation>>, CoreError> {
         let op = now_or_never(self.cgka.remove::<Local, _>(member, &self.signer))
             .ok_or(CoreError::SignerYielded)??;
+        // Mirrors the `add_member` case: a locally issued `Remove` never passes
+        // through `merge`, so nothing else would retract the member here. Note
+        // the asymmetry with `known_members`, which is deliberately left alone
+        // — retracting there would make admissibility delivery-order dependent.
+        if op.is_some() {
+            self.current_members.remove(&member);
+        }
         Ok(op)
     }
 
@@ -510,15 +584,29 @@ impl CgkaController {
         }
 
         // Read this before the merge consumes the operation.
-        let introduces = match op.payload {
-            CgkaOperation::Add { added_id, .. } => Some(added_id),
-            CgkaOperation::Remove { .. } | CgkaOperation::Update { .. } => None,
+        let membership_change = match op.payload {
+            CgkaOperation::Add { added_id, .. } => Some(MembershipChange::Added(added_id)),
+            CgkaOperation::Remove { id, .. } => Some(MembershipChange::Removed(id)),
+            CgkaOperation::Update { .. } => None,
         };
 
         match self.cgka.merge_concurrent_operation(op) {
             Ok(true) => {
-                if let Some(added) = introduces {
-                    self.known_members.insert(added);
+                // Applied only. A `Duplicate` changed nothing in the tree and
+                // must change nothing here either, or a re-delivered `Add`
+                // would resurrect a member a later `Remove` had already
+                // retracted from `current_members`.
+                match membership_change {
+                    Some(MembershipChange::Added(added)) => {
+                        self.known_members.insert(added);
+                        self.current_members.insert(added);
+                    }
+                    Some(MembershipChange::Removed(removed)) => {
+                        // `known_members` is deliberately not touched: see its
+                        // field documentation. Only the roster shrinks.
+                        self.current_members.remove(&removed);
+                    }
+                    None => {}
                 }
                 Ok(MergeOutcome::Applied)
             }

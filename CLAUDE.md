@@ -10,7 +10,8 @@ follows is a current choice rather than a settled one.
 
 ```bash
 cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, forgery rejection
-cargo test -p iroh-beekem-sim    # propsim: convergence, concurrent rotation/revocation, forging peer
+cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer, outsiders
+                                 # ~5 min: runs under swarm faults (partitions, latency, reorder)
 cargo test -p iroh-beekem        # two real endpoints over real QUIC
 
 cargo run -p iroh-beekem --example two_node   # full two-peer session, prints progress
@@ -77,6 +78,7 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
 - When building or refactoring a feature, strive to balance terse implementations with readability. Micro-functions (e.g. helpers used once) should be inlined, whereas shared functionality should be exported.
 - **Use the Rust Analyzer plugin** for symbol references, go-to-definition, and warnings rather than grepping (ask "What's the definition for this symbol?").
 - **Implement property tests rather than unit tests** for algorithms and data transformations (`proptest`). Test "business" logic, not trivial data-structure properties.
+- Use straight and unambiguous language in all the descriptive test comments: in <precondition> , upon <input / triggering event> , we expect <state change / output >. This is necessary because the property tests are the living documentation of the project.
 - **Improve coverage of code you touch.** When you add or change a code path, add tests that exercise it — property tests first (per the bullet above), unit tests only for the irreducible cases. Measure with `make coverage`, which regenerates [COVERAGE.md](COVERAGE.md) (a merged report across every test manifest); its "lowest-covered files" list is the standing to-do surface. Coverage is advisory today (`make coverage-check` enforces a soft floor but is not yet in `make check`) — treat a coverage drop on files you edited as a defect to fix before declaring done.
 - **In-memory / referentially-pure** implementations wherever possible : pure algorithms do no IO (disk, sockets), which keeps them in-memory-testable. For distributed algorithms, test with `propsim`. 
 - **No mocking** : test real implementations only.
@@ -119,6 +121,14 @@ None of them is settled; if a user story needs a different answer, change it.
   membership is checked only *after* predecessors are in hand, or a member whose own `Add` is still in
   flight would be rejected. `known_members` is currently monotone (a `Remove` does not retract) because
   retracting would make admissibility depend on delivery order and diverge peers.
+- **Admission control is an authenticated allowlist over endpoint ids.** All three ALPNs are wrapped
+  in `RosterGuard` ([roster.rs](crates/iroh-beekem/src/roster.rs)); an `EndpointId` is the peer's
+  public key, authenticated by the QUIC handshake. The roster is *derived*, never authored —
+  `WorkspaceState::roster` ([state.rs](crates/iroh-beekem-core/src/state.rs)) intersects the
+  manifest's device addresses with `current_members` — so it converges like everything else and
+  inherits the admin gating on `AddUser`/`AddDevice`. Computed in the core so the rule is testable
+  without a socket. Eviction is eventual, and it is an availability boundary, not a confidentiality
+  one.
 
 ## Easy to break by accident
 
@@ -134,6 +144,22 @@ them *without* noticing will not fail loudly.
   underneath it. The impl round-trips through a Loro snapshot.
 - **`WorkspaceState::found` vs `joined`.** The founder records itself as the first admin; a joiner
   must not, or Loro converges on a workspace with an administrator nobody appointed.
+- **`known_members` and `current_members` are two sets on purpose.** The first is the
+  *authorisation* predicate and must stay monotone, because disagreeing costs a dropped operation and
+  permanent divergence. The second is the *enumeration and connection-policy* predicate and is allowed
+  to be order-sensitive, because disagreeing costs a refused connection the next merge repairs.
+  Collapsing them has no safe direction: monotone, and a revoked device stays admitted forever;
+  non-monotone, and `merge` starts rejecting on a delivery-order-dependent predicate.
+- **The manifest needs its own anti-entropy.** It is published only when it *changes*, so unlike a
+  document it has no later write to carry lost content. `Event::ResyncManifest` exists for that, and
+  both `Workspace::resync`/`republish` and the simulator's resync tick must drive it — device records
+  live in the manifest, and the roster derives from device records, so a lost manifest chunk costs a
+  peer its place on somebody's roster until the next membership change happens to republish it.
+- **The simulator must model the control plane's repair, not just the data plane's.** A lost
+  `Msg::Op` is unrecoverable — a peer that misses the operation establishing a PCS key can never
+  derive it, and re-announcing content re-encrypts under that same key. `Msg::Log` is the simulator's
+  counterpart to `ControlMsg::Log`; without it the harness is strictly more fragile than production
+  and every resulting failure is an artefact.
 - **Pinned dependencies are pinned for a reason** (see comments in the manifests): `rand` at 0.8.5 to
   unify with beekem's public API, `propsim` at a git rev because it has no semver.
 

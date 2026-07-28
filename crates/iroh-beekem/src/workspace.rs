@@ -16,7 +16,7 @@ use beekem::{
     operation::CgkaOperation,
 };
 use bytes::Bytes;
-use iroh::EndpointId;
+use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
     CgkaController, DeviceRecord, DocumentUuid, Effect, Event, FileEntry, Role, WorkspaceInfo,
     WorkspaceSecret, WorkspaceState,
@@ -47,6 +47,7 @@ use crate::{
     error::WorkspaceError,
     identity::Identity,
     node::Node,
+    roster::Roster,
     wire::{ControlMsg, decode_chunk, encode_chunk},
 };
 
@@ -131,6 +132,12 @@ struct Inner {
     /// A [`Notify`] rather than a timestamp check because the republish must be
     /// *deferred*, never dropped — see [`republish_loop`].
     republish_wanted: Notify,
+    /// The node's admission list, shared with the guard on every ALPN.
+    ///
+    /// Held here rather than reached through [`Node`] so that the effect pump —
+    /// which sees every membership change — can update it without needing the
+    /// whole node.
+    roster: Roster,
 }
 
 /// A running, networked workspace.
@@ -338,6 +345,14 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
+        // The gossip bootstrap peers are also the connection bootstrap: a joiner
+        // must be able to reach its inviter before it holds the manifest that
+        // would derive a roster, and the inviter's guard must let it back in.
+        // Seeding both from the same list is what keeps the two in step.
+        for peer in &bootstrap {
+            node.roster().add_bootstrap(*peer);
+        }
+
         let gossip_topic = node
             .gossip()
             .subscribe(topic, bootstrap)
@@ -345,6 +360,7 @@ impl Workspace {
             .map_err(|e| WorkspaceError::Gossip(e.to_string()))?;
         let (gossip_tx, gossip_rx) = gossip_topic.split();
 
+        let endpoint_id = node.endpoint().id();
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
             blobs: node.blobs().clone(),
@@ -355,22 +371,40 @@ impl Workspace {
             seen_entries: Mutex::new(HashMap::new()),
             neighbor_cooldown: Mutex::new(Cooldown::default()),
             republish_wanted: Notify::new(),
+            roster: node.roster().clone(),
         });
 
         // Claim this workspace's author identity in the manifest. Until a peer
         // has seen this, it has no way to connect entries signed by this author
         // to the member the roles are written about, and will refuse them. This
         // also performs the manifest's first write to the replica.
+        //
+        // The endpoint announcement rides alongside for the same reason one
+        // step further out: until a peer has seen it, this device is on nobody's
+        // roster and its connections are refused. A joiner's manifest has no
+        // device record to attach it to yet, so the core remembers it and
+        // re-applies it on the first manifest that does.
         let announce = {
             let mut state = inner.state.lock().await;
-            report_rejection(state.handle(
+            let mut effects = report_rejection(state.handle(
                 Event::AnnounceAuthor {
                     author: author.to_bytes(),
                 },
                 &mut rand::rngs::OsRng,
-            ))
+            ));
+            effects.extend(report_rejection(state.handle(
+                Event::AnnounceEndpoint {
+                    endpoint_id: *endpoint_id.as_bytes(),
+                },
+                &mut rand::rngs::OsRng,
+            )));
+            effects
         };
         apply_effects(&inner, announce).await;
+        // The founder already has its own device record, so it derives a roster
+        // straight away; a joiner derives an empty one and relies on the
+        // bootstrap entry until its first manifest arrives.
+        refresh_roster(&inner).await;
 
         // Control plane: CGKA operations arriving over gossip.
         let control = Arc::clone(&inner);
@@ -412,6 +446,21 @@ impl Workspace {
             .map_err(|e| WorkspaceError::Storage(e.to_string()))
     }
 
+    /// This node's dialable address: its endpoint id plus the paths to reach it.
+    ///
+    /// [`Self::endpoint_id`] is what identifies and authorises a peer; this is
+    /// what a peer needs to actually open a connection to one.
+    #[must_use]
+    pub fn endpoint_addr(&self) -> EndpointAddr {
+        self.node.endpoint().addr()
+    }
+
+    /// The node this workspace runs on.
+    #[must_use]
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     /// This node's endpoint id, for peers to dial.
     #[must_use]
     pub fn endpoint_id(&self) -> EndpointId {
@@ -450,11 +499,26 @@ impl Workspace {
     /// performed: holding it across the network writes in `apply_effects` would
     /// serialise the whole workspace behind one blob upload.
     async fn drive(&self, event: Event) -> Result<(), WorkspaceError> {
+        // Checked before the event is consumed, and only for the handful of
+        // events that can move the roster. Refreshing unconditionally would put
+        // a manifest device scan behind every keystroke; refreshing nowhere
+        // would mean a locally issued removal took effect on every peer except
+        // the one that issued it.
+        let membership_moved = matches!(
+            event,
+            Event::AddUser { .. }
+                | Event::AddDevice { .. }
+                | Event::RemoveMember { .. }
+                | Event::AnnounceEndpoint { .. }
+        );
         let effects = {
             let mut state = self.inner.state.lock().await;
             state.handle(event, &mut rand::rngs::OsRng)?
         };
         apply_effects(&self.inner, effects).await;
+        if membership_moved {
+            refresh_roster(&self.inner).await;
+        }
         Ok(())
     }
 
@@ -467,6 +531,15 @@ impl Workspace {
     /// capability the invite carries: a viewer's ticket grants read access to
     /// the replica, an editor's grants write.
     ///
+    /// `endpoint` is the invitee's transport address, and admits them to this
+    /// node's roster before the invite is handed over. It is required rather
+    /// than optional because the alternative is a deadlock: an admitted device
+    /// cannot sync until it is on somebody's roster, and it cannot reach a
+    /// roster until its address has propagated through the manifest — which it
+    /// cannot receive without syncing. The caller already has to obtain the
+    /// invitee's `member` and `share_key` out of band, so their `EndpointId`
+    /// comes from the same exchange at no extra cost.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` unless this node
@@ -475,6 +548,7 @@ impl Workspace {
         &self,
         member: MemberId,
         share_key: ShareKey,
+        endpoint: EndpointId,
         role: Role,
         display_name: &str,
     ) -> Result<Invite, WorkspaceError> {
@@ -483,6 +557,7 @@ impl Workspace {
             share_key,
             role,
             display_name: display_name.to_string(),
+            endpoint: Some(*endpoint.as_bytes()),
         })
         .await?;
         self.build_invite(role).await
@@ -502,6 +577,7 @@ impl Workspace {
         &self,
         member: MemberId,
         share_key: ShareKey,
+        endpoint: EndpointId,
         user: [u8; 32],
         label: &str,
     ) -> Result<Invite, WorkspaceError> {
@@ -510,6 +586,7 @@ impl Workspace {
             share_key,
             user,
             label: label.to_string(),
+            endpoint: Some(*endpoint.as_bytes()),
         })
         .await?;
         let role = {
@@ -883,7 +960,12 @@ impl Workspace {
         for doc in self.files().await.into_iter().map(|f| f.uuid) {
             self.drive(Event::Resync { doc }).await?;
         }
-        Ok(())
+        // The manifest is published only when it changes, so unlike a document
+        // it has no later write to carry lost content. Device records live
+        // there and the roster derives from them, which makes a lost manifest
+        // chunk cost a peer its place on somebody's roster until the next
+        // membership change happens to republish it.
+        self.drive(Event::ResyncManifest).await
     }
 
     /// Chunks parked awaiting key material or CRDT dependencies.
@@ -1098,7 +1180,8 @@ async fn send_log(inner: &Inner) {
     }
 }
 
-/// Re-encrypt and re-announce every document this node knows about.
+/// Re-encrypt and re-announce every document this node knows about, and the
+/// manifest that indexes them.
 async fn republish(inner: &Inner) {
     let docs: Vec<DocumentUuid> = {
         let state = inner.state.lock().await;
@@ -1118,6 +1201,16 @@ async fn republish(inner: &Inner) {
         };
         apply_effects(inner, effects).await;
     }
+    // See `Workspace::resync`: the manifest needs re-announcing too, and this
+    // is the path a neighbour appearing takes, which is exactly when a peer is
+    // most likely to be missing it.
+    let effects = {
+        let mut state = inner.state.lock().await;
+        state
+            .handle(Event::ResyncManifest, &mut rand::rngs::OsRng)
+            .unwrap_or_default()
+    };
+    apply_effects(inner, effects).await;
 }
 
 /// Perform the effects the core asked for.
@@ -1162,9 +1255,28 @@ async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
                     tracing::error!(%err, "failed to withdraw an index entry");
                 }
             }
-            Effect::Applied { .. } | Effect::ManifestUpdated => {}
+            // A manifest arrival is the only way membership changes reach a node
+            // that did not issue them, so it is also the only place a peer
+            // learns it should stop accepting a removed device — or start
+            // accepting a newly admitted one.
+            Effect::ManifestUpdated => refresh_roster(inner).await,
+            Effect::Applied { .. } => {}
         }
     }
+}
+
+/// Recompute the node's admission list from the current workspace state.
+///
+/// Cheap and idempotent, which is why it runs on every manifest arrival rather
+/// than trying to detect whether membership actually moved: the manifest is a
+/// CRDT, so "did this import change the roster" is a diff over two derived sets,
+/// and computing the new set is the cheaper half of answering it.
+async fn refresh_roster(inner: &Inner) {
+    let endpoints = {
+        let state = inner.state.lock().await;
+        state.roster()
+    };
+    inner.roster.set_derived(endpoints);
 }
 
 /// Write one encrypted chunk to blobs and index it in docs.

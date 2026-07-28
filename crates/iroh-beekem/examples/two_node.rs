@@ -74,8 +74,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bob_id = bob_identity.member_id();
 
     println!("\nalice invites bob as an editor...");
+    // Bob's endpoint id goes in with the invite: admitting him puts him on
+    // alice's roster, and without that her node would refuse the connection he
+    // is about to make.
     let invite = alice
-        .add_user(bob_id, bob_identity.share_key(), Role::Editor, "Bob")
+        .add_user(
+            bob_id,
+            bob_identity.share_key(),
+            bob_node.endpoint().id(),
+            Role::Editor,
+            "Bob",
+        )
         .await?;
     println!("  invite carries {} CGKA operations", invite.log.len());
 

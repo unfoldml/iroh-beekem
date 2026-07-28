@@ -6,6 +6,7 @@
 pub mod error;
 pub mod identity;
 pub mod node;
+mod roster;
 pub mod wire;
 pub mod workspace;
 

@@ -1,7 +1,7 @@
 # iroh-beekem
 
 Group-confidential, local-first collaborative workspaces: groups of people editing a shared set of
-documents, every edit versioned, signed and concurrent-safe, with no trusted server anywhere.
+documents, every edit versioned, signed and concurrent-safe, without needing a trusted server.
 
 The goals this is built against are in [docs/USER_STORIES.md](docs/USER_STORIES.md). The project is
 early; what follows describes the current implementation, not a settled specification.
@@ -108,6 +108,47 @@ seeing a removal and a concurrent operation by the removed member in opposite or
 would otherwise disagree about admissibility and diverge. A removed member's operations
 cannot reach the root key anyway, so beekem's tree semantics already neutralise them.
 
+A *second*, non-monotone set (`current_members`) tracks who is a member **now**. The two
+cannot be one set, and the difference is which failure you are willing to pay for.
+`known_members` answers "may this operation be merged", where disagreeing costs a dropped
+operation and permanent divergence, so it must be order-independent. `current_members`
+answers "may this peer connect" and "who do I list", where disagreeing costs a refused
+connection that the next merge repairs. Merging them in either direction breaks something:
+made monotone, a revoked device stays admitted forever; made non-monotone, `merge` starts
+rejecting operations on a delivery-order-dependent predicate.
+
+### Admission control is an authenticated allowlist
+
+Neither `iroh-gossip` nor `iroh-docs` applies admission control of its own, so before this
+existed, confidentiality against an outsider rested on them not knowing two 32-byte
+identifiers — the gossip topic and the docs namespace — rather than on holding a key.
+
+Every ALPN is now wrapped in a `RosterGuard` (`roster.rs`), which refuses inbound
+connections from endpoints that are not currently members. An `EndpointId` *is* the peer's
+public key and the QUIC/TLS handshake proves possession of the secret, so this is an
+authenticated allowlist rather than a claim a peer can assert its way past. All three ALPNs
+are wrapped: guarding only gossip would leave the docs index — every document's existence,
+size, author and timing — readable by anyone who learned the namespace.
+
+The roster is **derived, never authored**: it is the set of `endpoint_id` values from the
+manifest's `devices` container whose member is in `current_members`. Both halves converge
+on their own, so it needs no distribution channel and inherits the admin gating already on
+`AddUser`/`AddDevice`. `WorkspaceState::roster` computes it in the I/O-free core, which is
+what makes the rule property-testable without a socket.
+
+Two limits are inherent rather than incidental:
+
+* **Eviction is eventual.** A removed device still reaches peers that have not yet merged
+  the removal.
+* **It is an availability boundary, not a confidentiality one.** It decides who may attempt
+  to sync; what they can *read* is decided by the CGKA, and nothing here retracts data
+  already synced.
+
+Bootstrapping is the one exception. A joiner must reach its inviter before it holds the
+manifest that would authorise anyone, so `Invite.inviter` is admitted unconditionally and
+never pruned — a workspace whose inviter later leaves should not become unjoinable
+mid-handshake.
+
 ### Two DAGs must both be satisfied
 
 An arriving chunk applies only when the CGKA operation graph has caught up far enough to reach its PCS
@@ -139,9 +180,10 @@ reason enough to revisit the choice underneath.
 
 1. **`iroh-docs` write capability is all-or-nothing.** Every writer holds the same `NamespaceSecret`,
    so a revoked member keeps it and can still push entries into the replica. They cannot *read*
-   anything written after their removal — that is the CGKA — and peers now refuse their entries
-   (see `Manifest::author_may_write`), but genuinely shutting off their writes needs a namespace
-   rotation, which is not automatic.
+   anything written after their removal — that is the CGKA — peers refuse their entries (see
+   `Manifest::author_may_write`), and once every peer has seen the removal the roster refuses
+   their connections outright. But a peer that has not yet merged the removal still accepts them,
+   so genuinely shutting off their writes needs a namespace rotation, which is not automatic.
 2. **A new member cannot read content written before they joined.** They reconstruct the group from
    the operation log but not the historical PCS keys. This is forward secrecy working as intended;
    `Workspace` re-publishes current state when a peer joins the overlay so they can catch up.
@@ -179,20 +221,26 @@ These are gaps, not trades. Nothing in the design prevents them.
 3. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
    re-encrypts them and writes a new blob; superseded blobs are never collected. Cost grows
    quadratically in edits.
-4. **Removal revokes reading, not watching.** A removed device keeps the docs write capability and
-   stays subscribed to the control topic, so it goes on observing membership churn *and* the
-   replicated index — entry existence, size, author and timing — for as long as it cares to look.
-   It reads no content and no manifest written afterwards, but "removed" currently means *cannot
-   read*, not *cannot see*. Closing it needs namespace rotation plus connection-level admission
-   control. The `a_removed_member_still_watches` properties in `iroh-beekem-sim` record exactly
-   where the line sits today, so it cannot move without a test noticing.
+4. **Removal revokes reading and connecting, but eviction is eventual.** Connection-level
+   admission control now exists, so a removed device is refused on all three ALPNs by every peer
+   that has merged the removal. Two gaps remain. A peer that has *not* yet merged it still
+   accepts the connection, and the removed device still holds the docs write capability and the
+   blinding secret — so during that window it goes on observing the replicated index (entry
+   existence, size, author, timing) and membership churn. Closing it fully needs namespace
+   rotation, which is not implemented. The `a_removed_member_still_watches` properties in
+   `iroh-beekem-sim` record exactly where the line sits today, so it cannot move without a test
+   noticing.
 5. **Invites are replayable.** No expiry, no nonce, no binding to the invitee — and the ticket
    carries the raw workspace secret, so it must travel over an authenticated, confidential channel.
    It does *not* grant read access: joining also needs the leaf secret, which never leaves the
    invitee's device.
-6. **No admission control on either transport.** Anyone who learns the gossip topic (the founder's
-   public key) or the docs namespace can participate. There is no allowlist, so confidentiality
-   against an outsider rests on them not knowing two 32-byte identifiers rather than on a key.
+6. **One roster per node, not per workspace.** The roster lives on `Node` because the guards must
+   be installed when the router is built, before any workspace exists. Two workspaces on one node
+   would therefore union their rosters, admitting a member of either to both. Fixing it means
+   keying the roster by workspace, which belongs with `Workspace::open`/`list` and persistence.
+7. **The gossip topic still never rotates.** It is derived from the tree id, which is the founder's
+   public key, so every past invitee knows it permanently. The roster is what refuses them; without
+   a new tree id — that is, a new workspace — the topic itself cannot change.
 
 
 

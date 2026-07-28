@@ -101,7 +101,13 @@ async fn invited_pair_as(seed: u64, role: Role) -> Pair {
     let bob_id = bob_identity.member_id();
 
     let invite: Invite = alice
-        .add_user(bob_id, bob_identity.share_key(), role, "bob")
+        .add_user(
+            bob_id,
+            bob_identity.share_key(),
+            bob_node.endpoint().id(),
+            role,
+            "bob",
+        )
         .await
         .expect("alice admits bob");
 
@@ -493,12 +499,17 @@ async fn a_viewer_is_given_a_read_only_capability() {
     use iroh_docs::sync::Capability;
 
     let (alice, _doc) = founded(110, "shared").await;
+    // Real nodes, because admitting somebody now records the address they will
+    // connect from: the roster has to know it before the invite is handed over.
+    let viewer_node = Node::spawn().await.expect("the viewer's node should bind");
+    let editor_node = Node::spawn().await.expect("the editor's node should bind");
     let viewer = Identity::generate(&mut ChaCha20Rng::seed_from_u64(111));
 
     let invite = alice
         .add_user(
             viewer.member_id(),
             viewer.share_key(),
+            viewer_node.endpoint().id(),
             Role::Viewer,
             "viewer",
         )
@@ -514,6 +525,7 @@ async fn a_viewer_is_given_a_read_only_capability() {
         .add_user(
             editor.member_id(),
             editor.share_key(),
+            editor_node.endpoint().id(),
             Role::Editor,
             "editor",
         )
@@ -535,17 +547,18 @@ async fn a_second_device_joins_its_users_account_and_inherits_the_role() {
     // Alice enrols a laptop of her own. This is not an administrative act, and
     // the new device gets no role of its own — it acts under alice's.
     let laptop_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(121));
+    let laptop_node = Node::spawn().await.expect("laptop should bind");
     let invite = alice
         .add_device(
             laptop_identity.member_id(),
             laptop_identity.share_key(),
+            laptop_node.endpoint().id(),
             alice_user,
             "laptop",
         )
         .await
         .expect("alice enrols her laptop");
 
-    let laptop_node = Node::spawn().await.expect("laptop should bind");
     let laptop = Workspace::join(
         laptop_node,
         &invite,
@@ -585,4 +598,154 @@ async fn a_second_device_joins_its_users_account_and_inherits_the_role() {
 
     alice.shutdown().await.expect("alice shuts down");
     laptop.shutdown().await.expect("the laptop shuts down");
+}
+
+/// Connection-level admission control, against three live endpoints.
+///
+/// The simulator models the *effect* of the roster — a node that is not a
+/// member observes nothing — but it cannot show that the guard is wired to
+/// `iroh` at all. Only a real handshake can, which is what these tests are for.
+mod admission_control_is_wired_to_iroh {
+    use iroh::{endpoint::ConnectionError, protocol::ProtocolHandler};
+
+    use super::*;
+
+    /// Every ALPN the node speaks. A guard on one and not the others would be
+    /// worse than none, because the docs index is where the metadata lives.
+    const ALPNS: [(&str, &[u8]); 3] = [
+        ("blobs", iroh_blobs::ALPN),
+        ("gossip", iroh_gossip::ALPN),
+        ("docs", iroh_docs::ALPN),
+    ];
+
+    /// How long a connection must survive before it counts as accepted.
+    ///
+    /// Long enough for a refusal to make the round trip on a loopback endpoint,
+    /// short enough that three ALPNs times two tests stays quick.
+    const SURVIVES_FOR: Duration = Duration::from_secs(3);
+
+    /// Whether `stranger` can hold an open connection to `target` on `alpn`.
+    ///
+    /// A refusal happens *after* the QUIC handshake — the peer's identity is
+    /// what the handshake establishes, so there is nothing to check before it —
+    /// so `connect` itself routinely succeeds against a node that is about to
+    /// refuse. Survival is the observable that separates the two.
+    ///
+    /// Deliberately **not** probed with `open_bi`: opening a stream is a local
+    /// operation in QUIC and returns `Ok` before the peer has seen anything, so
+    /// it reports success against a node that never accepted the connection at
+    /// all. Waiting for the peer to close is the only probe here that actually
+    /// depends on the peer.
+    async fn can_hold_a_connection(
+        stranger: &iroh::Endpoint,
+        target: iroh::EndpointAddr,
+        alpn: &[u8],
+    ) -> bool {
+        let Ok(conn) = stranger.connect(target, alpn).await else {
+            return false;
+        };
+        // Timing out means nobody closed it, which is what an accepted
+        // connection looks like from the dialling side.
+        tokio::time::timeout(SURVIVES_FOR, conn.closed())
+            .await
+            .is_err()
+    }
+
+    /// Given a founded workspace and a node that was never admitted to it, when
+    /// that node dials on each of the three ALPNs, we expect every attempt to be
+    /// refused.
+    ///
+    /// This is the property the whole roster exists for. Before it, an outsider
+    /// who learned the gossip topic — which is just the founder's public key —
+    /// could join the overlay and read every membership change, and one who
+    /// learned the namespace could sync the entire blinded index.
+    #[tokio::test]
+    async fn a_node_that_was_never_admitted_is_refused_on_every_alpn() {
+        let (alice, _doc) = founded(200, "shared").await;
+        let stranger = Node::spawn()
+            .await
+            .expect("the stranger's node should bind");
+        let alice_addr = alice.endpoint_addr();
+
+        for (name, alpn) in ALPNS {
+            assert!(
+                !can_hold_a_connection(stranger.endpoint(), alice_addr.clone(), alpn).await,
+                "an endpoint that no admin ever admitted held a connection on the {name} ALPN, \
+                 so knowing the topic id or the namespace is still enough to reach the workspace"
+            );
+        }
+
+        alice.shutdown().await.expect("alice shuts down");
+        stranger.shutdown().await.expect("the stranger shuts down");
+    }
+
+    /// Given a peer that *was* admitted, when it dials on each of the three
+    /// ALPNs, we expect every attempt to succeed.
+    ///
+    /// The counterweight, and the one worth writing first: a guard that refuses
+    /// everybody would pass the test above and silently break onboarding, which
+    /// is Story 1's "immediately access workspace files". Asserting only the
+    /// refusal would leave that failure invisible.
+    #[tokio::test]
+    async fn an_admitted_peer_is_accepted_on_every_alpn() {
+        let pair = invited_pair(201).await;
+        let alice_addr = pair.alice.endpoint_addr();
+
+        for (name, alpn) in ALPNS {
+            assert!(
+                can_hold_a_connection(pair.bob.node().endpoint(), alice_addr.clone(), alpn).await,
+                "an admitted member was refused on the {name} ALPN, so admission control \
+                 has locked a legitimate device out of its own workspace"
+            );
+        }
+
+        pair.alice.shutdown().await.expect("alice shuts down");
+        pair.bob.shutdown().await.expect("bob shuts down");
+    }
+
+    /// Given a wrapped handler, when a connection is refused, we expect the
+    /// refusal to name a distinct QUIC error code.
+    ///
+    /// Asserted through the public surface rather than by reaching into the
+    /// guard: a peer has to be able to tell "you are not a member" apart from
+    /// "the node is shutting down", because only one of those is worth retrying.
+    #[tokio::test]
+    async fn a_refusal_is_distinguishable_from_a_shutdown() {
+        let (alice, _doc) = founded(202, "shared").await;
+        let stranger = Node::spawn()
+            .await
+            .expect("the stranger's node should bind");
+        let alice_addr = alice.endpoint_addr();
+
+        let conn = stranger
+            .endpoint()
+            .connect(alice_addr, iroh_gossip::ALPN)
+            .await;
+
+        // The handshake may or may not complete before the refusal lands; both
+        // orderings are legitimate, and only the completed case can report a
+        // code, so the other is skipped rather than failed.
+        if let Ok(conn) = conn {
+            let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+            if let Ok(reason) = closed {
+                assert!(
+                    matches!(
+                        &reason,
+                        ConnectionError::ApplicationClosed(frame)
+                            if frame.error_code.into_inner() == 0x1E_E1
+                    ),
+                    "a refused connection closed with {reason:?} rather than the roster's \
+                     dedicated code, so a peer cannot tell a refusal from a shutdown"
+                );
+            }
+        }
+
+        alice.shutdown().await.expect("alice shuts down");
+        stranger.shutdown().await.expect("the stranger shuts down");
+    }
+
+    /// Keeps the import used, and documents that the guard is a `ProtocolHandler`
+    /// rather than something bolted on beside one.
+    #[allow(dead_code)]
+    fn guard_is_a_protocol_handler<P: ProtocolHandler>() {}
 }

@@ -738,6 +738,7 @@ mod users_own_devices {
                 share_key: laptop_secret.share_key(),
                 user: alice_user,
                 label: "laptop".into(),
+                endpoint: None,
             },
             302,
         );
@@ -787,6 +788,7 @@ mod users_own_devices {
                 share_key: rogue_secret.share_key(),
                 user: alice_user,
                 label: "not really alice's".into(),
+                endpoint: None,
             },
             &mut rng(312),
         );
@@ -811,6 +813,7 @@ mod users_own_devices {
                 share_key: laptop_secret.share_key(),
                 user: alice_user,
                 label: "laptop".into(),
+                endpoint: None,
             },
             322,
         );
@@ -1024,6 +1027,182 @@ mod file_crud {
         assert!(
             matches!(result, Err(CoreError::UnknownDocument)),
             "deleting a document that was never recorded should fail, got {result:?}"
+        );
+    }
+}
+
+/// The derived roster: who a node will accept connections from.
+///
+/// `WorkspaceState::roster` is the membership half of admission control. That it
+/// is actually wired to `iroh` is proven by the QUIC suite in `iroh-beekem`;
+/// what these establish is that the rule it computes is the right one.
+mod the_roster_derives_from_membership {
+    use super::*;
+
+    /// Endpoint addresses, distinguishable at a glance in a failure message.
+    const ALICE_ENDPOINT: [u8; 32] = [0xA1; 32];
+    const BOB_ENDPOINT: [u8; 32] = [0xB0; 32];
+
+    /// Given a workspace where both members have published an address, when the
+    /// roster is derived, we expect it to contain both.
+    ///
+    /// The baseline the eviction tests are measured against. Without it, a
+    /// roster that was empty for an unrelated reason would satisfy every
+    /// "is no longer present" assertion below vacuously.
+    #[test]
+    fn a_member_that_has_published_an_address_is_on_the_roster() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::AnnounceEndpoint {
+                endpoint_id: ALICE_ENDPOINT,
+            },
+            400,
+        );
+        bus.alice
+            .manifest()
+            .set_device_endpoint(&bus.bob.member_id().to_bytes(), &BOB_ENDPOINT)
+            .expect("recording bob's address");
+
+        let roster = bus.alice.roster();
+        assert!(
+            roster.contains(&ALICE_ENDPOINT) && roster.contains(&BOB_ENDPOINT),
+            "a roster derived from two members with published addresses held {roster:?}, \
+             so at least one member would be refused by their own workspace"
+        );
+    }
+
+    /// Given a member with no published address, when the roster is derived, we
+    /// expect them to be absent.
+    ///
+    /// Absence here is a liveness cost, not a security one — the member simply
+    /// cannot be reached yet — but it is why `AnnounceEndpoint` is re-applied on
+    /// every manifest arrival rather than attempted once and forgotten.
+    #[test]
+    fn a_member_with_no_published_address_is_not_on_the_roster() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::AnnounceEndpoint {
+                endpoint_id: ALICE_ENDPOINT,
+            },
+            401,
+        );
+
+        assert_eq!(
+            bus.alice.roster(),
+            vec![ALICE_ENDPOINT],
+            "a member who has not announced an address appeared on the roster, which means \
+             the roster is inventing addresses rather than deriving them"
+        );
+    }
+
+    /// Given a member on the roster, when they are removed from the group, we
+    /// expect their address to leave the roster.
+    ///
+    /// **This is the property the whole non-monotone member set exists for.**
+    /// `CgkaController::known_members` is deliberately monotone, so deriving the
+    /// roster from it would leave a revoked device admitted forever and make
+    /// removal decorative. A failure here means removal revokes reading but not
+    /// connecting, which is the state of the world before this phase.
+    #[test]
+    fn a_removed_member_leaves_the_roster() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::AnnounceEndpoint {
+                endpoint_id: ALICE_ENDPOINT,
+            },
+            402,
+        );
+        let bob_member = bus.bob.member_id();
+        bus.alice
+            .manifest()
+            .set_device_endpoint(&bob_member.to_bytes(), &BOB_ENDPOINT)
+            .expect("recording bob's address");
+        assert!(
+            bus.alice.roster().contains(&BOB_ENDPOINT),
+            "bob must be on the roster before his removal can be shown to take him off it"
+        );
+
+        bus.alice_does(Event::RemoveMember { member: bob_member }, 403);
+
+        let roster = bus.alice.roster();
+        assert!(
+            !roster.contains(&BOB_ENDPOINT),
+            "a removed member's address was still on the roster ({roster:?}), so revocation \
+             would revoke reading but leave the device free to keep connecting and syncing"
+        );
+        assert!(
+            roster.contains(&ALICE_ENDPOINT),
+            "removing bob also evicted alice, so a removal takes the remaining members \
+             offline with it"
+        );
+    }
+
+    /// Given a device record whose member never entered the group, when the
+    /// roster is derived, we expect it to be excluded.
+    ///
+    /// The manifest is a CRDT fed by remote peers, so a device record is not
+    /// evidence of membership on its own. Deriving the roster from the manifest
+    /// alone would let anyone who can write a manifest entry admit themselves.
+    #[test]
+    fn a_device_record_alone_does_not_put_anyone_on_the_roster() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::AnnounceEndpoint {
+                endpoint_id: ALICE_ENDPOINT,
+            },
+            404,
+        );
+
+        // A member id no `Add` ever introduced, with an address of its own.
+        let stranger =
+            beekem::id::MemberId::from(MemorySigner::generate(&mut rng(405)).verifying_key())
+                .to_bytes();
+        let stranger_endpoint = [0x5Eu8; 32];
+        bus.alice
+            .manifest()
+            .set_device(&stranger, &stranger, "uninvited")
+            .expect("writing the stranger's device record");
+        bus.alice
+            .manifest()
+            .set_device_endpoint(&stranger, &stranger_endpoint)
+            .expect("writing the stranger's address");
+
+        let roster = bus.alice.roster();
+        assert!(
+            !roster.contains(&stranger_endpoint),
+            "a device record that no CGKA `Add` ever backed put its address on the roster \
+             ({roster:?}), so writing a manifest entry would be enough to admit yourself"
+        );
+    }
+
+    /// Given two nodes with the same membership and the same manifest, when both
+    /// derive a roster, we expect the two to be identical.
+    ///
+    /// Convergence, and the reason `roster` sorts and dedups rather than
+    /// returning whatever order the underlying `HashSet` iterates in. Two peers
+    /// that disagreed would refuse each other's connections asymmetrically,
+    /// which is far harder to diagnose than refusing them symmetrically.
+    #[test]
+    fn two_nodes_with_the_same_membership_derive_the_same_roster() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::AnnounceEndpoint {
+                endpoint_id: ALICE_ENDPOINT,
+            },
+            406,
+        );
+        bus.alice
+            .manifest()
+            .set_device_endpoint(&bus.bob.member_id().to_bytes(), &BOB_ENDPOINT)
+            .expect("recording bob's address");
+        bus.alice_does(Event::ResyncManifest, 407);
+        bus.deliver_all_to_bob();
+
+        assert_eq!(
+            bus.alice.roster(),
+            bus.bob.roster(),
+            "two nodes holding the same membership and the same manifest derived different \
+             rosters, so each would accept peers the other refuses"
         );
     }
 }
