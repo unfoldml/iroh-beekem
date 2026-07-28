@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use beekem::{id::TreeId, operation::CgkaOperation};
-use iroh_beekem_core::{CgkaController, MergeOutcome};
+use iroh_beekem_core::{CgkaController, DecryptOutcome, MergeOutcome};
 use keyhive_crypto::{
     share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
 };
@@ -178,11 +178,11 @@ fn member_decrypts_content_written_by_another_member() {
 
     let recovered = bob
         .decrypt(&chunk)
-        .expect("bob is a member and should decrypt alice's chunk");
+        .expect("decryption should not fault for a member holding the key");
 
-    assert_eq!(
-        recovered, plaintext,
-        "bob should recover exactly the plaintext alice encrypted"
+    assert!(
+        matches!(recovered, DecryptOutcome::Plaintext(ref bytes) if bytes == plaintext),
+        "bob should recover exactly the plaintext alice encrypted, got {recovered:?}"
     );
 }
 
@@ -201,7 +201,7 @@ fn revoked_member_cannot_decrypt_later_content() {
         bob.merge(Arc::new(op)).expect("merging pre-revocation op");
     }
     assert!(
-        bob.decrypt(&before).is_ok(),
+        matches!(bob.decrypt(&before), Ok(DecryptOutcome::Plaintext(_))),
         "bob must be able to read before he is revoked"
     );
 
@@ -223,8 +223,13 @@ fn revoked_member_cannot_decrypt_later_content() {
         let _ = bob.merge(Arc::new(op));
     }
 
+    // `Unreachable` rather than merely "an error": bob holds the operation that
+    // established this epoch — he watched it go past on the public control
+    // plane — and still cannot derive the key. That is the whole content of
+    // revocation, and it is also what tells an honest peer that waiting will
+    // not help and only a re-encryption can.
     assert!(
-        bob.decrypt(&after).is_err(),
+        matches!(bob.decrypt(&after), Ok(DecryptOutcome::Unreachable)),
         "a revoked member must not be able to decrypt content written after their removal"
     );
 }

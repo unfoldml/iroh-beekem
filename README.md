@@ -184,9 +184,16 @@ reason enough to revisit the choice underneath.
    `Manifest::author_may_write`), and once every peer has seen the removal the roster refuses
    their connections outright. But a peer that has not yet merged the removal still accepts them,
    so genuinely shutting off their writes needs a namespace rotation, which is not automatic.
-2. **A new member cannot read content written before they joined.** They reconstruct the group from
-   the operation log but not the historical PCS keys. This is forward secrecy working as intended;
-   `Workspace` re-publishes current state when a peer joins the overlay so they can catch up.
+2. **A new member cannot read content written before they joined — until somebody re-encrypts it.**
+   They reconstruct the group from the operation log but not the historical PCS keys, which is
+   forward secrecy working as intended. What makes the workspace usable anyway is re-encryption:
+   `Workspace` re-publishes current state when a peer joins the overlay, and a peer that is *still*
+   stuck says so with `ControlMsg::Repair`, which a member that can read the content answers by
+   minting a fresh epoch and publishing under it. Anti-entropy alone cannot do this — it re-encrypts
+   under the same epoch the stuck peer already failed on — so the demand-driven path is load-bearing
+   rather than an optimisation. The cost is one CGKA operation per genuinely stuck `(target, epoch)`,
+   rate-limited per peer; content that was superseded before the join is never recovered, only
+   current state is.
 3. **Timestamp quantization is not achievable with `iroh-docs` as the index.** `Doc::set_bytes`/`set_hash`
    do not accept a timestamp; `iroh-docs` sets it internally. Modification times leak to any syncing
    peer. This is a property of the index we chose, not of the problem.
@@ -207,6 +214,9 @@ reason enough to revisit the choice underneath.
    bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`) and evict oldest-first, because an unbounded
    queue is a remote memory-exhaustion vector. Evicted operations return with the next neighbour log
    exchange; evicted chunks wait for a resync. A property test asserts honest runs never evict.
+   A chunk that can *never* be decrypted is not parked at all — it is dropped, counted, and answered
+   with a repair request, because holding it would occupy the budget for the life of the process
+   while every drain retried a decryption that cannot succeed.
 
 ## Not yet implemented
 

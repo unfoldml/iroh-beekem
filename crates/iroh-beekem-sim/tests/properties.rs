@@ -412,6 +412,13 @@ mod generated_crud_workloads {
 
     use super::{NODES, SEEDS, network_faults};
 
+    /// The ceiling on how many repairs one node may answer in a run.
+    ///
+    /// Deliberately equal to the simulator's anti-entropy budget: one forced
+    /// re-key per round is the most a healthy run can need, since a round is
+    /// what produces the unreadable chunk that raises the request.
+    const MAX_REPAIRS_PER_NODE: u64 = 24;
+
     fn workload_plan<S: Scenario>(
         properties: Vec<Property<WorkspaceNode<S>>>,
     ) -> TestPlan<WorkspaceNode<S>> {
@@ -433,44 +440,25 @@ mod generated_crud_workloads {
 
     /// Full convergence across every document under a generated workload.
     ///
-    /// **Ignored, and left here on purpose — this is a real defect, not a flaky
-    /// test.** Under a fixed script every node has joined before the first
-    /// write, so nothing is ever written that a peer cannot decrypt. A generated
-    /// workload removes that accident: the founder is live at t=0 and writes
-    /// before anyone else has joined, so joiners receive chunks encrypted under
-    /// a key they will never hold. That much is forward secrecy working as
-    /// designed — the re-announcement is supposed to repair it by re-encrypting
-    /// current state under a key they *can* derive.
+    /// This is the property the whole repair path exists to make true, and it
+    /// was `#[ignore]`d as a known defect until that path existed.
     ///
-    /// # Where the repair fails
+    /// Under a fixed script every node has joined before the first write, so
+    /// nothing is ever written that a peer cannot decrypt. A generated workload
+    /// removes that accident: the founder is live at t=0 and writes before
+    /// anyone else has joined, so joiners receive chunks encrypted under a key
+    /// they will never hold. That much is forward secrecy working as designed.
+    /// What was missing was the repair: `Event::Resync` routes through
+    /// `publish`, which reuses the *current* epoch key, so re-announcing
+    /// unchanged content reproduced a chunk with the same `content_ref` **and**
+    /// the same `pcs_key_hash` the stuck peer had already failed on — correctly
+    /// deduped by the receiver, and carrying no new information either way.
+    /// `Effect::RequestRepair` and `Event::RepairRequested` close that loop by
+    /// making the answer mint a fresh epoch.
     ///
-    /// `Event::Resync` routes through `publish`, which calls
-    /// `CgkaController::encrypt` — and that reuses the *current* PCS key. When
-    /// the document has not changed since the last publish, the repair therefore
-    /// reproduces a chunk with the same `content_ref` **and** the same
-    /// `pcs_key_hash` as the one already parked. `on_chunk_arrived` correctly
-    /// dedupes it, and correctly so: the two chunks are interchangeable. The
-    /// bug is upstream of the dedup — anti-entropy that re-encrypts under a key
-    /// the stuck peer already could not derive can repeat forever without ever
-    /// carrying new information. Repair needs to force a PCS update, not merely
-    /// re-publish.
-    ///
-    /// Ruled out: entries not being routed to the right document, RNG salt reuse
-    /// across documents and rounds, and the parked-chunk dedup itself. The first
-    /// two were harness bugs and are fixed; the third is correct as written.
-    ///
-    /// # Why it is ignored now and was not before
-    ///
-    /// It passed on all six honest seeds before fault injection was turned on.
-    /// That was luck, not health: with partitions and reordering in play the
-    /// failure is reproducible (`PROPSIM_SEED=0x03317bb4875fb038`). Widening the
-    /// horizon does not help, which is the evidence that this is a liveness bug
-    /// rather than a slow network.
-    ///
-    /// Un-ignore this once the repair path forces a re-key. It must not be
-    /// weakened into something that passes.
+    /// Reproduced before the fix with `PROPSIM_SEED=0x03317bb4875fb038`, which
+    /// is the seed to reach for if this ever regresses.
     #[test]
-    #[ignore = "known defect: anti-entropy re-encrypts under a key the stuck peer cannot derive"]
     fn every_document_converges_under_a_generated_workload() {
         // Byte-identical, not merely "contains what I wrote". Concurrent inserts
         // have no canonical order, so the assertion is that all replicas agree —
@@ -502,15 +490,85 @@ mod generated_crud_workloads {
         .run(deterministic());
     }
 
+    /// Given a generated workload under partitions, when the network settles,
+    /// we expect every node to have joined and every parking queue to be empty.
+    ///
+    /// The `nodes.len() == NODES` guard is load-bearing and was missing: at t=0
+    /// only the founder has joined and its queues are trivially empty, so
+    /// without it this `eventually` is satisfied at the first sampled instant
+    /// and can never observe a chunk that parks later and never drains — which
+    /// is exactly what pre-join ciphertext used to do. The honest-scenario
+    /// counterpart has always carried the guard; this one had drifted.
     #[test]
     fn no_chunk_stays_parked_under_a_generated_workload() {
         workload_plan::<Crud>(vec![property::eventually_within(
             "parking drains",
             Duration::from_secs(9),
             |w: &World<'_, WorkspaceNode<Crud>>| {
+                let nodes = joined(w);
+                nodes.len() == NODES
+                    && nodes
+                        .iter()
+                        .all(|n| n.pending_chunks() == 0 && n.parked_ops() == 0)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given a generated workload, we expect at least one node to receive
+    /// content it can never decrypt.
+    ///
+    /// The counterweight to every property above it. Convergence and empty
+    /// parking queues are both satisfied by a run in which the awkward case
+    /// never arises — where every node happens to join before anything is
+    /// written — and such a run would say nothing about repair. This asserts
+    /// the situation the repair path exists for actually occurs, so the
+    /// properties that depend on it are not passing vacuously.
+    #[test]
+    fn a_generated_workload_really_does_strand_a_late_joiner() {
+        workload_plan::<Crud>(vec![property::sometimes(
+            "some node receives an epoch it cannot derive",
+            |w: &World<'_, WorkspaceNode<Crud>>| {
+                joined(w).iter().any(|n| n.unreadable_chunks() > 0)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given a node stranded on an epoch it cannot derive, we expect some other
+    /// node to answer with a fresh-keyed republish.
+    ///
+    /// Stated separately from convergence because the two fail differently: a
+    /// run where nobody answers still converges if the stranded content happens
+    /// to be superseded by a later write, and that would leave the repair path
+    /// dead code that nothing notices.
+    #[test]
+    fn a_stranded_node_is_answered_by_a_repair() {
+        workload_plan::<Crud>(vec![property::sometimes(
+            "some node answers a repair request",
+            |w: &World<'_, WorkspaceNode<Crud>>| joined(w).iter().any(|n| n.repairs_answered() > 0),
+        )])
+        .run(deterministic());
+    }
+
+    /// Given an honest run, we expect no node to answer more repairs than it
+    /// performs anti-entropy rounds.
+    ///
+    /// The hazard this guards is a repair loop that feeds itself: an answer
+    /// mints a new epoch and publishes under it, so if that publish could
+    /// itself strand somebody the group would re-key without bound, converting
+    /// one lost message into permanent churn. A bound of one re-key per
+    /// anti-entropy round is far above what a healthy run needs — the runs this
+    /// was written against sit around a quarter of it — and far below what a
+    /// self-sustaining loop would reach within seconds.
+    #[test]
+    fn repair_does_not_feed_itself() {
+        workload_plan::<Crud>(vec![property::always(
+            "repairs stay proportional to anti-entropy rounds",
+            |w: &World<'_, WorkspaceNode<Crud>>| {
                 joined(w)
                     .iter()
-                    .all(|n| n.pending_chunks() == 0 && n.parked_ops() == 0)
+                    .all(|n| n.repairs_answered() <= MAX_REPAIRS_PER_NODE)
             },
         )])
         .run(deterministic());
@@ -532,11 +590,17 @@ mod generated_crud_workloads {
         .run(deterministic());
     }
 
+    /// Given generated CRUD against a group that is concurrently rotating keys
+    /// and losing a member, when the network settles, we expect every surviving
+    /// member to hold identical text.
+    ///
+    /// The hardest combination the simulator can express today. The
+    /// `remaining.len() == NODES - 1` guard matters for the same reason it does
+    /// in `no_chunk_stays_parked_under_a_generated_workload`: at t=0 only the
+    /// founder has joined, so a one-element set agrees with itself and the
+    /// property is satisfied before the run has done anything.
     #[test]
     fn the_remaining_members_converge_under_workload_and_churn() {
-        // The hardest combination the simulator can express today: generated
-        // CRUD against a group that is concurrently rotating keys and losing a
-        // member.
         workload_plan::<CrudChurn>(vec![property::eventually_within(
             "survivors converge",
             Duration::from_secs(9),
@@ -548,7 +612,8 @@ mod generated_crud_workloads {
                 let Some(first) = remaining.first() else {
                     return false;
                 };
-                remaining.iter().all(|n| n.all_text() == first.all_text())
+                remaining.len() == NODES - 1
+                    && remaining.iter().all(|n| n.all_text() == first.all_text())
             },
         )])
         .run(deterministic());

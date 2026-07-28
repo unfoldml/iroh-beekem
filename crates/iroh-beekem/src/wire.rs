@@ -13,6 +13,7 @@
 //! beekem itself verifies neither. This module only frames bytes.
 
 use beekem::operation::CgkaOperation;
+use iroh_beekem_core::{EpochId, RepairTarget};
 use keyhive_crypto::signed::Signed;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +40,32 @@ pub enum ControlMsg {
     Announce {
         /// The blinded storage key the content was written under.
         key: [u8; 32],
+    },
+    /// A peer reporting that it can never decrypt what the group publishes.
+    ///
+    /// A member admitted after content already existed cannot derive the epoch
+    /// that content was keyed under, and re-announcing does not help: anti-
+    /// entropy re-encrypts under that same epoch, reproducing a ciphertext the
+    /// peer already failed on. This asks a member that *can* read it to mint a
+    /// new epoch and publish under that instead.
+    ///
+    /// Carried here rather than on the data plane because the answer's key
+    /// material travels on this topic anyway, and because answering costs a
+    /// tree operation — so the receiver checks the named member against current
+    /// membership before doing any work.
+    /// Carries the requester as raw verifying-key bytes rather than a
+    /// `MemberId`, which wraps an expanded Ed25519 point and would make this
+    /// variant an order of magnitude larger than every other one — the same
+    /// reasoning `CoreError::Unauthorized` records. A value that does not parse
+    /// back into a member id could never have entered the tree, so the receiver
+    /// treats it as a request from a non-member.
+    Repair {
+        /// Who is stuck, as raw verifying-key bytes.
+        member: [u8; 32],
+        /// What they cannot read.
+        target: RepairTarget,
+        /// The epoch they cannot derive.
+        epoch: EpochId,
     },
 }
 

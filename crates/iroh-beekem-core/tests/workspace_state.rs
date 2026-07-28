@@ -7,9 +7,13 @@
 
 use std::sync::Arc;
 
-use beekem::{id::TreeId, operation::CgkaOperation};
+use beekem::{
+    id::{MemberId, TreeId},
+    operation::CgkaOperation,
+};
 use iroh_beekem_core::{
-    CgkaController, DocumentUuid, Effect, Event, Role, WorkspaceSecret, WorkspaceState,
+    CgkaController, DocumentUuid, Effect, EpochId, Event, RepairTarget, Role, WorkspaceSecret,
+    WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
@@ -33,6 +37,13 @@ struct Bus {
     chunks_to_bob: Vec<iroh_beekem_core::Chunk>,
     /// Encrypted manifest replicas alice has emitted but bob has not received.
     manifests_to_bob: Vec<iroh_beekem_core::Chunk>,
+    /// Bob's identity, so his repair requests can be attributed to him.
+    ///
+    /// A repair request names its requester and is answered only for a current
+    /// member, so the bus has to carry that identity rather than invent one.
+    bob_id: MemberId,
+    /// Repair requests bob has raised and alice has not yet answered.
+    repairs_from_bob: Vec<(RepairTarget, EpochId)>,
 }
 
 fn two_node_workspace() -> Bus {
@@ -82,22 +93,93 @@ fn two_node_workspace() -> Bus {
         to_bob: Vec::new(),
         chunks_to_bob: Vec::new(),
         manifests_to_bob: Vec::new(),
+        bob_id,
+        repairs_from_bob: Vec::new(),
     }
 }
 
 impl Bus {
+    /// A bus over two already-constructed nodes.
+    fn new(alice: WorkspaceState, bob: WorkspaceState, bob_id: MemberId) -> Self {
+        Self {
+            alice,
+            bob,
+            to_bob: Vec::new(),
+            chunks_to_bob: Vec::new(),
+            manifests_to_bob: Vec::new(),
+            bob_id,
+            repairs_from_bob: Vec::new(),
+        }
+    }
+
     /// Apply an event to alice, queueing whatever she emits for bob.
     fn alice_does(&mut self, event: Event, seed: u64) {
         let effects = self
             .alice
             .handle(event, &mut rng(seed))
             .expect("alice should handle the event");
+        self.queue_for_bob(effects);
+    }
+
+    /// Apply an event to alice and hand back what she emitted, unqueued.
+    ///
+    /// For assertions about the *shape* of a publish — which epoch it names,
+    /// whether it produced anything at all — as distinct from its effect on bob.
+    fn alice_emits(&mut self, event: Event, seed: u64) -> Vec<Effect> {
+        self.alice
+            .handle(event, &mut rng(seed))
+            .expect("alice should handle the event")
+    }
+
+    /// Repair requests bob has raised and alice has not yet answered.
+    fn repairs_from_bob(&self) -> &[(RepairTarget, EpochId)] {
+        &self.repairs_from_bob
+    }
+
+    /// The single document chunk currently queued for bob.
+    fn chunk_queued_for_bob(&self) -> iroh_beekem_core::Chunk {
+        assert_eq!(
+            self.chunks_to_bob.len(),
+            1,
+            "this helper is for tests expecting exactly one queued chunk"
+        );
+        self.chunks_to_bob[0].clone()
+    }
+
+    /// Route alice's effects onto the bus.
+    ///
+    /// One place, so that a path added later cannot quietly drop the operation
+    /// that keys the chunk beside it — the ordering rule the whole protocol
+    /// rests on.
+    fn queue_for_bob(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
                 Effect::BroadcastOp(op) => self.to_bob.push(*op),
                 Effect::StoreChunk { chunk, .. } => self.chunks_to_bob.push(*chunk),
                 Effect::StoreManifest { chunk, .. } => self.manifests_to_bob.push(*chunk),
-                Effect::Applied { .. } | Effect::ManifestUpdated | Effect::DeleteEntry { .. } => {}
+                // Alice asking bob for a repair is not something these tests
+                // exercise — bob is the joiner — and answering would need a
+                // second bus in the other direction.
+                Effect::RequestRepair { .. }
+                | Effect::Applied { .. }
+                | Effect::ManifestUpdated
+                | Effect::DeleteEntry { .. } => {}
+            }
+        }
+    }
+
+    /// Apply an event to bob, recording any repair he asks for.
+    fn bob_receives(&mut self, event: Event) {
+        let effects = self
+            .bob
+            .handle(event, &mut rng(0))
+            .expect("bob should handle the event");
+        // Bob is a passive receiver in these tests, so the only effect of his
+        // that the bus carries is a repair request; anything he publishes is
+        // the subject of a different test.
+        for effect in effects {
+            if let Effect::RequestRepair { target, epoch } = effect {
+                self.repairs_from_bob.push((target, epoch));
             }
         }
     }
@@ -105,46 +187,56 @@ impl Bus {
     /// Deliver everything queued for bob, control plane first.
     fn deliver_all_to_bob(&mut self) {
         for op in std::mem::take(&mut self.to_bob) {
-            self.bob
-                .handle(Event::ControlOp(Arc::new(op)), &mut rng(0))
-                .expect("bob should handle a control op");
+            self.bob_receives(Event::ControlOp(Arc::new(op)));
         }
         for chunk in std::mem::take(&mut self.manifests_to_bob) {
-            self.bob
-                .handle(
-                    Event::ManifestArrived {
-                        chunk: Box::new(chunk),
-                    },
-                    &mut rng(0),
-                )
-                .expect("bob should handle a manifest arrival");
+            self.bob_receives(Event::ManifestArrived {
+                chunk: Box::new(chunk),
+            });
         }
         for chunk in std::mem::take(&mut self.chunks_to_bob) {
-            self.bob
-                .handle(
-                    Event::ChunkArrived {
-                        doc: DOC,
-                        chunk: Box::new(chunk),
-                    },
-                    &mut rng(0),
-                )
-                .expect("bob should handle a chunk arrival");
+            self.bob_receives(Event::ChunkArrived {
+                doc: DOC,
+                chunk: Box::new(chunk),
+            });
         }
     }
 
     /// Deliver only the data plane, holding back the control plane.
     fn deliver_chunks_only_to_bob(&mut self) {
         for chunk in std::mem::take(&mut self.chunks_to_bob) {
-            self.bob
-                .handle(
-                    Event::ChunkArrived {
-                        doc: DOC,
-                        chunk: Box::new(chunk),
-                    },
-                    &mut rng(0),
-                )
-                .expect("bob should handle a chunk arrival");
+            self.bob_receives(Event::ChunkArrived {
+                doc: DOC,
+                chunk: Box::new(chunk),
+            });
         }
+    }
+
+    /// Have alice answer every repair bob has asked for, queueing the result.
+    ///
+    /// Returns how many she answered, which is the cost the group pays: each
+    /// one mints a new epoch, so a test that expects repair to be bounded can
+    /// assert on it directly.
+    fn alice_answers_repairs(&mut self, seed: u64) -> usize {
+        let mut answered = 0;
+        for (target, epoch) in std::mem::take(&mut self.repairs_from_bob) {
+            let effects = self
+                .alice
+                .handle(
+                    Event::RepairRequested {
+                        requester: self.bob_id,
+                        target,
+                        epoch,
+                    },
+                    &mut rng(seed + answered as u64),
+                )
+                .expect("alice should handle a repair request from a member");
+            if !effects.is_empty() {
+                answered += 1;
+            }
+            self.queue_for_bob(effects);
+        }
+        answered
     }
 }
 
@@ -266,7 +358,10 @@ fn concurrent_edits_from_both_members_converge() {
                     .handle(Event::ManifestArrived { chunk }, &mut rng(0))
                     .expect("alice handles bob's manifest");
             }
-            Effect::Applied { .. } | Effect::ManifestUpdated | Effect::DeleteEntry { .. } => {}
+            Effect::RequestRepair { .. }
+            | Effect::Applied { .. }
+            | Effect::ManifestUpdated
+            | Effect::DeleteEntry { .. } => {}
         }
     }
     bus.deliver_all_to_bob();
@@ -647,6 +742,332 @@ mod the_pending_queue_is_bounded {
         assert!(
             bus.bob.evicted_chunks() > 0,
             "exceeding the byte budget should have evicted something"
+        );
+    }
+}
+
+/// What a member admitted *after* content already exists can read, and how.
+///
+/// This is user story 1 — "invite a teammate so they can immediately access
+/// workspace files" — and it is the one thing forward secrecy makes impossible
+/// to deliver by encryption alone. A joiner cannot derive any epoch that
+/// predates its leaf, so pre-existing content reaches it only if a member that
+/// *can* read it re-encrypts under a live epoch. These tests pin down when that
+/// happens, what it costs, and who is allowed to ask for it.
+mod repair_reaches_a_member_admitted_late {
+    use super::{Bus, DOC, MemberId, rng};
+    use beekem::id::TreeId;
+    use iroh_beekem_core::{
+        CgkaController, Chunk, Effect, EpochId, Event, RepairTarget, Role, WorkspaceSecret,
+        WorkspaceState,
+    };
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
+
+    /// The text alice writes while she is still alone in the workspace.
+    const EARLY: &str = "written before bob arrived";
+
+    /// The one chunk in a set of effects, for tests that expect exactly one.
+    fn only_chunk(effects: &[Effect]) -> Chunk {
+        let mut chunks = effects.iter().filter_map(|effect| match effect {
+            Effect::StoreChunk { chunk, .. } => Some((**chunk).clone()),
+            _ => None,
+        });
+        let chunk = chunks.next().expect("the effects should contain a chunk");
+        assert!(
+            chunks.next().is_none(),
+            "these tests assume one document per publish; more than one means the \
+             caller changed and the assertions below no longer say what they claim"
+        );
+        chunk
+    }
+
+    /// A workspace where alice wrote a document *before* bob was admitted.
+    ///
+    /// Distinct from `two_node_workspace` in exactly one respect, and it is the
+    /// respect that matters: there bob holds a leaf before anything is written,
+    /// so every chunk is readable by construction and the repair path is never
+    /// reached. Returns the chunk alice published while alone, which is the
+    /// ciphertext bob can never decrypt.
+    fn workspace_written_to_before_bob_joined() -> (Bus, Chunk) {
+        let doc_id = TreeId::from(MemorySigner::generate(&mut rng(0)).verifying_key());
+        let alice_signer = MemorySigner::generate(&mut rng(1));
+        let bob_signer = MemorySigner::generate(&mut rng(2));
+        let bob_id = MemberId::from(bob_signer.verifying_key());
+        let secret = WorkspaceSecret::generate(&mut rng(5));
+
+        let alice_cgka = CgkaController::create(doc_id, alice_signer, &mut rng(10))
+            .expect("alice founds the workspace");
+        let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
+            .expect("the founder records herself as the first admin");
+
+        let effects = alice
+            .handle(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: EARLY.into(),
+                },
+                &mut rng(30),
+            )
+            .expect("alice writes while she is the only member");
+        let stale = only_chunk(&effects);
+
+        // Now bob is admitted, through the same event a real admission uses, so
+        // that he gets the manifest records a leaf needs to have a role.
+        let bob_secret = ShareSecretKey::generate(&mut rng(20));
+        let admission = alice
+            .handle(
+                Event::AddUser {
+                    member: bob_id,
+                    share_key: bob_secret.share_key(),
+                    role: Role::Editor,
+                    display_name: "bob".into(),
+                    endpoint: None,
+                },
+                &mut rng(31),
+            )
+            .expect("alice is an admin and may admit bob");
+
+        let log = alice.op_log().expect("exporting the operation log");
+        let bob_cgka =
+            CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
+
+        let mut bus = Bus::new(alice, WorkspaceState::joined(bob_cgka, secret), bob_id);
+        bus.queue_for_bob(admission);
+        (bus, stale)
+    }
+
+    /// Given a workspace with content written before a member was admitted,
+    /// when that member receives the old ciphertext, we expect it to be dropped
+    /// rather than parked, and a repair request raised naming exactly the epoch
+    /// it cannot derive.
+    ///
+    /// Parking it would be the silent failure: the chunk can never become
+    /// applicable, so it would occupy the pending budget for the lifetime of
+    /// the process while every drain retried a decryption that cannot succeed,
+    /// and nothing anywhere would say so.
+    #[test]
+    fn a_chunk_from_before_the_join_is_dropped_and_reported() {
+        let (mut bus, stale) = workspace_written_to_before_bob_joined();
+        bus.deliver_all_to_bob();
+
+        bus.bob_receives(Event::ChunkArrived {
+            doc: DOC,
+            chunk: Box::new(stale.clone()),
+        });
+
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            "",
+            "bob must not be able to read an epoch that predates his own leaf"
+        );
+        assert_eq!(
+            bus.bob.pending_len(),
+            0,
+            "a chunk that can never be decrypted must not occupy the pending budget"
+        );
+        assert_eq!(
+            bus.bob.unreadable_chunks(),
+            1,
+            "dropping it silently would be the same defect in a different place; \
+             it has to be counted"
+        );
+        assert_eq!(
+            bus.repairs_from_bob(),
+            &[(RepairTarget::Document(DOC), EpochId::of(&stale))],
+            "the request must name the document and the exact epoch bob failed on, \
+             since that pair is what a responder's rate limiter is keyed on"
+        );
+    }
+
+    /// Given a member stuck on pre-join content, when a member that can read it
+    /// answers the repair, we expect the content to become readable — and to
+    /// arrive under a *different* epoch than the one that was asked about.
+    ///
+    /// The second half is the whole mechanism. A response under the same epoch
+    /// would be the byte-identical ciphertext bob already failed on, which is
+    /// precisely what ordinary anti-entropy produces.
+    #[test]
+    fn an_answered_repair_makes_pre_join_content_readable() {
+        let (mut bus, stale) = workspace_written_to_before_bob_joined();
+        bus.deliver_all_to_bob();
+        bus.bob_receives(Event::ChunkArrived {
+            doc: DOC,
+            chunk: Box::new(stale.clone()),
+        });
+
+        assert_eq!(
+            bus.alice_answers_repairs(40),
+            1,
+            "alice holds the document and may write, so she must answer"
+        );
+        let answer = bus.chunk_queued_for_bob();
+        assert_ne!(
+            EpochId::of(&answer),
+            EpochId::of(&stale),
+            "a repair keyed under the epoch that was reported unreadable carries \
+             nothing new, which is the defect this whole path exists to fix"
+        );
+
+        bus.deliver_all_to_bob();
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            EARLY,
+            "once alice re-keys and republishes, bob reads content written before \
+             he was admitted — user story 1"
+        );
+        assert_eq!(
+            bus.bob.pending_len(),
+            0,
+            "nothing should remain parked once the repair has landed"
+        );
+    }
+
+    /// Given a document that has not changed, when it is re-announced twice, we
+    /// expect both announcements to be keyed under the same epoch — and a
+    /// repair of the same document to be keyed under a new one.
+    ///
+    /// This is the defect stated as an assertion. Anti-entropy is a fixed point
+    /// with respect to a peer that cannot derive the current epoch: repeating it
+    /// reproduces the ciphertext that peer already failed on. Only the repair
+    /// path is obliged to advance the epoch, and this is what says so.
+    #[test]
+    fn anti_entropy_repeats_an_epoch_while_a_repair_advances_it() {
+        let (mut bus, _stale) = workspace_written_to_before_bob_joined();
+        bus.deliver_all_to_bob();
+
+        let first = only_chunk(&bus.alice_emits(Event::Resync { doc: DOC }, 50));
+        let second = only_chunk(&bus.alice_emits(Event::Resync { doc: DOC }, 51));
+        assert_eq!(
+            EpochId::of(&first),
+            EpochId::of(&second),
+            "two resyncs of unchanged content must reuse the epoch — if they did \
+             not, this test would be proving nothing about the repair below"
+        );
+        assert_eq!(
+            first.content_ref, second.content_ref,
+            "unchanged content re-exports identically, which is why a receiver \
+             correctly dedupes the second against the first"
+        );
+
+        let repaired = only_chunk(&bus.alice_emits(
+            Event::RepairRequested {
+                requester: bus.bob.member_id(),
+                target: RepairTarget::Document(DOC),
+                epoch: EpochId::of(&second),
+            },
+            52,
+        ));
+        assert_ne!(
+            EpochId::of(&repaired),
+            EpochId::of(&second),
+            "a repair must mint a new epoch, or it tells the stuck peer nothing"
+        );
+    }
+
+    /// Given a member that has been removed, when it asks for a repair, we
+    /// expect the request to be refused before any key material is minted.
+    ///
+    /// Answering costs the whole group a tree operation, so an unauthenticated
+    /// request would be a cheap way for a revoked device to spend everyone's
+    /// CPU. It would also gain the requester nothing — the fresh epoch is minted
+    /// after its leaf left the tree — which is why refusing costs no liveness.
+    #[test]
+    fn a_removed_member_cannot_make_the_group_re_key() {
+        let (mut bus, stale) = workspace_written_to_before_bob_joined();
+        bus.deliver_all_to_bob();
+
+        let bob_id = bus.bob.member_id();
+        bus.alice_does(Event::RemoveMember { member: bob_id }, 60);
+        let before = bus.alice.repairs_answered();
+
+        let refusal = bus.alice.handle(
+            Event::RepairRequested {
+                requester: bob_id,
+                target: RepairTarget::Document(DOC),
+                epoch: EpochId::of(&stale),
+            },
+            &mut rng(61),
+        );
+
+        assert!(
+            refusal.is_err(),
+            "a repair request from a device that is no longer a member must be refused"
+        );
+        assert_eq!(
+            bus.alice.repairs_answered(),
+            before,
+            "the refusal must happen before the re-key, not after it"
+        );
+    }
+
+    /// Given a repair request naming a document this node does not hold, we
+    /// expect no answer and no re-key.
+    ///
+    /// A no-op rather than an error: some other member holds it and will
+    /// answer, and treating "not mine" as a fault would fill an operator's logs
+    /// with the normal case.
+    #[test]
+    fn a_repair_for_an_unheld_document_costs_nothing() {
+        let (mut bus, stale) = workspace_written_to_before_bob_joined();
+        bus.deliver_all_to_bob();
+        let before = bus.alice.repairs_answered();
+
+        let effects = bus.alice_emits(
+            Event::RepairRequested {
+                requester: bus.bob.member_id(),
+                target: RepairTarget::Document(iroh_beekem_core::DocumentUuid([99u8; 16])),
+                epoch: EpochId::of(&stale),
+            },
+            70,
+        );
+
+        assert!(
+            effects.is_empty(),
+            "a node with nothing to re-encrypt must stay silent, got {effects:?}"
+        );
+        assert_eq!(
+            bus.alice.repairs_answered(),
+            before,
+            "an unanswerable request must not be counted as a repair, or the \
+             bounded-cost property would be measuring the wrong thing"
+        );
+    }
+
+    /// Given a member that cannot read the manifest, when it asks for a repair
+    /// of the manifest, we expect a fresh-keyed manifest replica in return.
+    ///
+    /// The manifest needs this at least as much as a document does: device
+    /// records live there and the roster derives from them, so a member that
+    /// cannot read it is refused by peers rather than merely out of date — and
+    /// unlike a document, it has no parking queue to hold a copy until keys
+    /// arrive.
+    #[test]
+    fn a_manifest_repair_is_answered_under_a_fresh_epoch() {
+        let (mut bus, stale) = workspace_written_to_before_bob_joined();
+        bus.deliver_all_to_bob();
+
+        let effects = bus.alice_emits(
+            Event::RepairRequested {
+                requester: bus.bob.member_id(),
+                target: RepairTarget::Manifest,
+                epoch: EpochId::of(&stale),
+            },
+            80,
+        );
+
+        let manifest = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::StoreManifest { chunk, .. } => Some((**chunk).clone()),
+                _ => None,
+            })
+            .expect("a manifest repair must produce a manifest replica");
+        assert_ne!(
+            EpochId::of(&manifest),
+            EpochId::of(&stale),
+            "the replacement must be keyed under an epoch the requester can derive"
         );
     }
 }

@@ -18,6 +18,23 @@
 //! control operations arrive. Getting this pairing wrong is the most likely
 //! source of silent data loss in the whole system, which is why
 //! [`WorkspaceState::pending_len`] is exposed for properties to assert on.
+//!
+//! # A third outcome, and why repair exists
+//!
+//! There is a case neither of those covers: a chunk keyed under an epoch that
+//! predates this node's membership. Waiting cannot fix it — that is forward
+//! secrecy — and neither can anti-entropy, because [`Event::Resync`]
+//! re-encrypts under the *current* epoch key, which for such a peer is a key it
+//! already could not derive. Re-publishing unchanged content then reproduces a
+//! byte-identical chunk, so the repair loop is a fixed point that carries no
+//! information.
+//!
+//! [`Effect::RequestRepair`] and [`Event::RepairRequested`] close that loop:
+//! the stuck peer names what it cannot read, and a peer that *can* read it
+//! answers by minting a new epoch ([`Keying::Fresh`]) and re-publishing under
+//! it. A freshly minted epoch is derivable by every leaf in the tree and by
+//! nothing outside it, so the repair reaches new members without reaching
+//! removed ones.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -25,12 +42,13 @@ use beekem::{id::MemberId, operation::CgkaOperation};
 use keyhive_crypto::{share_key::ShareKey, signed::Signed};
 use loro::{ExportMode, LoroDoc};
 use rand::{CryptoRng, RngCore};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
     content::{Chunk, ChunkRef},
     error::CoreError,
-    keys::{CgkaController, ControlOp, MergeOutcome},
+    keys::{CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome},
     manifest::{FileEntry, Manifest, Role, WorkspaceInfo},
 };
 
@@ -49,6 +67,21 @@ pub const MAX_PENDING_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// How many chunks may be parked at once, regardless of their size.
 pub const MAX_PENDING_CHUNKS: usize = 4096;
+
+/// What a repair request is asking somebody to re-encrypt.
+///
+/// The manifest is a target in its own right rather than a document with a
+/// well-known UUID, because it is the one thing whose loss is not merely
+/// invisible content: device records live there and the roster derives from
+/// them, so a member that cannot read the manifest is refused by peers rather
+/// than merely out of date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RepairTarget {
+    /// One document, named by the UUID both sides already agree on.
+    Document(DocumentUuid),
+    /// The workspace manifest.
+    Manifest,
+}
 
 /// Something that happened to this node.
 #[derive(Debug, Clone)]
@@ -242,6 +275,28 @@ pub enum Event {
     /// and endpoint records, which it published without needing a role in the
     /// first place — and refusing would leave viewers permanently unreachable.
     ResyncManifest,
+    /// A peer reports that it can never decrypt what it received from us.
+    ///
+    /// The other half of [`Effect::RequestRepair`], and the only thing in the
+    /// protocol that turns "somebody is stuck" into "somebody re-keys".
+    /// Ordinary anti-entropy cannot do it: [`Event::Resync`] re-encrypts under
+    /// the *current* epoch key, so for a peer that cannot derive that key every
+    /// repeat carries exactly the information the first one did — none. The
+    /// answer to this event mints a new epoch instead, which every leaf in the
+    /// tree can derive and nothing outside it can.
+    ///
+    /// Answering costs a tree operation, so the request is gated on the
+    /// requester being a member *now*: a removed device must not be able to
+    /// spend the group's CPU, and it gains nothing from the answer either way,
+    /// since the fresh epoch is minted after its leaf left the tree.
+    RepairRequested {
+        /// Who is stuck. Must be a current member for the request to be honoured.
+        requester: MemberId,
+        /// What they cannot read.
+        target: RepairTarget,
+        /// The epoch they named, for the caller's rate limiting and for logs.
+        epoch: EpochId,
+    },
 }
 
 /// Something the caller must do on this node's behalf.
@@ -292,6 +347,50 @@ pub enum Effect {
     },
     /// A remote manifest replica was decrypted and merged.
     ManifestUpdated,
+    /// Tell the group that this node can never decrypt what it just received.
+    ///
+    /// Raised when a chunk names an epoch whose establishing operation is in
+    /// hand and whose key still cannot be derived — that is, one that predates
+    /// this node's membership. Waiting cannot fix it and neither can ordinary
+    /// anti-entropy, which re-encrypts under the same unreachable key; only a
+    /// holder re-keying and re-publishing can, and this is how it is asked.
+    ///
+    /// **The caller must rate-limit this.** It is emitted on every arrival of
+    /// an unreachable chunk, deliberately: a request lost in transit must be
+    /// retried, and the core has no clock to schedule a retry with. Both
+    /// backends key their cooldown on `(target, epoch)`, which bounds the rate
+    /// while still letting a peer that becomes stuck on a *new* epoch be served
+    /// at once rather than waiting the window out.
+    RequestRepair {
+        /// What this node cannot read.
+        target: RepairTarget,
+        /// The epoch it cannot derive.
+        epoch: EpochId,
+    },
+}
+
+/// What the local node could do with one parked chunk.
+///
+/// Separating "not yet" from "never" is what makes the pending queue
+/// terminating: without it, ciphertext from before this node joined is retried
+/// on every drain for the lifetime of the process, occupying the budget meant
+/// for chunks that are genuinely in flight, and nothing anywhere reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkVerdict {
+    /// Decrypted and merged into the document.
+    Applied,
+    /// The operation establishing its epoch has not arrived. Keep it.
+    AwaitingKey,
+    /// Decrypted, but Loro is missing operations it depends on. Keep it.
+    AwaitingDeps,
+    /// Keyed under an epoch this node can never derive. Drop it and ask for a
+    /// re-encryption; no amount of waiting turns this into `Applied`.
+    Unreachable,
+    /// The key was derived and authentication then failed. Drop it, and do
+    /// *not* ask for a repair: the epoch is one this node can read, so the
+    /// fault is the ciphertext, and a repair request would hand any peer able
+    /// to corrupt a byte a way to force group-wide re-keys.
+    Corrupt,
 }
 
 /// One node's complete workspace state.
@@ -309,6 +408,26 @@ pub struct WorkspaceState {
     pending_bytes: usize,
     /// Chunks dropped because the pending budget was exhausted.
     evicted_chunks: u64,
+    /// Chunks dropped because their epoch predates this node's membership.
+    ///
+    /// Not a fault: it is forward secrecy, and it is the ordinary experience of
+    /// a member admitted after content already existed. It is counted because
+    /// each one costs a repair request, so a value that keeps climbing after
+    /// the group has settled means repairs are not landing.
+    unreadable_chunks: u64,
+    /// Chunks whose key was derived and whose authentication then failed.
+    ///
+    /// Distinct from [`Self::unreadable_chunks`] because the cause is
+    /// different in kind: this is a corrupted or tampered ciphertext from a
+    /// peer allowed to write, not an ordering or membership condition. It
+    /// should be zero in any honest run.
+    corrupt_chunks: u64,
+    /// Repair requests this node answered by minting a fresh epoch.
+    ///
+    /// Each one is a tree operation the whole group pays for, which is exactly
+    /// why it is counted: repair must stay proportional to the number of peers
+    /// that are actually stuck, not to how often anti-entropy runs.
+    repairs_answered: u64,
     /// The most recent chunk this node published or applied, per document.
     ///
     /// This is what makes each chunk's key causally bound rather than bound to
@@ -363,6 +482,9 @@ impl Clone for WorkspaceState {
             pending_chunks: self.pending_chunks.clone(),
             pending_bytes: self.pending_bytes,
             evicted_chunks: self.evicted_chunks,
+            unreadable_chunks: self.unreadable_chunks,
+            corrupt_chunks: self.corrupt_chunks,
+            repairs_answered: self.repairs_answered,
             last_ref: self.last_ref.clone(),
             endpoint_id: self.endpoint_id,
         }
@@ -396,6 +518,9 @@ impl WorkspaceState {
             pending_chunks: VecDeque::new(),
             pending_bytes: 0,
             evicted_chunks: 0,
+            unreadable_chunks: 0,
+            corrupt_chunks: 0,
+            repairs_answered: 0,
             last_ref: HashMap::new(),
             endpoint_id: None,
         }
@@ -520,6 +645,36 @@ impl WorkspaceState {
         self.cgka.evicted_ops()
     }
 
+    /// Chunks dropped because this node can never derive their epoch key.
+    ///
+    /// Expected to be non-zero for any member admitted after content already
+    /// existed — that is forward secrecy. Each one raises
+    /// [`Effect::RequestRepair`], so what matters is that it stops climbing
+    /// once the repair lands, not that it stays at zero.
+    #[must_use]
+    pub fn unreadable_chunks(&self) -> u64 {
+        self.unreadable_chunks
+    }
+
+    /// Chunks whose key was derived and whose authentication then failed.
+    ///
+    /// Zero in any honest run; a non-zero value means a peer that may write is
+    /// producing ciphertext this node cannot authenticate.
+    #[must_use]
+    pub fn corrupt_chunks(&self) -> u64 {
+        self.corrupt_chunks
+    }
+
+    /// Repair requests answered by minting a fresh epoch.
+    ///
+    /// One tree operation each, paid for by the whole group, so this is the
+    /// number to watch: it should track admissions and lost operations, not
+    /// anti-entropy rounds.
+    #[must_use]
+    pub fn repairs_answered(&self) -> u64 {
+        self.repairs_answered
+    }
+
     /// The current text of a document, or the empty string if unknown.
     #[must_use]
     pub fn document_text(&self, doc: DocumentUuid) -> String {
@@ -576,20 +731,7 @@ impl WorkspaceState {
                 content.delete(at, len.min(end - at))
             }),
             Event::DeleteFile { doc } => self.on_delete_file(doc, csprng),
-            // Gated like any other publish, and for the same reason: a
-            // re-announcement runs the identical `publish` path, so it can
-            // force a group-wide key change on everyone's behalf. A member who
-            // may not write has nothing legitimate to re-announce anyway, since
-            // peers reject its entries either way.
-            Event::Resync { doc } => {
-                self.require_write()?;
-                // Nothing known about this document yet; nothing to re-announce.
-                if self.docs.contains_key(&doc) {
-                    self.publish(doc, csprng)
-                } else {
-                    Ok(Vec::new())
-                }
-            }
+            Event::Resync { doc } => self.on_resync(doc, csprng),
             Event::AddUser {
                 member,
                 share_key,
@@ -619,12 +761,12 @@ impl WorkspaceState {
             Event::UpsertFile { entry } => {
                 self.require_write()?;
                 self.manifest.upsert_file(&entry)?;
-                self.publish_manifest(csprng)
+                self.publish_manifest(Keying::Current, csprng)
             }
             Event::RenameFile { doc, path } => {
                 self.require_write()?;
                 self.manifest.rename(doc, &path)?;
-                self.publish_manifest(csprng)
+                self.publish_manifest(Keying::Current, csprng)
             }
             Event::SetRole { user, role } => {
                 self.require_admin()?;
@@ -632,25 +774,30 @@ impl WorkspaceState {
                     self.require_not_last_admin(&user)?;
                 }
                 self.manifest.set_role(&user, role)?;
-                self.publish_manifest(csprng)
+                self.publish_manifest(Keying::Current, csprng)
             }
             Event::SetInfo { info } => {
                 self.require_admin()?;
                 self.manifest.set_info(&info)?;
-                self.publish_manifest(csprng)
+                self.publish_manifest(Keying::Current, csprng)
             }
             Event::SetDisplayName { display_name } => {
                 let me = self.cgka.member_id().to_bytes();
                 let user = self.manifest.user_of(&me).ok_or(CoreError::UnknownDevice)?;
                 self.manifest.set_user(&user, &display_name)?;
-                self.publish_manifest(csprng)
+                self.publish_manifest(Keying::Current, csprng)
             }
             Event::AnnounceAuthor { author } => {
                 self.manifest
                     .set_author(&self.cgka.member_id().to_bytes(), &author)?;
-                self.publish_manifest(csprng)
+                self.publish_manifest(Keying::Current, csprng)
             }
-            Event::ResyncManifest => self.publish_manifest(csprng),
+            Event::ResyncManifest => self.publish_manifest(Keying::Current, csprng),
+            Event::RepairRequested {
+                requester,
+                target,
+                epoch: _,
+            } => self.on_repair_requested(requester, target, csprng),
             Event::AnnounceEndpoint { endpoint_id } => {
                 self.endpoint_id = Some(endpoint_id);
                 // The manifest may have nowhere to put it yet — a joiner has no
@@ -658,7 +805,7 @@ impl WorkspaceState {
                 // what makes that recoverable; `record_endpoint` reports
                 // whether the write landed so we only publish when it did.
                 if self.record_endpoint()? {
-                    self.publish_manifest(csprng)
+                    self.publish_manifest(Keying::Current, csprng)
                 } else {
                     Ok(Vec::new())
                 }
@@ -745,11 +892,29 @@ impl WorkspaceState {
         chunk: &Chunk,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
-        let Ok(plaintext) = self.cgka.decrypt(chunk) else {
-            // Not yet decryptable, and not an error: forward secrecy means a
-            // replica published before this node joined never will be. The next
-            // re-announcement carries one it can read.
-            return Ok(Vec::new());
+        let plaintext = match self.cgka.decrypt(chunk) {
+            Ok(DecryptOutcome::Plaintext(plaintext)) => plaintext,
+            // The control plane has not caught up. The next re-announcement,
+            // or this same one after the missing operation lands, will read.
+            Ok(DecryptOutcome::AwaitingOp) => return Ok(Vec::new()),
+            // Published before this node joined, so no re-announcement under
+            // that epoch will ever be readable. Ask for one under a live epoch:
+            // without the manifest this node has no device records, so it
+            // derives no roster and peers derive none containing it.
+            Ok(DecryptOutcome::Unreachable) => {
+                self.unreadable_chunks += 1;
+                return Ok(vec![Effect::RequestRepair {
+                    target: RepairTarget::Manifest,
+                    epoch: EpochId::of(chunk),
+                }]);
+            }
+            // Authenticated decryption failed under a key we *did* derive:
+            // count it and move on, exactly as for a document chunk, rather
+            // than letting one bad ciphertext abort the arrival pump.
+            Err(_) => {
+                self.corrupt_chunks += 1;
+                return Ok(Vec::new());
+            }
         };
         self.manifest.import(&plaintext)?;
         // The arriving replica may be the one that finally carries this
@@ -758,7 +923,7 @@ impl WorkspaceState {
         // peer's roster.
         let mut effects = vec![Effect::ManifestUpdated];
         if self.record_endpoint()? {
-            effects.extend(self.publish_manifest(csprng)?);
+            effects.extend(self.publish_manifest(Keying::Current, csprng)?);
         }
         Ok(effects)
     }
@@ -900,7 +1065,7 @@ impl WorkspaceState {
             key: self.secret.storage_key(doc),
             doc,
         }];
-        effects.extend(self.publish_manifest(csprng)?);
+        effects.extend(self.publish_manifest(Keying::Current, csprng)?);
         Ok(effects)
     }
 
@@ -929,7 +1094,7 @@ impl WorkspaceState {
             .map(|o| Effect::BroadcastOp(Box::new(o)))
             .into_iter()
             .collect();
-        effects.extend(self.publish_manifest(csprng)?);
+        effects.extend(self.publish_manifest(Keying::Current, csprng)?);
         Ok(effects)
     }
 
@@ -979,25 +1144,118 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Re-announce a document without editing it.
+    ///
+    /// Gated like any other publish, and for the same reason: a re-announcement
+    /// runs the identical `publish` path, so it can force a group-wide key
+    /// change on everyone's behalf. A member who may not write has nothing
+    /// legitimate to re-announce anyway, since peers reject its entries either
+    /// way.
+    fn on_resync<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_write()?;
+        if self.docs.contains_key(&doc) {
+            self.publish(doc, csprng)
+        } else {
+            // Nothing known about this document yet; nothing to re-announce.
+            Ok(Vec::new())
+        }
+    }
+
+    /// Answer a peer that reports it can never read what we publish.
+    ///
+    /// Three distinct outcomes, and the difference between them matters:
+    ///
+    /// * **Not a current member** — refused, loudly. Answering costs a tree
+    ///   operation, so this is the one place where being permissive would let a
+    ///   revoked device spend the group's CPU indefinitely. `current_members`
+    ///   rather than `known_members` for exactly that reason; disagreeing about
+    ///   it costs a refused repair the next merge repairs, which is the cheap
+    ///   direction.
+    /// * **Nothing to offer** — a viewer, or a node that does not hold this
+    ///   document, has nothing to re-encrypt. That is not the requester's
+    ///   fault and not an error: some other member will answer.
+    /// * **Able to help** — re-key and republish, so the answer is keyed under
+    ///   an epoch minted *after* the request and therefore derivable by every
+    ///   leaf currently in the tree, the requester's included.
+    fn on_repair_requested<R: CryptoRng + RngCore>(
+        &mut self,
+        requester: MemberId,
+        target: RepairTarget,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if !self.cgka.is_current_member(requester) {
+            return Err(CoreError::Unauthorized {
+                issuer: requester.to_bytes(),
+            });
+        }
+        let effects = match target {
+            // Not gated on a writing role, exactly as `Event::ResyncManifest`
+            // is not: a viewer's own device record lives in the manifest too,
+            // and a group where only writers can repair the manifest is one
+            // where a viewer can be locked off every roster permanently.
+            RepairTarget::Manifest => self.publish_manifest(Keying::Fresh, csprng)?,
+            RepairTarget::Document(doc) => {
+                if self.docs.contains_key(&doc) && self.require_write().is_ok() {
+                    self.publish_keyed(doc, Keying::Fresh, csprng)?
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+        if effects.is_empty() {
+            // Nothing to offer: no epoch was minted, so nothing is counted.
+            Ok(effects)
+        } else {
+            self.repairs_answered += 1;
+            Ok(effects)
+        }
+    }
+
     /// Encrypt the manifest and emit it for storage at its well-known key.
     fn publish_manifest<R: CryptoRng + RngCore>(
         &mut self,
+        keying: Keying,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
         let snapshot = self.manifest.export_snapshot()?;
-        let (chunk, implicit_op) = self.cgka.encrypt(&snapshot, &[], csprng)?;
+        let (chunk, ops) = self.encrypt_keyed(&snapshot, &[], keying, csprng)?;
 
-        let mut effects = Vec::new();
         // As in `publish`: an implicit PCS update has to reach peers before the
         // ciphertext it keys, or nobody can read what follows.
-        if let Some(op) = implicit_op {
-            effects.push(Effect::BroadcastOp(Box::new(op)));
-        }
+        let mut effects: Vec<Effect> = ops
+            .into_iter()
+            .map(|op| Effect::BroadcastOp(Box::new(op)))
+            .collect();
         effects.push(Effect::StoreManifest {
             key: self.secret.manifest_key(),
             chunk: Box::new(chunk),
         });
         Ok(effects)
+    }
+
+    /// Encrypt one payload under either the current epoch or a fresh one.
+    ///
+    /// The single place the choice is made, so that no future publish path can
+    /// silently pick the wrong one. Both arms return their operations in the
+    /// order they must be broadcast.
+    fn encrypt_keyed<R: CryptoRng + RngCore>(
+        &mut self,
+        plaintext: &[u8],
+        preds: &[ChunkRef],
+        keying: Keying,
+        csprng: &mut R,
+    ) -> Result<(Chunk, Vec<Signed<CgkaOperation>>), CoreError> {
+        match keying {
+            Keying::Current => {
+                let (chunk, implicit) = self.cgka.encrypt(plaintext, preds, csprng)?;
+                Ok((chunk, implicit.into_iter().collect()))
+            }
+            Keying::Fresh => self.cgka.encrypt_fresh(plaintext, preds, csprng),
+        }
     }
 
     fn on_control_op(&mut self, op: ControlOp) -> Result<Vec<Effect>, CoreError> {
@@ -1011,10 +1269,20 @@ impl WorkspaceState {
         Ok(Vec::new())
     }
 
-    /// Encrypt and emit the current state of a document.
+    /// Encrypt and emit the current state of a document under the current epoch.
     fn publish<R: CryptoRng + RngCore>(
         &mut self,
         doc: DocumentUuid,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.publish_keyed(doc, Keying::Current, csprng)
+    }
+
+    /// Encrypt and emit the current state of a document.
+    fn publish_keyed<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        keying: Keying,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
         let loro = self.docs.entry(doc).or_default();
@@ -1030,15 +1298,16 @@ impl WorkspaceState {
 
         // Bind this chunk to the last state we know of for this document.
         let preds: Vec<ChunkRef> = self.last_ref.get(&doc).copied().into_iter().collect();
-        let (chunk, implicit_op) = self.cgka.encrypt(&update, &preds, csprng)?;
+        let (chunk, ops) = self.encrypt_keyed(&update, &preds, keying, csprng)?;
         self.last_ref.insert(doc, chunk.content_ref);
 
-        let mut effects = Vec::new();
-        // The implicit PCS update must go out *before* anything else can read
-        // the chunk, so it is emitted first.
-        if let Some(op) = implicit_op {
-            effects.push(Effect::BroadcastOp(Box::new(op)));
-        }
+        // Key material must go out *before* anything else can read the chunk,
+        // so it is emitted first — whether it is an implicit update beekem
+        // performed for us or the deliberate re-key of a repair.
+        let mut effects: Vec<Effect> = ops
+            .into_iter()
+            .map(|op| Effect::BroadcastOp(Box::new(op)))
+            .collect();
         effects.push(Effect::StoreChunk {
             key: self.secret.storage_key(doc),
             doc,
@@ -1068,26 +1337,46 @@ impl WorkspaceState {
     }
 
     /// Retry every parked chunk, repeating while progress is being made.
+    ///
+    /// Progress is counted as *applications*, not as effects: a repair request
+    /// is an effect too, and counting it would spin this loop forever over a
+    /// chunk that can never apply.
     fn drain_pending(&mut self) -> Result<Vec<Effect>, CoreError> {
         let mut effects = Vec::new();
         loop {
             let candidates = std::mem::take(&mut self.pending_chunks);
             self.pending_bytes = 0;
-            let before = effects.len();
+            let mut applied = 0_usize;
             for (doc, chunk) in candidates {
-                if self.try_apply(doc, &chunk) {
-                    effects.push(Effect::Applied { doc });
-                } else {
+                match self.try_apply(doc, &chunk) {
+                    ChunkVerdict::Applied => {
+                        applied += 1;
+                        effects.push(Effect::Applied { doc });
+                    }
                     // Not applicable yet: re-queue and try again next time new
                     // key material or new operations arrive. Re-queueing goes
                     // through the plain path rather than `park_chunk`, because
                     // these chunks were already admitted under the budget and
                     // re-checking it here could evict a chunk mid-drain.
-                    self.pending_bytes += chunk.ciphertext.len();
-                    self.pending_chunks.push_back((doc, chunk));
+                    ChunkVerdict::AwaitingKey | ChunkVerdict::AwaitingDeps => {
+                        self.pending_bytes += chunk.ciphertext.len();
+                        self.pending_chunks.push_back((doc, chunk));
+                    }
+                    // Never applicable. Holding it would occupy the budget for
+                    // the life of the process and retry a decryption that
+                    // cannot succeed on every drain; the content comes back
+                    // instead as a re-encryption under an epoch we can derive.
+                    ChunkVerdict::Unreachable => {
+                        self.unreadable_chunks += 1;
+                        effects.push(Effect::RequestRepair {
+                            target: RepairTarget::Document(doc),
+                            epoch: EpochId::of(&chunk),
+                        });
+                    }
+                    ChunkVerdict::Corrupt => self.corrupt_chunks += 1,
                 }
             }
-            if effects.len() == before {
+            if applied == 0 {
                 return Ok(effects);
             }
         }
@@ -1095,23 +1384,48 @@ impl WorkspaceState {
 
     /// Attempt to decrypt and merge one chunk.
     ///
-    /// Returns `false` when the chunk is simply not applicable yet — a missing
-    /// key or a missing CRDT dependency — rather than treating the normal case
-    /// of out-of-order delivery as a failure. A revoked member sees the same
-    /// `false` forever, which is the intended outcome.
-    fn try_apply(&mut self, doc: DocumentUuid, chunk: &Chunk) -> bool {
-        let Ok(plaintext) = self.cgka.decrypt(chunk) else {
-            return false;
+    /// Out-of-order delivery is not a failure, so "not applicable" is a verdict
+    /// rather than an error — but it is *two* verdicts, and which one it is
+    /// decides whether the chunk is worth keeping. A chunk waiting on key
+    /// material becomes readable the moment the control plane catches up; a
+    /// chunk keyed under an epoch that predates this node's membership never
+    /// does, and the only thing that can help is somebody re-encrypting it.
+    fn try_apply(&mut self, doc: DocumentUuid, chunk: &Chunk) -> ChunkVerdict {
+        let plaintext = match self.cgka.decrypt(chunk) {
+            Ok(DecryptOutcome::Plaintext(plaintext)) => plaintext,
+            Ok(DecryptOutcome::AwaitingOp) => return ChunkVerdict::AwaitingKey,
+            Ok(DecryptOutcome::Unreachable) => return ChunkVerdict::Unreachable,
+            Err(_) => return ChunkVerdict::Corrupt,
         };
         let loro = self.docs.entry(doc).or_default();
         // Loro reports its own missing dependencies separately from the
-        // key-availability question; both mean "not yet".
+        // key-availability question. This one really is "not yet": the chunk
+        // carrying the operations this one depends on is still in flight.
         let applied = matches!(loro.import(&plaintext), Ok(status) if status.pending.is_none());
         if applied {
             // Anything we publish next genuinely follows this chunk, so it is
             // the predecessor to name.
             self.last_ref.insert(doc, chunk.content_ref);
+            ChunkVerdict::Applied
+        } else {
+            ChunkVerdict::AwaitingDeps
         }
-        applied
     }
+}
+
+/// Whether a publish reuses the group's current epoch key or mints a new one.
+///
+/// The distinction is the difference between anti-entropy and repair.
+/// [`Keying::Current`] is right for every ordinary publish: beekem re-keys on
+/// its own whenever the tree has no root key, so a normal write pays for a
+/// re-key only when membership actually moved. [`Keying::Fresh`] is for the one
+/// case that rule cannot cover — a peer that reports it cannot derive the
+/// current epoch at all — where re-publishing under the current key reproduces
+/// a byte-identical chunk and repairs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keying {
+    /// Reuse the current epoch key, letting beekem re-key if it must.
+    Current,
+    /// Mint a new epoch, so every leaf now in the tree can read the result.
+    Fresh,
 }

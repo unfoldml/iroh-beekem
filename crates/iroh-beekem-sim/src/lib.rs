@@ -15,7 +15,9 @@
 //! [`Msg::Hello`], the founder admits it and replies with [`Msg::Welcome`]
 //! carrying the full CGKA operation log, and the joiner replays that log to
 //! reconstruct the group. Thereafter all nodes gossip [`Msg::Op`] (control
-//! plane) and [`Msg::Chunk`] (data plane).
+//! plane) and [`Msg::Entry`] (data plane), with [`Msg::Log`] and
+//! [`Msg::Repair`] as the two repair paths — one for a lost operation, one for
+//! an epoch a node was admitted too late to derive.
 //!
 //! Messages that arrive before a node has joined are buffered rather than
 //! dropped, because under an unordered transport a `Welcome` routinely loses
@@ -36,8 +38,8 @@ use beekem::{
     operation::CgkaOperation,
 };
 use iroh_beekem_core::{
-    CgkaController, Chunk, DocumentUuid, Effect, Event, Role, StorageKey, WorkspaceSecret,
-    WorkspaceState,
+    CgkaController, Chunk, DocumentUuid, Effect, EpochId, Event, RepairTarget, Role, StorageKey,
+    WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -122,6 +124,20 @@ const MAX_RESYNCS_UNDER_WORKLOAD: u32 = 24;
 /// simulation. Production is event-driven and cooldown-limited here; this is the
 /// closest cheap analogue.
 const LOG_REPAIR_EVERY: u32 = 4;
+
+/// How long one repair request is suppressed before the same one is re-sent.
+///
+/// A stuck peer receives an unreachable chunk on every anti-entropy round from
+/// every publisher, and the core raises a request for each — deliberately, so a
+/// request lost in transit is retried. This is where that is turned back into a
+/// bounded rate. Keyed on `(target, epoch)`, so becoming stuck on a *new* epoch
+/// is served at once rather than waiting the window out.
+///
+/// Shorter than [`RESYNC_INTERVAL`] on purpose: a window longer than the round
+/// that produces the request would suppress every retry, which is the failure
+/// this whole mechanism exists to prevent. The real `Workspace` uses the same
+/// relationship at a larger scale.
+const REPAIR_COOLDOWN: Duration = Duration::from_millis(500);
 
 /// How often a rotating node re-keys its leaf.
 const ROTATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -262,6 +278,26 @@ pub enum Msg {
     /// made the simulator strictly more fragile than production, and every
     /// resulting failure an artefact of the harness.
     Log(Vec<Signed<CgkaOperation>>),
+    /// Control plane repair: "I can never decrypt what you are publishing."
+    ///
+    /// The counterpart of `ControlMsg::Repair`. A peer admitted after content
+    /// already existed cannot derive the epoch that content was keyed under,
+    /// and no amount of re-announcement helps — anti-entropy re-encrypts under
+    /// that same epoch. This is how it says so, and a member that can read the
+    /// content answers by minting a new epoch and publishing under it.
+    ///
+    /// Carried on the control plane rather than the data plane because that is
+    /// where the answer's key material has to travel anyway, and because it is
+    /// gated by the same roster: a node nobody admits cannot make the group
+    /// re-key.
+    Repair {
+        /// Who is stuck. Checked against current membership by the receiver.
+        member: MemberId,
+        /// What they cannot read.
+        target: RepairTarget,
+        /// The epoch they cannot derive, which keys the sender's cooldown.
+        epoch: EpochId,
+    },
     /// Data plane: one entry in the replicated index.
     ///
     /// Carries the *blinded key* rather than a document id, because that is all
@@ -427,6 +463,13 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     bootstrap: BTreeSet<NodeId>,
     /// Control-plane operations seen, whether or not they applied.
     observed_ops: u64,
+    /// When each distinct repair request was last put on the wire.
+    ///
+    /// The rate limiter the core cannot own, because the core has no clock.
+    /// A `BTreeMap` rather than a `HashMap` so that nothing about this node's
+    /// behaviour can depend on hash iteration order, which is the kind of
+    /// nondeterminism `the_simulation_is_reproducible` exists to catch.
+    repair_sent: BTreeMap<(RepairTarget, EpochId), Duration>,
     /// Client operations that arrived before this node finished joining.
     ///
     /// Held rather than failed. The harness allows one operation in flight per
@@ -573,6 +616,39 @@ impl<S: Scenario> WorkspaceNode<S> {
             .map_or(0, |s| s.evicted_chunks() + s.evicted_ops())
     }
 
+    /// Chunks dropped because their epoch predates this node's membership.
+    ///
+    /// Expected to be non-zero for a node admitted after content existed: that
+    /// is forward secrecy, and each one is answered with a repair request. What
+    /// would be a defect is this climbing while [`Self::repairs_answered`] stays
+    /// flat across the group — that is a peer asking and nobody answering.
+    #[must_use]
+    pub fn unreadable_chunks(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map_or(0, WorkspaceState::unreadable_chunks)
+    }
+
+    /// Chunks whose key was derived and whose authentication then failed.
+    #[must_use]
+    pub fn corrupt_chunks(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map_or(0, WorkspaceState::corrupt_chunks)
+    }
+
+    /// Repair requests this node answered by minting a fresh epoch.
+    ///
+    /// One tree operation each, so this is what a bounded-cost property counts:
+    /// repair must scale with the number of peers that are actually stuck, not
+    /// with how many anti-entropy rounds have gone by.
+    #[must_use]
+    pub fn repairs_answered(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map_or(0, WorkspaceState::repairs_answered)
+    }
+
     /// The text this node has contributed locally.
     #[must_use]
     pub fn contributed(&self) -> &[String] {
@@ -689,6 +765,32 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.flush_deferred_ops(cx);
     }
 
+    /// Answer a peer that says it can never decrypt what we publish.
+    ///
+    /// The salt is derived from the epoch the requester named rather than being
+    /// a constant: `drive` seeds a fresh RNG per call, and two repairs answered
+    /// with the same salt would re-key with the identical random stream — which
+    /// would mint the *same* epoch twice and leave the second requester exactly
+    /// as stuck as it was.
+    fn on_repair(
+        &mut self,
+        member: MemberId,
+        target: RepairTarget,
+        epoch: EpochId,
+        cx: &mut dyn Ctx<Self>,
+    ) {
+        let salt = u64::from_le_bytes(epoch.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
+        self.drive(
+            Event::RepairRequested {
+                requester: member,
+                target,
+                epoch,
+            },
+            cx,
+            salt,
+        );
+    }
+
     /// Recompute the modelled overlay from the workspace state.
     ///
     /// Called after every drive rather than only after membership events: the
@@ -714,7 +816,7 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn admits(&self, from: NodeId, msg: &Msg) -> bool {
         match msg {
             Msg::Hello { .. } | Msg::Welcome { .. } => true,
-            Msg::Op(_) | Msg::Log(_) | Msg::Entry { .. } => {
+            Msg::Op(_) | Msg::Log(_) | Msg::Entry { .. } | Msg::Repair { .. } => {
                 self.roster.contains(&from) || self.bootstrap.contains(&from)
             }
         }
@@ -858,11 +960,44 @@ impl<S: Scenario> WorkspaceNode<S> {
                 Effect::DeleteEntry { key, .. } => {
                     self.index.remove(&key);
                 }
+                Effect::RequestRepair { target, epoch } => {
+                    self.ask_for_repair(target, epoch, cx);
+                }
                 // Purely local; nothing to tell the network about.
                 Effect::Applied { .. } | Effect::ManifestUpdated => {}
             }
         }
         self.refresh_roster();
+    }
+
+    /// Broadcast a repair request, at most once per window per `(target, epoch)`.
+    ///
+    /// The core raises one of these for every unreachable chunk that arrives,
+    /// which is what makes a lost request recoverable; turning that into a
+    /// bounded rate is this side's job, because the rate depends on a clock and
+    /// the core has none.
+    fn ask_for_repair(&mut self, target: RepairTarget, epoch: EpochId, cx: &mut dyn Ctx<Self>) {
+        let Some(member) = self.state.as_ref().map(WorkspaceState::member_id) else {
+            return;
+        };
+        let now = cx.now();
+        let fresh = match self.repair_sent.get(&(target, epoch)) {
+            Some(sent) => now.saturating_sub(*sent) >= REPAIR_COOLDOWN,
+            // Never asked for this one, so there is nothing to suppress.
+            None => true,
+        };
+        if fresh {
+            self.repair_sent.insert((target, epoch), now);
+            cx.broadcast(Msg::Repair {
+                member,
+                target,
+                epoch,
+            });
+        } else {
+            // Already asked within the window. Silence is correct here: the
+            // answer is a group-wide re-key, so asking twice for the same epoch
+            // costs everyone and tells nobody anything new.
+        }
     }
 
     /// Replay everything buffered while this node was still joining.
@@ -876,6 +1011,11 @@ impl<S: Scenario> WorkspaceNode<S> {
                 }
                 Msg::Log(log) => self.on_log(log, cx),
                 Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 0),
+                Msg::Repair {
+                    member,
+                    target,
+                    epoch,
+                } => self.on_repair(member, target, epoch, cx),
                 // Join-protocol messages; by the time we flush, joining is done.
                 Msg::Hello { .. } | Msg::Welcome { .. } => {}
             }
@@ -1096,6 +1236,11 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
             }
             Msg::Log(log) => self.on_log(log, cx),
             Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 3),
+            Msg::Repair {
+                member,
+                target,
+                epoch,
+            } => self.on_repair(member, target, epoch, cx),
         }
     }
 

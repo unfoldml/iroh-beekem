@@ -18,8 +18,8 @@ use beekem::{
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    CgkaController, DeviceRecord, DocumentUuid, Effect, Event, FileEntry, Role, WorkspaceInfo,
-    WorkspaceSecret, WorkspaceState,
+    CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry, RepairTarget,
+    Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{
@@ -126,7 +126,28 @@ struct Inner {
     /// overwritten by each peer's entry in turn and never register a hit.
     seen_entries: Mutex<HashMap<EntrySlot, iroh_blobs::Hash>>,
     /// Rate limiter for the neighbour-up repair path.
-    neighbor_cooldown: Mutex<Cooldown>,
+    neighbor_cooldown: Mutex<Cooldown<EndpointId>>,
+    /// Rate limiter for outgoing repair requests, per `(target, epoch)`.
+    ///
+    /// Answering one costs the whole group a tree operation, so asking twice
+    /// for the same epoch is pure waste; asking about a *different* epoch is
+    /// new information and must get through, which is why the epoch is part of
+    /// the key rather than just the target.
+    repair_cooldown: Mutex<Cooldown<(RepairTarget, EpochId)>>,
+    /// Rate limiter for *answering* repair requests, per requesting member.
+    ///
+    /// The limiter above binds only well-behaved peers, since it lives on the
+    /// sending side. This one binds everyone: a member that ignores its own
+    /// cooldown and floods requests costs the group one re-key per window
+    /// rather than one per message. Keyed by member rather than by
+    /// `(target, epoch)` because it is the *requester* being limited — an
+    /// attacker can mint fresh epoch bytes for free, so a key they control
+    /// would be no limit at all.
+    ///
+    /// Not a confidentiality boundary. A member can already force tree work by
+    /// rotating its own leaf; this keeps the repair path from being a cheaper
+    /// way to do the same thing.
+    repair_answer_cooldown: Mutex<Cooldown<[u8; 32]>>,
     /// Raised when the current document state should be re-announced.
     ///
     /// A [`Notify`] rather than a timestamp check because the republish must be
@@ -195,37 +216,64 @@ const NEIGHBOR_COOLDOWN: Duration = Duration::from_secs(10);
 /// doing once.
 const REPUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Per-peer rate limiter for the neighbour-up repair path.
+/// How long the same repair request is suppressed after being broadcast.
+///
+/// The core raises `Effect::RequestRepair` for *every* unreachable chunk that
+/// arrives, deliberately: a request lost in transit has to be retried, and the
+/// core has no clock to schedule a retry with. This is where that becomes a
+/// bounded rate. Deliberately shorter than [`NEIGHBOR_COOLDOWN`] and than
+/// [`REPUBLISH_MIN_INTERVAL`] — a window longer than the republish that
+/// produces the unreadable chunk would suppress every retry, which is the
+/// stall this mechanism exists to break.
+const REPAIR_COOLDOWN: Duration = Duration::from_secs(2);
+
+/// Rate limiter keyed on whatever distinguishes one occasion from the next.
 ///
 /// Takes `now` as an argument rather than reading the clock, which is what
 /// makes the policy testable without waiting on wall time — the same reasoning
 /// that keeps `iroh-beekem-core` clock-free.
-#[derive(Debug, Default)]
-struct Cooldown {
-    seen: HashMap<EndpointId, Instant>,
+///
+/// Generic in the key because its three users disagree about what "the same
+/// event" means, and each disagreement is deliberate: neighbour-up repair is
+/// per peer; an *outgoing* repair request is per `(target, epoch)`, so a peer
+/// that becomes stuck on a new epoch is not silenced by the window it opened
+/// for the old one; and *answering* a repair request is per requesting member,
+/// because there the point is to limit the requester rather than the request.
+#[derive(Debug)]
+struct Cooldown<K> {
+    seen: HashMap<K, Instant>,
+    window: Duration,
 }
 
-impl Cooldown {
-    /// Whether `peer` may trigger the repair path now, recording it if so.
+impl<K: std::hash::Hash + Eq> Cooldown<K> {
+    /// A limiter that suppresses a repeated key for `window`.
+    fn new(window: Duration) -> Self {
+        Self {
+            seen: HashMap::new(),
+            window,
+        }
+    }
+
+    /// Whether `key` may trigger its action now, recording it if so.
     ///
     /// Expired entries are pruned on the way through, so the map stays
-    /// proportional to the peers seen in one window rather than to every peer
+    /// proportional to the keys seen in one window rather than to every key
     /// ever seen. Without that, a map keyed by peer id would simply move the
     /// exhaustion vector this exists to close from CPU to memory.
-    fn claim(&mut self, peer: EndpointId, now: Instant) -> bool {
+    fn claim(&mut self, key: K, now: Instant) -> bool {
         // An entry older than the cooldown says nothing its absence does not.
-        self.seen
-            .retain(|_, at| now.duration_since(*at) < NEIGHBOR_COOLDOWN);
-        match self.seen.get(&peer) {
-            Some(at) if now.duration_since(*at) < NEIGHBOR_COOLDOWN => false,
+        let window = self.window;
+        self.seen.retain(|_, at| now.duration_since(*at) < window);
+        match self.seen.get(&key) {
+            Some(at) if now.duration_since(*at) < window => false,
             _ => {
-                self.seen.insert(peer, now);
+                self.seen.insert(key, now);
                 true
             }
         }
     }
 
-    /// How many peers are currently being tracked.
+    /// How many keys are currently being tracked.
     ///
     /// Only the pruning test needs this; the policy itself never asks.
     #[cfg(test)]
@@ -369,7 +417,9 @@ impl Workspace {
             gossip_tx,
             secret,
             seen_entries: Mutex::new(HashMap::new()),
-            neighbor_cooldown: Mutex::new(Cooldown::default()),
+            neighbor_cooldown: Mutex::new(Cooldown::new(NEIGHBOR_COOLDOWN)),
+            repair_cooldown: Mutex::new(Cooldown::new(REPAIR_COOLDOWN)),
+            repair_answer_cooldown: Mutex::new(Cooldown::new(REPAIR_COOLDOWN)),
             republish_wanted: Notify::new(),
             roster: node.roster().clone(),
         });
@@ -1107,6 +1157,45 @@ async fn control_loop<E>(
             ControlMsg::Announce { .. } => {
                 ingest_all(&inner).await;
             }
+            // Somebody cannot read what we publish. Answering re-keys the
+            // group, so the core checks the requester is a member *now* before
+            // any of that happens; a refusal is logged rather than fatal, since
+            // a revoked device asking is an expected thing to see on a topic
+            // every past invitee can reach.
+            ControlMsg::Repair {
+                member,
+                target,
+                epoch,
+            } => {
+                let Some(requester) = member_id_from_bytes(&member) else {
+                    tracing::warn!("discarding a repair request naming an unparseable member");
+                    continue;
+                };
+                // Checked before the core is asked to do anything, because what
+                // is being limited is the *work*: a member ignoring its own
+                // sending cooldown must not be able to buy more re-keys by
+                // shouting.
+                let allowed = {
+                    let mut cooldown = inner.repair_answer_cooldown.lock().await;
+                    cooldown.claim(member, Instant::now())
+                };
+                if !allowed {
+                    tracing::debug!("suppressing a repeat repair answer for one peer");
+                    continue;
+                }
+                let effects = {
+                    let mut state = inner.state.lock().await;
+                    report_rejection(state.handle(
+                        Event::RepairRequested {
+                            requester,
+                            target,
+                            epoch,
+                        },
+                        &mut rand::rngs::OsRng,
+                    ))
+                };
+                apply_effects(&inner, effects).await;
+            }
         }
     }
 }
@@ -1260,8 +1349,42 @@ async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
             // learns it should stop accepting a removed device — or start
             // accepting a newly admitted one.
             Effect::ManifestUpdated => refresh_roster(inner).await,
+            Effect::RequestRepair { target, epoch } => {
+                request_repair(inner, target, epoch).await;
+            }
             Effect::Applied { .. } => {}
         }
+    }
+}
+
+/// Ask the group to re-encrypt something this node can never decrypt.
+///
+/// Rate-limited here rather than in the core, which has no clock. The core
+/// raises the effect on *every* unreachable arrival on purpose — that is what
+/// makes a request lost in transit recoverable — so without a window a stuck
+/// peer would broadcast once per republish per publisher.
+async fn request_repair(inner: &Inner, target: RepairTarget, epoch: EpochId) {
+    let allowed = {
+        let mut cooldown = inner.repair_cooldown.lock().await;
+        cooldown.claim((target, epoch), Instant::now())
+    };
+    if !allowed {
+        tracing::debug!(?target, %epoch, "suppressing a repeat repair request");
+        return;
+    }
+    let member = inner.state.lock().await.member_id().to_bytes();
+    let msg = ControlMsg::Repair {
+        member,
+        target,
+        epoch,
+    };
+    tracing::info!(?target, %epoch, "asking the group to re-key and republish");
+    if let Ok(bytes) = msg.encode()
+        && let Err(err) = inner.gossip_tx.broadcast(Bytes::from(bytes)).await
+    {
+        // Not fatal, and not silent either: while this fails, content written
+        // before this node joined stays unreadable to it.
+        tracing::error!(%err, "failed to broadcast a repair request");
     }
 }
 
@@ -1455,7 +1578,7 @@ mod cooldown {
 
     #[test]
     fn a_first_arrival_is_always_allowed() {
-        let mut cooldown = Cooldown::default();
+        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
         assert!(
             cooldown.claim(peer(1), Instant::now()),
             "a peer that has never been seen must be able to repair"
@@ -1464,7 +1587,7 @@ mod cooldown {
 
     #[test]
     fn a_repeat_arrival_within_the_window_is_refused() {
-        let mut cooldown = Cooldown::default();
+        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
         let start = Instant::now();
 
         assert!(cooldown.claim(peer(1), start));
@@ -1476,7 +1599,7 @@ mod cooldown {
 
     #[test]
     fn the_same_peer_is_allowed_again_once_the_window_passes() {
-        let mut cooldown = Cooldown::default();
+        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
         let start = Instant::now();
 
         assert!(cooldown.claim(peer(1), start));
@@ -1488,7 +1611,7 @@ mod cooldown {
 
     #[test]
     fn one_peers_cooldown_does_not_suppress_another() {
-        let mut cooldown = Cooldown::default();
+        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
         let start = Instant::now();
 
         assert!(cooldown.claim(peer(1), start));
@@ -1500,7 +1623,7 @@ mod cooldown {
 
     #[test]
     fn expired_entries_are_pruned_so_the_map_cannot_grow_without_bound() {
-        let mut cooldown = Cooldown::default();
+        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
         let start = Instant::now();
 
         // A flood of distinct peers, which is what an attacker controls: peer

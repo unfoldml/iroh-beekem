@@ -202,6 +202,58 @@ async fn edits_propagate_from_the_founder_to_a_joiner_over_quic() {
     bob.shutdown().await.expect("bob shuts down");
 }
 
+/// Given a document written *before* a member was invited, when that member
+/// joins, we expect them to end up reading it over real QUIC.
+///
+/// User story 1 — "invite a teammate so they can immediately access workspace
+/// files" — and the one case encryption alone cannot deliver: bob cannot derive
+/// any epoch that predates his leaf, so this content reaches him only because a
+/// member that can read it re-encrypts under a live epoch. Every other test in
+/// this file writes *after* the invite, which is the ordering that never needs
+/// that to happen.
+#[tokio::test]
+async fn content_written_before_the_invite_reaches_the_joiner() {
+    let (alice, doc) = founded(21, "shared").await;
+    alice
+        .append(doc, "written before bob was invited")
+        .await
+        .expect("alice writes while she is alone in the workspace");
+
+    let bob_node = Node::spawn().await.expect("bob should bind");
+    let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(22));
+    let invite: Invite = alice
+        .add_user(
+            bob_identity.member_id(),
+            bob_identity.share_key(),
+            bob_node.endpoint().id(),
+            Role::Editor,
+            "bob",
+        )
+        .await
+        .expect("alice admits bob");
+    let bob = Workspace::join(
+        bob_node,
+        &invite,
+        &bob_identity,
+        &mut ChaCha20Rng::seed_from_u64(23),
+    )
+    .await
+    .expect("bob joins from the invite");
+
+    eventually(
+        "bob reads content that existed before he was admitted",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.read(doc).await.contains("written before bob")
+        },
+    )
+    .await;
+
+    alice.shutdown().await.expect("alice shuts down");
+    bob.shutdown().await.expect("bob shuts down");
+}
+
 #[tokio::test]
 async fn edits_propagate_from_a_joiner_back_to_the_founder() {
     let Pair {

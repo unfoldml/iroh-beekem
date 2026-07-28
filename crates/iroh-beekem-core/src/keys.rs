@@ -53,6 +53,7 @@ use keyhive_crypto::{
     verifiable::Verifiable,
 };
 use rand::{CryptoRng, RngCore};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     content::{Chunk, ChunkRef},
@@ -76,6 +77,66 @@ pub type ControlOp = Arc<Signed<CgkaOperation>>;
 /// operation log is re-exchanged whenever a neighbour appears, so an evicted
 /// operation is recoverable, whereas exhausted memory is not.
 pub const MAX_PARKED_OPS: usize = 1024;
+
+/// Which group epoch key a ciphertext names.
+///
+/// The digest of the PCS key a chunk was encrypted under, carried as plain
+/// bytes so it can cross the wire in a repair request without exposing
+/// beekem's `Digest<PcsKey>` in this crate's public API. It identifies a key,
+/// it is not one: the digest of a key is safe to broadcast, which is what makes
+/// "I cannot decrypt epoch E" a sayable sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct EpochId([u8; 32]);
+
+impl EpochId {
+    /// The epoch a chunk was encrypted under.
+    #[must_use]
+    pub fn of(chunk: &Chunk) -> Self {
+        Self(*chunk.pcs_key_hash.raw.as_bytes())
+    }
+
+    /// The raw digest bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for EpochId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in &self.0[..4] {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str("..")
+    }
+}
+
+/// What the local CGKA could make of an arriving ciphertext.
+///
+/// The distinction between the two failing cases is the whole point of this
+/// type, and it is decidable rather than heuristic: a chunk names the operation
+/// that established its epoch, so either that operation is in our graph or it
+/// is not.
+///
+/// * absent — the control plane has not caught up yet, and this chunk becomes
+///   readable the moment it does. Park it.
+/// * present, and the key still cannot be derived — our leaf was not in the
+///   tree at that epoch, so no amount of waiting will help. That is forward
+///   secrecy, and the only repair is somebody re-encrypting the content under a
+///   live epoch.
+///
+/// Collapsing these two into one "not applicable" answer is what let
+/// permanently undecryptable ciphertext accumulate in the pending queue with
+/// nothing able to notice.
+#[derive(Debug)]
+pub enum DecryptOutcome {
+    /// The chunk was decrypted.
+    Plaintext(Vec<u8>),
+    /// The operation that established this epoch has not arrived yet.
+    AwaitingOp,
+    /// This node can never derive the key: the epoch predates its membership.
+    Unreachable,
+}
 
 /// What happened when an operation was offered to the local CGKA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -525,16 +586,73 @@ impl CgkaController {
         Ok((secret.try_encrypt(plaintext)?, op))
     }
 
-    /// Decrypt a chunk produced by any member of the group.
+    /// Encrypt a chunk under an epoch key minted for the occasion.
+    ///
+    /// This is [`Self::encrypt`] with the guarantee that
+    /// [`Self::encrypt`] cannot give: the ciphertext is keyed under an epoch
+    /// that did not exist a moment ago, and that therefore *every* leaf
+    /// currently in the tree can derive — including one admitted since the last
+    /// time anybody published. Nothing outside the tree can derive it, so a
+    /// removed member gains nothing from it.
+    ///
+    /// It is the only sound answer to "I cannot read what you published":
+    /// `encrypt` reuses the current PCS key whenever beekem has one, so
+    /// re-publishing unchanged content reproduces a byte-identical chunk and
+    /// tells a stuck peer nothing it did not already know.
+    ///
+    /// The returned operations **must be broadcast before the chunk**, in the
+    /// order given, or the re-key is invisible to peers and the ciphertext is
+    /// unreadable to everyone.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Cgka`] if the local tree cannot reach the PCS key
-    /// the chunk names — which is exactly what a revoked member sees — or
-    /// [`CoreError::Aead`] if authentication fails.
-    pub fn decrypt(&mut self, chunk: &Chunk) -> Result<Vec<u8>, CoreError> {
-        let key = self.cgka.decryption_key_for(chunk)?;
-        Ok(chunk.try_decrypt(key)?)
+    /// Returns [`CoreError::Cgka`] if the path cannot be re-encrypted or no
+    /// application secret can be derived, or [`CoreError::Aead`] if encryption
+    /// fails.
+    pub fn encrypt_fresh<R: CryptoRng + RngCore>(
+        &mut self,
+        plaintext: &[u8],
+        pred_refs: &[ChunkRef],
+        csprng: &mut R,
+    ) -> Result<(Chunk, Vec<Signed<CgkaOperation>>), CoreError> {
+        let rotation = self.rotate(csprng)?;
+        let (chunk, implicit) = self.encrypt(plaintext, pred_refs, csprng)?;
+        // The rotation leaves the tree with a root key, so `encrypt` normally
+        // adds nothing here. It is still collected rather than asserted away:
+        // a concurrent operation merged between the two calls can blank the
+        // root again, and dropping the resulting update would make this very
+        // chunk undecryptable — the failure this method exists to prevent.
+        let ops = std::iter::once(rotation).chain(implicit).collect();
+        Ok((chunk, ops))
+    }
+
+    /// Decrypt a chunk produced by any member of the group.
+    ///
+    /// Failure to decrypt is not an error: it is the ordinary condition of a
+    /// peer whose control plane has not caught up, and the *permanent*
+    /// condition of a peer that was not a member when the chunk was written.
+    /// [`DecryptOutcome`] tells those two apart so the caller can park one and
+    /// ask for a repair of the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Aead`] if the key was derived and authentication
+    /// then failed — which is tampering rather than ordering, and the one case
+    /// here that really is a fault.
+    pub fn decrypt(&mut self, chunk: &Chunk) -> Result<DecryptOutcome, CoreError> {
+        let Ok(key) = self.cgka.decryption_key_for(chunk) else {
+            // Ask the graph, not the error code: the chunk names the operation
+            // that established its epoch, so "have I seen that operation?" is
+            // exactly the question that separates "not yet" from "never", and
+            // it is one beekem answers directly.
+            let establishing = HashSet::from([chunk.pcs_update_op_hash]);
+            return if self.cgka.contains_predecessors(&establishing) {
+                Ok(DecryptOutcome::Unreachable)
+            } else {
+                Ok(DecryptOutcome::AwaitingOp)
+            };
+        };
+        Ok(DecryptOutcome::Plaintext(chunk.try_decrypt(key)?))
     }
 
     /// Offer a remote operation to the local CGKA.

@@ -98,6 +98,15 @@ None of them is settled; if a user story needs a different answer, change it.
   (`ControlMsg::Log`, [wire.rs](crates/iroh-beekem/src/wire.rs)). A peer that misses an operation can
   never derive keys for anything encrypted after it, so *some* repair is needed; whole-log resend is
   simply the cheapest one to write.
+- **Unreadable content is repaired on demand, by the peer that cannot read it.** A member admitted
+  after content existed can never derive the epoch that content was keyed under, and anti-entropy
+  cannot fix that: `Event::Resync` re-encrypts under the *current* epoch, so for such a peer every
+  repeat reproduces a ciphertext it already failed on. `Effect::RequestRepair` names the
+  `(target, epoch)` it is stuck on, and `Event::RepairRequested` is answered by re-publishing through
+  `Keying::Fresh`, which mints an epoch every leaf in the tree can derive and nothing outside it can
+  ([state.rs](crates/iroh-beekem-core/src/state.rs)). Demand-driven rather than scheduled because
+  answering costs a tree operation: the alternative, re-keying on a timer, charges the whole group
+  for a peer that may not exist.
 - **Content flows through Loro as CRDT updates**, so a chunk applies only when the CGKA can reach the
   PCS key it names *and* Loro has the operations it depends on — that second condition is what
   `park_chunk` / `drain_pending` / `try_apply` in [state.rs](crates/iroh-beekem-core/src/state.rs)
@@ -135,10 +144,21 @@ None of them is settled; if a user story needs a different answer, change it.
 Properties of the code as currently written. Changing the surrounding design may retire these; changing
 them *without* noticing will not fail loudly.
 
-- **An implicit PCS update must be broadcast before the chunk it keys.** `CgkaController::encrypt`
-  returns `Option<Signed<CgkaOperation>>`; both `publish` and `publish_manifest` push
-  `Effect::BroadcastOp` ahead of the store effect for this reason. Reordering them makes content
-  permanently undecryptable for peers.
+- **Key material must be broadcast before the chunk it keys.** `encrypt_keyed` returns the operations
+  a publish minted — beekem's implicit PCS update, or the deliberate re-key of a repair — and
+  `publish_keyed`/`publish_manifest` push every one as `Effect::BroadcastOp` ahead of the store
+  effect. Reordering them makes content permanently undecryptable for peers.
+- **A repair must go through `Keying::Fresh`; anti-entropy must not.** They differ in exactly one
+  respect and it is the whole mechanism: `Keying::Current` lets beekem decide whether to re-key,
+  which for a peer that cannot derive the current epoch means "no" forever. Routing repair through
+  the ordinary publish path would restore the original defect while leaving every test name intact —
+  `anti_entropy_repeats_an_epoch_while_a_repair_advances_it` in
+  [workspace_state.rs](crates/iroh-beekem-core/tests/workspace_state.rs) is the one that would fail.
+- **"Not yet" and "never" are different verdicts on an undecryptable chunk.** `CgkaController::decrypt`
+  distinguishes them by asking whether the operation that established the chunk's epoch is in the
+  local graph; `try_apply` parks the first and drops the second. Collapsing them back into a bool
+  fails silently — permanently unreadable ciphertext accumulates in the pending queue, and the
+  `eventually` properties that watch that queue can still be satisfied at t=0.
 - **`WorkspaceState`'s `Clone` is hand-written on purpose.** `LoroDoc::clone` returns another handle
   onto the *same* document; a derived `Clone` would give the simulator a snapshot that keeps mutating
   underneath it. The impl round-trips through a Loro snapshot.
