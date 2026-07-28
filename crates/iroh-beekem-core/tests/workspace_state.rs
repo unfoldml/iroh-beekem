@@ -418,6 +418,106 @@ mod roles_are_enforced {
             "an author nobody has claimed must never be accepted"
         );
     }
+
+    /// A viewer publishing is not merely futile — every receiver would reject
+    /// the entry anyway — it is *expensive*: encrypting a chunk can force an
+    /// implicit PCS update, re-keying the whole group to protect bytes nobody
+    /// will accept. These cover the three mutations that had no check at all,
+    /// plus the resync that runs the same publish path.
+    #[test]
+    fn a_viewer_cannot_mutate_content_or_the_file_index() {
+        let mut bus = two_node_workspace();
+        let bob_id = bus.bob.member_id();
+
+        // Record the demotion on bob's own replica, standing in for the sync
+        // that would carry it.
+        bus.bob
+            .manifest()
+            .set_role(&bob_id.to_bytes(), Role::Viewer)
+            .expect("recording the role");
+
+        let refusals = [
+            (
+                "edit",
+                bus.bob.handle(
+                    Event::LocalEdit {
+                        doc: DOC,
+                        text: "viewers may not write".into(),
+                    },
+                    &mut rng(80),
+                ),
+            ),
+            (
+                "resync",
+                bus.bob.handle(Event::Resync { doc: DOC }, &mut rng(81)),
+            ),
+            (
+                "upsert",
+                bus.bob.handle(
+                    Event::UpsertFile {
+                        entry: FileEntry {
+                            uuid: DOC,
+                            logical_path: "/viewer.md".into(),
+                            mime_type: "text/markdown".into(),
+                        },
+                    },
+                    &mut rng(82),
+                ),
+            ),
+            (
+                "rename",
+                bus.bob.handle(
+                    Event::RenameFile {
+                        doc: DOC,
+                        path: "/renamed-by-viewer.md".into(),
+                    },
+                    &mut rng(83),
+                ),
+            ),
+        ];
+
+        for (what, result) in refusals {
+            assert!(
+                matches!(result, Err(CoreError::NotAWriter)),
+                "a viewer's {what} must be refused, got {result:?}"
+            );
+        }
+
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            "",
+            "a refused edit must not have reached the local document either"
+        );
+    }
+
+    /// The bootstrap case, and the reason `require_write` is permissive about
+    /// members it has never heard of. A joiner's manifest is empty until it
+    /// syncs, so a role-less member is indistinguishable from an unsynced one.
+    /// Refusing here would deadlock onboarding: no publish, so no author
+    /// announcement, so no peer ever accepts anything from this node.
+    #[test]
+    fn a_member_whose_role_has_not_synced_yet_may_still_write() {
+        let mut bus = two_node_workspace();
+
+        assert_eq!(
+            bus.bob.manifest().role_of(&bus.bob.member_id().to_bytes()),
+            None,
+            "precondition: bob has synced no manifest and holds no role"
+        );
+
+        let result = bus.bob.handle(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "written before my role arrived".into(),
+            },
+            &mut rng(84),
+        );
+
+        assert!(
+            result.is_ok(),
+            "a member whose role has not yet synced must not be refused, got {result:?}"
+        );
+    }
 }
 
 /// The pending-chunk queue holds ciphertext that arrived before its key, so it

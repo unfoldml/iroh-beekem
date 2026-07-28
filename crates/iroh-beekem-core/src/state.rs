@@ -375,8 +375,17 @@ impl WorkspaceState {
                 }
                 self.drain_pending()
             }
-            Event::LocalEdit { doc, text } => self.on_local_edit(doc, &text, csprng),
+            Event::LocalEdit { doc, text } => {
+                self.require_write()?;
+                self.on_local_edit(doc, &text, csprng)
+            }
             Event::Resync { doc } => {
+                // Gated like any other publish, and for the same reason: a
+                // re-announcement runs the identical `publish` path, so it can
+                // force a group-wide key change on everyone's behalf. A member
+                // who may not write has nothing legitimate to re-announce
+                // anyway, since peers reject its entries either way.
+                self.require_write()?;
                 if self.docs.contains_key(&doc) {
                     self.publish(doc, csprng)
                 } else {
@@ -426,10 +435,12 @@ impl WorkspaceState {
                 Ok(vec![Effect::ManifestUpdated])
             }
             Event::UpsertFile { entry } => {
+                self.require_write()?;
                 self.manifest.upsert_file(&entry)?;
                 self.publish_manifest(csprng)
             }
             Event::RenameFile { doc, path } => {
+                self.require_write()?;
                 self.manifest.rename(doc, &path)?;
                 self.publish_manifest(csprng)
             }
@@ -460,6 +471,35 @@ impl WorkspaceState {
             return Ok(());
         }
         Err(CoreError::NotAnAdmin)
+    }
+
+    /// Refuse a content or manifest mutation unless the local member may write.
+    ///
+    /// Deliberately permissive about the *unknown* case, and that asymmetry is
+    /// the whole design. A joiner's manifest starts empty (see [`Self::joined`]),
+    /// so a member whose role assignment has not yet synced is indistinguishable
+    /// from one who was never given a role. Refusing there would deadlock
+    /// onboarding: the joiner could not publish, so it could never announce its
+    /// author, so no peer would ever accept anything from it. This mirrors the
+    /// exemption the data plane already makes for a node's own entries before
+    /// it has read back its own author claim.
+    ///
+    /// So: refuse only when a role *is* recorded and that role cannot write.
+    /// That still catches what this exists for — a Viewer, or a member demoted
+    /// from Editor — while leaving the bootstrap path open.
+    ///
+    /// Like [`Self::require_admin`] this is the permissions layer, not the
+    /// cryptographic one. It does not stop a malicious peer from publishing;
+    /// what stops that is every receiver's `author_may_write` check. What it
+    /// does stop is a well-behaved node emitting writes it knows will be
+    /// rejected — and, more importantly, forcing an implicit PCS update on the
+    /// entire group to encrypt them.
+    fn require_write(&self) -> Result<(), CoreError> {
+        let me = self.cgka.member_id().to_bytes();
+        match self.manifest.role_of(&me) {
+            Some(role) if !role.can_write() => Err(CoreError::NotAWriter),
+            _ => Ok(()),
+        }
     }
 
     /// Refuse to strip the last admin of their powers.

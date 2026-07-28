@@ -88,6 +88,19 @@ pub enum CoreError {
     #[error("this member does not hold an administrative role")]
     NotAnAdmin,
 
+    /// A content or manifest mutation was attempted by a member whose recorded
+    /// role cannot write.
+    ///
+    /// Advisory in the same sense as [`Self::NotAnAdmin`]: it constrains what a
+    /// well-behaved node emits, not what a peer holding the namespace write
+    /// capability can push. Its real value is that a rejected write is not free
+    /// — encrypting one can force an implicit PCS update on the whole group.
+    ///
+    /// A member whose role has simply not synced yet is *not* refused; see
+    /// `WorkspaceState::require_write`.
+    #[error("this member's role does not permit writing")]
+    NotAWriter,
+
     /// The action would leave the workspace with no administrator.
     ///
     /// Promoting an admin is itself an admin action, so a workspace that loses

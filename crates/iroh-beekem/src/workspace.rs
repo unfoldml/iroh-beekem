@@ -5,7 +5,11 @@
 //! come back into gossip broadcasts and blob writes. All key handling lives in
 //! `iroh-beekem-core`, where it can be simulated and property-tested.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use beekem::{
     id::{MemberId, TreeId},
@@ -38,7 +42,10 @@ use keyhive_crypto::{
 };
 use n0_future::StreamExt;
 use rand::{CryptoRng, RngCore};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 
 use crate::{
     error::WorkspaceError,
@@ -85,6 +92,13 @@ struct Inner {
     gossip_tx: GossipSender,
     secret: WorkspaceSecret,
     document: DocumentUuid,
+    /// Rate limiter for the neighbour-up repair path.
+    neighbor_cooldown: Mutex<Cooldown>,
+    /// Raised when the current document state should be re-announced.
+    ///
+    /// A [`Notify`] rather than a timestamp check because the republish must be
+    /// *deferred*, never dropped — see [`republish_loop`].
+    republish_wanted: Notify,
 }
 
 /// A running, networked workspace.
@@ -123,6 +137,63 @@ impl Drop for Workspace {
 /// limit is well above any realistic workspace history and exists purely to
 /// bound that cost.
 const MAX_LOG_OPS: usize = 100_000;
+
+/// How long one peer's neighbour-up repair is suppressed after the last.
+///
+/// The topic is derived from the tree id, which every past invitee knows, so
+/// anyone who has ever held an invite can join the overlay — and rejoin it in a
+/// loop. Each arrival costs us a full operation-log broadcast and costs every
+/// receiver a signature check per operation, so without this a single peer can
+/// spend the whole group's CPU by reconnecting. [`MAX_LOG_OPS`] bounds one
+/// message; this bounds their rate.
+const NEIGHBOR_COOLDOWN: Duration = Duration::from_secs(10);
+
+/// The minimum gap between two re-announcements of document state.
+///
+/// Distinct from [`NEIGHBOR_COOLDOWN`] because it is a *global* budget rather
+/// than a per-peer one: twenty peers arriving at once are twenty legitimate
+/// reasons to re-publish, but the work is identical each time and only needs
+/// doing once.
+const REPUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-peer rate limiter for the neighbour-up repair path.
+///
+/// Takes `now` as an argument rather than reading the clock, which is what
+/// makes the policy testable without waiting on wall time — the same reasoning
+/// that keeps `iroh-beekem-core` clock-free.
+#[derive(Debug, Default)]
+struct Cooldown {
+    seen: HashMap<EndpointId, Instant>,
+}
+
+impl Cooldown {
+    /// Whether `peer` may trigger the repair path now, recording it if so.
+    ///
+    /// Expired entries are pruned on the way through, so the map stays
+    /// proportional to the peers seen in one window rather than to every peer
+    /// ever seen. Without that, a map keyed by peer id would simply move the
+    /// exhaustion vector this exists to close from CPU to memory.
+    fn claim(&mut self, peer: EndpointId, now: Instant) -> bool {
+        // An entry older than the cooldown says nothing its absence does not.
+        self.seen
+            .retain(|_, at| now.duration_since(*at) < NEIGHBOR_COOLDOWN);
+        match self.seen.get(&peer) {
+            Some(at) if now.duration_since(*at) < NEIGHBOR_COOLDOWN => false,
+            _ => {
+                self.seen.insert(peer, now);
+                true
+            }
+        }
+    }
+
+    /// How many peers are currently being tracked.
+    ///
+    /// Only the pruning test needs this; the policy itself never asks.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.seen.len()
+    }
+}
 
 /// Derive the gossip topic for a workspace.
 ///
@@ -250,6 +321,8 @@ impl Workspace {
             gossip_tx,
             secret,
             document,
+            neighbor_cooldown: Mutex::new(Cooldown::default()),
+            republish_wanted: Notify::new(),
         });
 
         // Claim this workspace's author identity in the manifest. Until a peer
@@ -279,13 +352,18 @@ impl Workspace {
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
         let data_task = tokio::spawn(data_loop(data, doc_events));
 
+        // Anti-entropy: re-announcements requested by the control loop, run at
+        // a bounded rate but never discarded.
+        let republish = Arc::clone(&inner);
+        let republish_task = tokio::spawn(republish_loop(republish));
+
         Ok(Self {
             node,
             inner,
             namespace,
             tree_id,
             topic,
-            tasks: vec![control_task, data_task],
+            tasks: vec![control_task, data_task, republish_task],
         })
     }
 
@@ -610,11 +688,24 @@ async fn control_loop<E>(
             // re-publish current state under the present epoch key, which they
             // *can* derive. This is the moment to do it: before now they were
             // not listening.
-            Ok(GossipEvent::NeighborUp(_)) => {
+            Ok(GossipEvent::NeighborUp(peer)) => {
+                let allowed = {
+                    let mut cooldown = inner.neighbor_cooldown.lock().await;
+                    cooldown.claim(peer, Instant::now())
+                };
+                if !allowed {
+                    // This peer already had its repair recently. Suppressing the
+                    // repeat is safe precisely because the first one succeeded.
+                    tracing::debug!(%peer, "suppressing a repeat neighbour-up repair");
+                    continue;
+                }
                 // Order matters: the peer needs our operation log before it can
                 // derive the key for anything we re-publish afterwards.
                 send_log(&inner).await;
-                republish(&inner).await;
+                // Requested, not performed. The republish is rate-limited
+                // globally, and dropping it outright would be a correctness bug
+                // rather than a mere optimisation — see `republish_loop`.
+                inner.republish_wanted.notify_one();
                 continue;
             }
             _ => continue,
@@ -690,6 +781,28 @@ fn report_rejection(outcome: Result<Vec<Effect>, iroh_beekem_core::CoreError>) -
             tracing::warn!(%err, "rejected an incoming control operation");
             Vec::new()
         }
+    }
+}
+
+/// Re-announce document state on request, at a bounded rate.
+///
+/// The republish is **deferred, never dropped**, and the distinction is the
+/// whole point of this task. A member cannot decrypt anything written before
+/// they were admitted, so this re-announcement is the only thing that makes
+/// existing content readable to a peer that has just joined. Rate-limiting it
+/// by discarding requests would therefore not cost throughput, it would leave
+/// new members permanently unable to see documents that already exist.
+///
+/// [`Notify::notify_one`] stores a single permit, which gives coalescing for
+/// free: any number of requests arriving during a republish or its quiet period
+/// collapse into exactly one follow-up, and none is lost.
+async fn republish_loop(inner: Arc<Inner>) {
+    loop {
+        inner.republish_wanted.notified().await;
+        republish(&inner).await;
+        // Quiet period. Requests raised during it are remembered by the stored
+        // permit and serviced on the next turn of the loop.
+        tokio::time::sleep(REPUBLISH_MIN_INTERVAL).await;
     }
 }
 
@@ -879,4 +992,90 @@ async fn fetch_chunks(
 /// Rebuild a verifying key from raw bytes.
 fn ed25519_verifying_key(bytes: &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey> {
     ed25519_dalek::VerifyingKey::from_bytes(bytes).ok()
+}
+
+/// The neighbour-up repair path is reachable by anyone who has ever held an
+/// invite, because the gossip topic is derived from the tree id. Each arrival
+/// costs a full operation-log broadcast and a signature check per operation on
+/// every receiver, so the rate limit is a denial-of-service control, not a
+/// tuning knob. It takes `now` as an argument so the policy can be checked
+/// without waiting on wall time.
+#[cfg(test)]
+mod cooldown {
+    use std::time::Instant;
+
+    use iroh::{EndpointId, SecretKey};
+
+    use super::{Cooldown, NEIGHBOR_COOLDOWN};
+
+    fn peer(seed: u8) -> EndpointId {
+        SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn a_first_arrival_is_always_allowed() {
+        let mut cooldown = Cooldown::default();
+        assert!(
+            cooldown.claim(peer(1), Instant::now()),
+            "a peer that has never been seen must be able to repair"
+        );
+    }
+
+    #[test]
+    fn a_repeat_arrival_within_the_window_is_refused() {
+        let mut cooldown = Cooldown::default();
+        let start = Instant::now();
+
+        assert!(cooldown.claim(peer(1), start));
+        assert!(
+            !cooldown.claim(peer(1), start + NEIGHBOR_COOLDOWN / 2),
+            "a peer reconnecting inside the window must not trigger a second repair"
+        );
+    }
+
+    #[test]
+    fn the_same_peer_is_allowed_again_once_the_window_passes() {
+        let mut cooldown = Cooldown::default();
+        let start = Instant::now();
+
+        assert!(cooldown.claim(peer(1), start));
+        assert!(
+            cooldown.claim(peer(1), start + NEIGHBOR_COOLDOWN),
+            "the limit is a rate, not a ban: a genuine later reconnect must repair"
+        );
+    }
+
+    #[test]
+    fn one_peers_cooldown_does_not_suppress_another() {
+        let mut cooldown = Cooldown::default();
+        let start = Instant::now();
+
+        assert!(cooldown.claim(peer(1), start));
+        assert!(
+            cooldown.claim(peer(2), start),
+            "the budget is per peer; one noisy peer must not starve a quiet one"
+        );
+    }
+
+    #[test]
+    fn expired_entries_are_pruned_so_the_map_cannot_grow_without_bound() {
+        let mut cooldown = Cooldown::default();
+        let start = Instant::now();
+
+        // A flood of distinct peers, which is what an attacker controls: peer
+        // ids are free to mint.
+        for seed in 0..64u8 {
+            cooldown.claim(peer(seed), start);
+        }
+        assert_eq!(cooldown.tracked(), 64, "all should be tracked while fresh");
+
+        // One arrival after the window must collect every stale entry, or the
+        // rate limit would trade a CPU vector for a memory one.
+        cooldown.claim(peer(200), start + NEIGHBOR_COOLDOWN);
+        assert_eq!(
+            cooldown.tracked(),
+            1,
+            "expired entries must be pruned, leaving only the live one"
+        );
+    }
 }
