@@ -26,4 +26,12 @@ pub enum WorkspaceError {
     /// The invite ticket could not be parsed or applied.
     #[error("invalid invite: {0}")]
     Invite(String),
+
+    /// Stored device key material could not be restored.
+    #[error("invalid identity: {0}")]
+    Identity(String),
+
+    /// The manifest has no document at the requested path.
+    #[error("no document at path: {0}")]
+    NoSuchPath(String),
 }

@@ -63,6 +63,26 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
 - **Adding an `Event` or `Effect` variant means updating both backends**, or the simulator and the
   real transport silently diverge in behaviour.
 
+
+## Engineering and Coding practices
+
+- Priorities when building a new feature or refactoring a preexisting one: first, make it correct. Second, make it principled (the API must follow textbook implementation and adhere to theory). Then, make it performant.
+- Never, ever stub out implementations, or make simplifying assumptions without asking the user. Only deliver complete features.
+- If you find code that is stubbed out, ask the user to expand the scope and fix it.
+- Don't guess performance; set up targeted benchmarks and measure instead.
+- Prefer total functions (i.e. producing an output for each value of the input). When total functions are not possible, use a sum type (e.g. Option, or implement an informative custom one) to enumerate the output cases.
+- As a corollary of the above, do not panic but use an "error"-like enum branch
+- Every "if" must have an "else" branch.
+- Comment all code with its purpose
+- When building or refactoring a feature, strive to balance terse implementations with readability. Micro-functions (e.g. helpers used once) should be inlined, whereas shared functionality should be exported.
+- **Use the Rust Analyzer plugin** for symbol references, go-to-definition, and warnings rather than grepping (ask "What's the definition for this symbol?").
+- **Implement property tests rather than unit tests** for algorithms and data transformations (`proptest`). Test "business" logic, not trivial data-structure properties.
+- **Improve coverage of code you touch.** When you add or change a code path, add tests that exercise it — property tests first (per the bullet above), unit tests only for the irreducible cases. Measure with `make coverage`, which regenerates [COVERAGE.md](COVERAGE.md) (a merged report across every test manifest); its "lowest-covered files" list is the standing to-do surface. Coverage is advisory today (`make coverage-check` enforces a soft floor but is not yet in `make check`) — treat a coverage drop on files you edited as a defect to fix before declaring done.
+- **In-memory / referentially-pure** implementations wherever possible : pure algorithms do no IO (disk, sockets), which keeps them in-memory-testable. For distributed algorithms, test with `propsim`. 
+- **No mocking** : test real implementations only.
+- Architecture and designs live in [docs/](docs/) and must be periodically reviewed. Mark or remove assumptions/conventions that no longer hold or are speculative.
+
+
 ## Current implementation — revisable
 
 These are today's answers, with the reasoning that produced them and what else moves if they change.

@@ -25,6 +25,44 @@ early; what follows describes the current implementation, not a settled specific
 `iroh-beekem-core` returns every effect as data instead of performing it, which is what lets the entire protocol run on a single-threaded simulator with virtual
 time and a seeded RNG. `propsim`'s `Node::on_msg` is a *synchronous* callback — a state machine that needed an async runtime could not be plugged in at all.
 
+## Usage
+
+```rust,no_run
+use iroh_beekem::{Identity, Node, Workspace};
+use iroh_beekem_core::{Role, WorkspaceInfo};
+
+// A device identity, not a person's. Persist these bytes: they are this
+// device's leaf, and a new one is a new member as far as the group is concerned.
+let me = Identity::generate(&mut rand::rngs::OsRng);
+
+let ws = Workspace::create(
+    Node::spawn().await?,
+    &me,
+    WorkspaceInfo { name: "Q3 planning".into(), description: String::new() },
+    &mut rand::rngs::OsRng,
+).await?;
+
+// Files are addressed by UUID; the logical path lives only in the encrypted
+// manifest, so renaming never moves a stored chunk.
+let notes = ws.create_file("/notes.md", "text/markdown").await?;
+ws.write(notes, "# Agenda").await?;
+ws.append(notes, "\n1. ship 0.1").await?;
+
+// Admitting someone returns the invite they need. The role is chosen here
+// because it decides what capability the ticket carries.
+let invite = ws.add_user(their_member_id, their_share_key, Role::Editor, "Bob").await?;
+
+for user in ws.users().await {
+    println!("{:?}: {:?} on {} device(s)", user.display_name, user.role, user.devices.len());
+}
+```
+
+A person may hold several devices, each with its own leaf and its own
+`Identity`; roles attach to the person, so a laptop and a phone always agree.
+Enrol one with `add_device`, revoke one with `remove_device`, and remove someone
+entirely with `remove_user`. See [`examples/two_node.rs`](crates/iroh-beekem/examples/two_node.rs)
+for a complete session over real QUIC.
+
 ## Design
 
 ```
@@ -135,21 +173,26 @@ These are gaps, not trades. Nothing in the design prevents them.
 1. **No persistence.** `MemStore` and `Docs::memory()` only, and neither `CgkaController` nor
    `WorkspaceState` can be serialized — so there is no export/import to build persistence on, and
    nothing survives a restart.
-2. **Single document per workspace in the networked facade.** The core already keys documents by
-   UUID and the manifest indexes them; `Workspace` pins one.
-3. **M-of-N admin actions.** The manifest has the role schema; the threshold enforcement is not
+2. **M-of-N admin actions.** The manifest has the role schema; the threshold enforcement is not
    written. Single-admin rules *are* enforced: admin-only membership changes, and a refusal to
-   demote or remove the last admin.
-4. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
+   demote or remove a user's last admin device.
+3. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
    re-encrypts them and writes a new blob; superseded blobs are never collected. Cost grows
    quadratically in edits.
-5. **No namespace rotation and no `leave`.** A revoked member keeps the docs write capability and
-   stays subscribed to the control topic, where it can observe membership churn.
-6. **Invites are replayable.** No expiry, no nonce, no binding to the invitee — and the ticket
+4. **Removal revokes reading, not watching.** A removed device keeps the docs write capability and
+   stays subscribed to the control topic, so it goes on observing membership churn *and* the
+   replicated index — entry existence, size, author and timing — for as long as it cares to look.
+   It reads no content and no manifest written afterwards, but "removed" currently means *cannot
+   read*, not *cannot see*. Closing it needs namespace rotation plus connection-level admission
+   control. The `a_removed_member_still_watches` properties in `iroh-beekem-sim` record exactly
+   where the line sits today, so it cannot move without a test noticing.
+5. **Invites are replayable.** No expiry, no nonce, no binding to the invitee — and the ticket
    carries the raw workspace secret, so it must travel over an authenticated, confidential channel.
-7. **No CI, and `LICENSE-APACHE` is missing.** `LICENSE-MIT` is present; fetch the other from its
-   canonical source rather than transcribing it:
-   `curl -o LICENSE-APACHE https://www.apache.org/licenses/LICENSE-2.0.txt`
+   It does *not* grant read access: joining also needs the leaf secret, which never leaves the
+   invitee's device.
+6. **No admission control on either transport.** Anyone who learns the gossip topic (the founder's
+   public key) or the docs namespace can participate. There is no allowlist, so confidentiality
+   against an outsider rests on them not knowing two 32-byte identifiers rather than on a key.
 
 
 

@@ -31,7 +31,7 @@ use crate::{
     content::{Chunk, ChunkRef},
     error::CoreError,
     keys::{CgkaController, ControlOp, MergeOutcome},
-    manifest::{FileEntry, Manifest, Role},
+    manifest::{FileEntry, Manifest, Role, WorkspaceInfo},
 };
 
 /// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
@@ -69,12 +69,68 @@ pub enum Event {
         /// Text to append.
         text: String,
     },
-    /// The local user admitted a new member.
-    AddMember {
-        /// The new member's identity.
+    /// The local user replaced a document's entire contents.
+    WriteFile {
+        /// Which document to overwrite.
+        doc: DocumentUuid,
+        /// The new contents.
+        text: String,
+    },
+    /// The local user inserted text at a position.
+    InsertText {
+        /// Which document to edit.
+        doc: DocumentUuid,
+        /// Character offset to insert at, clamped to the document's length.
+        pos: usize,
+        /// Text to insert.
+        text: String,
+    },
+    /// The local user deleted a range of text.
+    RemoveText {
+        /// Which document to edit.
+        doc: DocumentUuid,
+        /// Character offset to delete from, clamped to the document's length.
+        pos: usize,
+        /// How many characters to delete, clamped to what remains.
+        len: usize,
+    },
+    /// The local user deleted a document.
+    ///
+    /// Removes it from this workspace; it does not erase it from the disk of
+    /// any member who already synced it. See `WorkspaceState::delete_file`.
+    DeleteFile {
+        /// Which document to delete.
+        doc: DocumentUuid,
+    },
+    /// The local user admitted a new person, along with their first device.
+    ///
+    /// The new user's id is that first device's member id; see the
+    /// [manifest module documentation](crate::manifest) for why.
+    AddUser {
+        /// The new device's identity, which also becomes the user id.
         member: MemberId,
-        /// The new member's published leaf key.
+        /// The new device's published leaf key.
         share_key: ShareKey,
+        /// The role to grant the new user.
+        role: Role,
+        /// Human-readable name, for display only.
+        display_name: String,
+    },
+    /// The local user admitted another device for an existing person.
+    ///
+    /// Needs no administrative role when adding a device to *your own* user —
+    /// enrolling your own phone is not an act of administration — but binding a
+    /// device to somebody else's user is, or any member could inherit an
+    /// admin's permissions by claiming to be one of their devices.
+    AddDevice {
+        /// The new device's identity.
+        member: MemberId,
+        /// The new device's published leaf key.
+        share_key: ShareKey,
+        /// The user this device will act for.
+        user: [u8; 32],
+        /// Human-readable label, for display only.
+        label: String,
     },
     /// The local user revoked a member.
     RemoveMember {
@@ -102,10 +158,24 @@ pub enum Event {
     },
     /// The local user assigned a role. Requires the local member to be an admin.
     SetRole {
-        /// The member whose role changes, as raw verifying-key bytes.
-        member: [u8; 32],
+        /// The **user** whose role changes, as raw id bytes — not a device.
+        user: [u8; 32],
         /// The role to assign.
         role: Role,
+    },
+    /// The local user renamed the workspace. Requires an administrative role.
+    SetInfo {
+        /// The metadata to record.
+        info: WorkspaceInfo,
+    },
+    /// The local user set their own display name.
+    ///
+    /// Deliberately self-only: a display name is how a person presents
+    /// themselves, and letting one member rename another is an impersonation
+    /// vector rather than a convenience.
+    SetDisplayName {
+        /// The name to present.
+        display_name: String,
     },
     /// Publish the local member's data-plane author identity.
     ///
@@ -157,6 +227,18 @@ pub enum Effect {
         key: StorageKey,
         /// The ciphertext to store.
         chunk: Box<Chunk>,
+    },
+    /// Withdraw this node's index entry for a deleted document.
+    ///
+    /// Only *this* node's entry: `iroh-docs` deletion is per author, so every
+    /// member must withdraw their own. A deleted document therefore disappears
+    /// from the index gradually, as each peer observes the manifest tombstone,
+    /// rather than atomically.
+    DeleteEntry {
+        /// The blinded `iroh-docs` key to withdraw.
+        key: StorageKey,
+        /// Which document was deleted.
+        doc: DocumentUuid,
     },
     /// A remote chunk was decrypted and merged into a local document.
     Applied {
@@ -276,8 +358,15 @@ impl WorkspaceState {
     /// Returns [`CoreError::Manifest`] if the initial role cannot be recorded.
     pub fn found(cgka: CgkaController, secret: WorkspaceSecret) -> Result<Self, CoreError> {
         let this = Self::joined(cgka, secret);
-        this.manifest
-            .set_role(&this.member_id().to_bytes(), Role::Admin)?;
+        // The founder is their own user, and this device is that user's first —
+        // which makes the user id and the member id the same bytes here, and
+        // only here. All three records are needed: without the device record
+        // the founder's own leaf resolves to no user, hence to no role, and the
+        // workspace would begin with an admin nobody can look up.
+        let me = this.member_id().to_bytes();
+        this.manifest.set_user(&me, "")?;
+        this.manifest.set_device(&me, &me, "first device")?;
+        this.manifest.set_role(&me, Role::Admin)?;
         Ok(this)
     }
 
@@ -361,79 +450,92 @@ impl WorkspaceState {
     ) -> Result<Vec<Effect>, CoreError> {
         match event {
             Event::ControlOp(op) => self.on_control_op(op),
-            Event::ChunkArrived { doc, chunk } => {
-                // The data plane re-offers the same entry on every sync round,
-                // so without this the parked list would grow without bound and
-                // every drain would redo the same failed decryptions.
-                let already_parked = self.pending_chunks.iter().any(|(d, c)| {
-                    *d == doc
-                        && c.content_ref == chunk.content_ref
-                        && c.pcs_key_hash == chunk.pcs_key_hash
-                });
-                if !already_parked {
-                    self.park_chunk(doc, *chunk);
-                }
-                self.drain_pending()
-            }
-            Event::LocalEdit { doc, text } => {
-                self.require_write()?;
-                self.on_local_edit(doc, &text, csprng)
-            }
+            Event::ChunkArrived { doc, chunk } => self.on_chunk_arrived(doc, *chunk),
+            Event::LocalEdit { doc, text } => self.on_text_edit(doc, csprng, |content| {
+                let at = content.len_unicode();
+                content.insert(at, &text)
+            }),
+            // `update` diffs against the current contents rather than clearing
+            // and re-inserting, so replacing one word stays a one-word change
+            // in the CRDT — and merges with a concurrent edit elsewhere in the
+            // document instead of clobbering it.
+            Event::WriteFile { doc, text } => self.on_text_edit(doc, csprng, |content| {
+                content
+                    .update(&text, loro::UpdateOptions::default())
+                    .map_err(|e| loro::LoroError::Unknown(e.to_string().into()))
+            }),
+            // Positions are clamped rather than rejected: they come from a
+            // caller holding a view that a concurrent remote edit may already
+            // have shortened, which is ordinary in a CRDT rather than a fault.
+            Event::InsertText { doc, pos, text } => self.on_text_edit(doc, csprng, |content| {
+                content.insert(pos.min(content.len_unicode()), &text)
+            }),
+            Event::RemoveText { doc, pos, len } => self.on_text_edit(doc, csprng, |content| {
+                let end = content.len_unicode();
+                let at = pos.min(end);
+                content.delete(at, len.min(end - at))
+            }),
+            Event::DeleteFile { doc } => self.on_delete_file(doc, csprng),
+            // Gated like any other publish, and for the same reason: a
+            // re-announcement runs the identical `publish` path, so it can
+            // force a group-wide key change on everyone's behalf. A member who
+            // may not write has nothing legitimate to re-announce anyway, since
+            // peers reject its entries either way.
             Event::Resync { doc } => {
-                // Gated like any other publish, and for the same reason: a
-                // re-announcement runs the identical `publish` path, so it can
-                // force a group-wide key change on everyone's behalf. A member
-                // who may not write has nothing legitimate to re-announce
-                // anyway, since peers reject its entries either way.
                 self.require_write()?;
+                // Nothing known about this document yet; nothing to re-announce.
                 if self.docs.contains_key(&doc) {
                     self.publish(doc, csprng)
                 } else {
-                    // Nothing known about this document yet; nothing to re-announce.
                     Ok(Vec::new())
                 }
             }
-            Event::AddMember { member, share_key } => {
+            Event::AddUser {
+                member,
+                share_key,
+                role,
+                display_name,
+            } => {
                 self.require_admin()?;
-                let op = self.cgka.add_member(member, share_key)?;
-                if op.is_some() {
-                    // A new member is useless without a role: with none, every
-                    // peer's `author_may_write` check rejects their entries and
-                    // they would appear to join successfully and then silently
-                    // fail to publish anything.
-                    self.manifest.set_role(&member.to_bytes(), Role::Editor)?;
-                }
-                let mut effects: Vec<Effect> = op
-                    .map(|o| Effect::BroadcastOp(Box::new(o)))
-                    .into_iter()
-                    .collect();
-                effects.extend(self.publish_manifest(csprng)?);
-                Ok(effects)
+                self.admit(member, share_key, csprng, |manifest, member| {
+                    // All three records, together. A leaf with no device record
+                    // has no user, so it has no role, so every peer's
+                    // `author_may_write` rejects its entries — it would appear
+                    // to join and then silently fail to publish anything.
+                    manifest.set_user(member, &display_name)?;
+                    manifest.set_device(member, member, "first device")?;
+                    manifest.set_role(member, role)
+                })
             }
-            Event::RemoveMember { member } => {
-                self.require_admin()?;
-                self.require_not_last_admin(&member.to_bytes())?;
-                let op = self.cgka.remove_member(member)?;
-                Ok(op
-                    .map(|o| Effect::BroadcastOp(Box::new(o)))
-                    .into_iter()
-                    .collect())
+            Event::AddDevice {
+                member,
+                share_key,
+                user,
+                label,
+            } => {
+                self.require_may_add_device_to(&user)?;
+                self.admit(member, share_key, csprng, |manifest, member| {
+                    // No role is granted here: the device inherits its user's,
+                    // which is the whole reason roles are keyed by user.
+                    manifest.set_device(member, &user, &label)
+                })
             }
+            Event::RemoveMember { member } => self.on_remove_member(member),
             Event::Rotate => {
                 let op = self.cgka.rotate(csprng)?;
                 Ok(vec![Effect::BroadcastOp(Box::new(op))])
             }
-            Event::ManifestArrived { chunk } => {
-                // No parking queue for the manifest: it is re-published on every
-                // change and on every resync, so a copy that cannot be decrypted
-                // yet is replaced by one that can, rather than needing to be
-                // held. Holding it would also mean a second unbounded queue.
-                let Ok(plaintext) = self.cgka.decrypt(&chunk) else {
-                    return Ok(Vec::new());
-                };
-                self.manifest.import(&plaintext)?;
-                Ok(vec![Effect::ManifestUpdated])
-            }
+            // No parking queue for the manifest: it is re-published on every
+            // change and on every resync, so a copy that cannot be decrypted
+            // yet is replaced by one that can, rather than needing to be held.
+            // Holding it would also mean a second unbounded queue.
+            Event::ManifestArrived { chunk } => match self.cgka.decrypt(&chunk) {
+                Ok(plaintext) => {
+                    self.manifest.import(&plaintext)?;
+                    Ok(vec![Effect::ManifestUpdated])
+                }
+                Err(_) => Ok(Vec::new()),
+            },
             Event::UpsertFile { entry } => {
                 self.require_write()?;
                 self.manifest.upsert_file(&entry)?;
@@ -444,12 +546,23 @@ impl WorkspaceState {
                 self.manifest.rename(doc, &path)?;
                 self.publish_manifest(csprng)
             }
-            Event::SetRole { member, role } => {
+            Event::SetRole { user, role } => {
                 self.require_admin()?;
                 if !role.can_administer() {
-                    self.require_not_last_admin(&member)?;
+                    self.require_not_last_admin(&user)?;
                 }
-                self.manifest.set_role(&member, role)?;
+                self.manifest.set_role(&user, role)?;
+                self.publish_manifest(csprng)
+            }
+            Event::SetInfo { info } => {
+                self.require_admin()?;
+                self.manifest.set_info(&info)?;
+                self.publish_manifest(csprng)
+            }
+            Event::SetDisplayName { display_name } => {
+                let me = self.cgka.member_id().to_bytes();
+                let user = self.manifest.user_of(&me).ok_or(CoreError::UnknownDevice)?;
+                self.manifest.set_user(&user, &display_name)?;
                 self.publish_manifest(csprng)
             }
             Event::AnnounceAuthor { author } => {
@@ -467,10 +580,160 @@ impl WorkspaceState {
     /// whatever the manifest says. Genuine read revocation is a CGKA removal.
     fn require_admin(&self) -> Result<(), CoreError> {
         let me = self.cgka.member_id().to_bytes();
-        if self.manifest.role_of(&me).is_some_and(Role::can_administer) {
+        if self
+            .manifest
+            .role_of_member(&me)
+            .is_some_and(Role::can_administer)
+        {
             return Ok(());
         }
         Err(CoreError::NotAnAdmin)
+    }
+
+    /// Refuse to enrol a device for a user the local device may not act for.
+    ///
+    /// Adding a device to *your own* user is not an administrative act — it is
+    /// enrolling your own phone — so it needs no role. Adding one to somebody
+    /// else's user is, and must be refused, or any member could bind a device
+    /// of theirs to an admin's user and inherit the role.
+    ///
+    /// As everywhere else in this layer, this binds well-behaved nodes only;
+    /// the manifest is a CRDT that merges whatever a malicious peer writes. See
+    /// the [manifest module documentation](crate::manifest) for what would
+    /// close that properly.
+    fn require_may_add_device_to(&self, user: &[u8; 32]) -> Result<(), CoreError> {
+        let me = self.cgka.member_id().to_bytes();
+        if self.manifest.user_of(&me) == Some(*user) {
+            return Ok(());
+        }
+        if self
+            .manifest
+            .role_of_member(&me)
+            .is_some_and(Role::can_administer)
+        {
+            return Ok(());
+        }
+        Err(CoreError::NotThisUsersDevice)
+    }
+
+    /// Park an arriving chunk if it is new, then retry the whole queue.
+    fn on_chunk_arrived(
+        &mut self,
+        doc: DocumentUuid,
+        chunk: Chunk,
+    ) -> Result<Vec<Effect>, CoreError> {
+        // The data plane re-offers the same entry on every sync round, so
+        // without this the parked list would grow without bound and every drain
+        // would redo the same failed decryptions.
+        let already_parked = self.pending_chunks.iter().any(|(d, c)| {
+            *d == doc && c.content_ref == chunk.content_ref && c.pcs_key_hash == chunk.pcs_key_hash
+        });
+        if !already_parked {
+            self.park_chunk(doc, chunk);
+        }
+        self.drain_pending()
+    }
+
+    /// Revoke one device's leaf.
+    fn on_remove_member(&mut self, member: MemberId) -> Result<Vec<Effect>, CoreError> {
+        self.require_admin()?;
+        // Guard on the device's *user*: removing one of an admin's three
+        // devices is fine, removing their last one is not, and the difference
+        // is invisible if you look at the leaf alone. A device with no record
+        // stands in for its own user, which is the pre-sync case.
+        let owner = self
+            .manifest
+            .user_of(&member.to_bytes())
+            .unwrap_or_else(|| member.to_bytes());
+        if self.manifest.devices_of(&owner).len() <= 1 {
+            self.require_not_last_admin(&owner)?;
+        }
+        let op = self.cgka.remove_member(member)?;
+        Ok(op
+            .map(|o| Effect::BroadcastOp(Box::new(o)))
+            .into_iter()
+            .collect())
+    }
+
+    /// Apply a mutation to a document's text and publish the result.
+    ///
+    /// Every content edit funnels through here so the permission check, the
+    /// container name, the commit and the publish live in one place rather than
+    /// being repeated — and so that no future edit can accidentally skip the
+    /// write check or forget to publish.
+    fn on_text_edit<R, F>(
+        &mut self,
+        doc: DocumentUuid,
+        csprng: &mut R,
+        mutate: F,
+    ) -> Result<Vec<Effect>, CoreError>
+    where
+        R: CryptoRng + RngCore,
+        F: FnOnce(&loro::LoroText) -> Result<(), loro::LoroError>,
+    {
+        self.require_write()?;
+        let loro = self.docs.entry(doc).or_default();
+        let content = loro.get_text("content");
+        mutate(&content).map_err(|e| CoreError::Manifest(e.to_string()))?;
+        loro.commit();
+        self.publish(doc, csprng)
+    }
+
+    /// Delete a document and withdraw this node's entry for it.
+    fn on_delete_file<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_write()?;
+        self.manifest.delete_file(doc)?;
+        self.docs.remove(&doc);
+        self.last_ref.remove(&doc);
+        // Drop anything parked for it too, or a chunk still in flight would
+        // silently resurrect the document once its key arrived.
+        let pending_bytes = &mut self.pending_bytes;
+        self.pending_chunks.retain(|(d, chunk)| {
+            let keep = *d != doc;
+            if !keep {
+                *pending_bytes = pending_bytes.saturating_sub(chunk.ciphertext.len());
+            }
+            keep
+        });
+        let mut effects = vec![Effect::DeleteEntry {
+            key: self.secret.storage_key(doc),
+            doc,
+        }];
+        effects.extend(self.publish_manifest(csprng)?);
+        Ok(effects)
+    }
+
+    /// Admit a leaf to the group and record whatever the manifest needs.
+    ///
+    /// The CGKA half is identical for a new user and a new device; only the
+    /// records differ, so `record` supplies those. It runs only when the
+    /// operation was genuinely new, since re-recording on a duplicate `Add`
+    /// would let a repeat admission quietly overwrite a role.
+    fn admit<R, F>(
+        &mut self,
+        member: MemberId,
+        share_key: ShareKey,
+        csprng: &mut R,
+        record: F,
+    ) -> Result<Vec<Effect>, CoreError>
+    where
+        R: CryptoRng + RngCore,
+        F: FnOnce(&Manifest, &[u8; 32]) -> Result<(), CoreError>,
+    {
+        let op = self.cgka.add_member(member, share_key)?;
+        if op.is_some() {
+            record(&self.manifest, &member.to_bytes())?;
+        }
+        let mut effects: Vec<Effect> = op
+            .map(|o| Effect::BroadcastOp(Box::new(o)))
+            .into_iter()
+            .collect();
+        effects.extend(self.publish_manifest(csprng)?);
+        Ok(effects)
     }
 
     /// Refuse a content or manifest mutation unless the local member may write.
@@ -496,7 +759,7 @@ impl WorkspaceState {
     /// entire group to encrypt them.
     fn require_write(&self) -> Result<(), CoreError> {
         let me = self.cgka.member_id().to_bytes();
-        match self.manifest.role_of(&me) {
+        match self.manifest.role_of_member(&me) {
             Some(role) if !role.can_write() => Err(CoreError::NotAWriter),
             _ => Ok(()),
         }
@@ -549,23 +812,6 @@ impl WorkspaceState {
             return self.drain_pending();
         }
         Ok(Vec::new())
-    }
-
-    fn on_local_edit<R: CryptoRng + RngCore>(
-        &mut self,
-        doc: DocumentUuid,
-        text: &str,
-        csprng: &mut R,
-    ) -> Result<Vec<Effect>, CoreError> {
-        let loro = self.docs.entry(doc).or_default();
-        let content = loro.get_text("content");
-        let at = content.len_utf8();
-        content
-            .insert(at, text)
-            .map_err(|e| CoreError::Manifest(e.to_string()))?;
-        loro.commit();
-
-        self.publish(doc, csprng)
     }
 
     /// Encrypt and emit the current state of a document.

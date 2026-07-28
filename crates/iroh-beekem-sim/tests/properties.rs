@@ -291,3 +291,77 @@ fn the_simulation_is_reproducible() {
     assert_deterministic(|| base_plan(Vec::new()), Seed(0x00C0_FFEE));
     assert_deterministic(|| base_plan(Vec::new()), Seed(0x1234_5678));
 }
+
+/// What a removed member can still *see*, as distinct from what it can read.
+///
+/// The confidentiality properties above cover the crypto plane: a revoked member
+/// cannot decrypt content or manifests written after its removal. They say
+/// nothing about the data plane, and until the simulator modelled an index there
+/// was no way to ask. The answer today is uncomfortable, and these properties
+/// are written to record exactly where the line currently sits rather than to
+/// flatter it.
+///
+/// A removed member retains the `iroh-docs` write capability, the blinding
+/// secret and its place in the gossip overlay, so it keeps observing entry
+/// existence, size, author and timing — and keeps watching membership churn.
+/// Closing that is what namespace rotation and the device roster are for; see
+/// the plan's Phases 3 and 4.
+mod a_removed_member_still_watches {
+    use iroh_beekem_sim::{Churn, WorkspaceNode};
+    use propsim::prelude::*;
+
+    use super::plan;
+
+    /// The victim's own view, once the run has settled.
+    fn victim<'a>(w: &'a World<'a, WorkspaceNode<Churn>>) -> Option<&'a WorkspaceNode<Churn>> {
+        w.nodes()
+            .find(|n| n.is_revocation_target() && n.has_joined())
+    }
+
+    #[test]
+    fn the_victim_sees_index_entries_it_can_never_decrypt() {
+        // Visibility is not readability. This passing is not a good thing — it
+        // is the statement of the gap, and it should be inverted the moment
+        // namespace rotation lands.
+        plan::<Churn>(vec![property::sometimes(
+            "the victim observes entries",
+            |w: &World<'_, WorkspaceNode<Churn>>| victim(w).is_some_and(|v| v.index_len() > 0),
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn the_victim_keeps_observing_the_control_plane() {
+        // The gossip topic is derived from the tree id, which every past invitee
+        // knows, so removal does not unsubscribe anyone. Membership churn stays
+        // visible to the removed member indefinitely.
+        plan::<Churn>(vec![property::sometimes(
+            "the victim observes control operations",
+            |w: &World<'_, WorkspaceNode<Churn>>| victim(w).is_some_and(|v| v.observed_ops() > 0),
+        )])
+        .run(deterministic());
+    }
+
+    #[test]
+    fn every_node_sees_the_same_entries_once_settled() {
+        // The index is replicated, so it converges like everything else. This
+        // one is a genuine invariant rather than a recorded gap, and it is what
+        // the visibility properties above are stated against.
+        plan::<Churn>(vec![property::eventually_within(
+            "indices converge",
+            Duration::from_secs(8),
+            |w: &World<'_, WorkspaceNode<Churn>>| {
+                let joined: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
+                let Some(first) = joined.first() else {
+                    return false;
+                };
+                joined
+                    .iter()
+                    .all(|n| n.observed_keys() == first.observed_keys())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    use std::time::Duration;
+}

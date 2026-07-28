@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use beekem::{id::TreeId, operation::CgkaOperation};
 use iroh_beekem_core::{
-    CgkaController, DocumentUuid, Effect, Event, WorkspaceSecret, WorkspaceState,
+    CgkaController, DocumentUuid, Effect, Event, Role, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
@@ -55,9 +55,29 @@ fn two_node_workspace() -> Bus {
     let log = alice_cgka.op_log().expect("exporting log");
     let bob_cgka = CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
 
+    let alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
+        .expect("alice founds the workspace");
+
+    // `add_member` above admits bob at the CGKA level only. A real admission
+    // goes through `Event::AddUser`, which also writes the manifest records
+    // that give the new leaf an owner and therefore a role; mirror that here,
+    // or bob would hold a leaf belonging to nobody.
+    let bob_bytes = bob_id.to_bytes();
+    alice
+        .manifest()
+        .set_user(&bob_bytes, "bob")
+        .expect("recording bob's user");
+    alice
+        .manifest()
+        .set_device(&bob_bytes, &bob_bytes, "first device")
+        .expect("recording bob's device");
+    alice
+        .manifest()
+        .set_role(&bob_bytes, Role::Editor)
+        .expect("granting bob a writing role");
+
     Bus {
-        alice: WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
-            .expect("alice founds the workspace"),
+        alice,
         bob: WorkspaceState::joined(bob_cgka, secret),
         to_bob: Vec::new(),
         chunks_to_bob: Vec::new(),
@@ -77,7 +97,7 @@ impl Bus {
                 Effect::BroadcastOp(op) => self.to_bob.push(*op),
                 Effect::StoreChunk { chunk, .. } => self.chunks_to_bob.push(*chunk),
                 Effect::StoreManifest { chunk, .. } => self.manifests_to_bob.push(*chunk),
-                Effect::Applied { .. } | Effect::ManifestUpdated => {}
+                Effect::Applied { .. } | Effect::ManifestUpdated | Effect::DeleteEntry { .. } => {}
             }
         }
     }
@@ -246,7 +266,7 @@ fn concurrent_edits_from_both_members_converge() {
                     .handle(Event::ManifestArrived { chunk }, &mut rng(0))
                     .expect("alice handles bob's manifest");
             }
-            Effect::Applied { .. } | Effect::ManifestUpdated => {}
+            Effect::Applied { .. } | Effect::ManifestUpdated | Effect::DeleteEntry { .. } => {}
         }
     }
     bus.deliver_all_to_bob();
@@ -335,7 +355,7 @@ mod roles_are_enforced {
         let bob_id = bus.bob.member_id();
         bus.alice_does(
             Event::SetRole {
-                member: bob_id.to_bytes(),
+                user: bob_id.to_bytes(),
                 role: Role::Editor,
             },
             51,
@@ -361,7 +381,7 @@ mod roles_are_enforced {
 
         let demote = bus.alice.handle(
             Event::SetRole {
-                member: alice_id.to_bytes(),
+                user: alice_id.to_bytes(),
                 role: Role::Editor,
             },
             &mut rng(60),
@@ -403,7 +423,13 @@ mod roles_are_enforced {
         );
 
         // Now an admin grants the role. Applied to bob's own replica directly,
-        // standing in for the sync that would carry it.
+        // standing in for the sync that would carry it — which means writing
+        // the device record too, since a role is granted to a *user* and it is
+        // that record which says whose device this leaf is.
+        bus.bob
+            .manifest()
+            .set_device(&bob_id.to_bytes(), &bob_id.to_bytes(), "first device")
+            .expect("recording the device");
         bus.bob
             .manifest()
             .set_role(&bob_id.to_bytes(), Role::Editor)
@@ -430,7 +456,12 @@ mod roles_are_enforced {
         let bob_id = bus.bob.member_id();
 
         // Record the demotion on bob's own replica, standing in for the sync
-        // that would carry it.
+        // that would carry it. Both records: the role names a user, and the
+        // device record is what ties bob's leaf to that user.
+        bus.bob
+            .manifest()
+            .set_device(&bob_id.to_bytes(), &bob_id.to_bytes(), "first device")
+            .expect("recording the device");
         bus.bob
             .manifest()
             .set_role(&bob_id.to_bytes(), Role::Viewer)
@@ -661,4 +692,338 @@ fn revoked_member_cannot_read_subsequent_edits() {
         bus.alice.document_text(DOC).contains("AFTER revocation"),
         "alice should still see her own edit"
     );
+}
+
+/// A CGKA leaf is a device, not a person. These cover the consequences: roles
+/// resolve through the owning user, one user's devices are independent leaves,
+/// and a device cannot enrol itself into somebody else's user — which would be
+/// a privilege escalation rather than a mere bookkeeping error.
+mod users_own_devices {
+    use iroh_beekem_core::{CoreError, Event, Role};
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
+
+    use super::{rng, two_node_workspace};
+
+    #[test]
+    fn a_device_acts_under_its_owners_role() {
+        let bus = two_node_workspace();
+        let alice = bus.alice.member_id().to_bytes();
+
+        assert_eq!(
+            bus.alice.manifest().role_of_member(&alice),
+            Some(Role::Admin),
+            "the founding device must resolve to the founding user's role"
+        );
+        assert_eq!(
+            bus.alice.manifest().user_of(&alice),
+            Some(alice),
+            "a founder's user id is their founding device's member id"
+        );
+    }
+
+    #[test]
+    fn a_second_device_inherits_its_users_role_without_a_new_grant() {
+        let mut bus = two_node_workspace();
+        let alice_user = bus.alice.member_id().to_bytes();
+
+        // Alice enrols a laptop of her own.
+        let laptop = MemorySigner::generate(&mut rng(300));
+        let laptop_id = beekem::id::MemberId::from(laptop.verifying_key());
+        let laptop_secret = ShareSecretKey::generate(&mut rng(301));
+        bus.alice_does(
+            Event::AddDevice {
+                member: laptop_id,
+                share_key: laptop_secret.share_key(),
+                user: alice_user,
+                label: "laptop".into(),
+            },
+            302,
+        );
+
+        assert_eq!(
+            bus.alice.manifest().role_of_member(&laptop_id.to_bytes()),
+            Some(Role::Admin),
+            "a new device must inherit its user's role rather than needing its own grant"
+        );
+        assert_eq!(
+            bus.alice.manifest().devices_of(&alice_user).len(),
+            2,
+            "alice should now own two devices"
+        );
+        assert_eq!(
+            bus.alice.manifest().users().len(),
+            2,
+            "enrolling a device must not invent a new user; alice and bob only"
+        );
+    }
+
+    #[test]
+    fn a_member_cannot_enrol_a_device_into_someone_elses_user() {
+        let mut bus = two_node_workspace();
+        let alice_user = bus.alice.member_id().to_bytes();
+
+        // Bob is an editor, not an admin, and the device he is trying to bind
+        // would inherit alice's admin role.
+        let rogue = MemorySigner::generate(&mut rng(310));
+        let rogue_id = beekem::id::MemberId::from(rogue.verifying_key());
+        let rogue_secret = ShareSecretKey::generate(&mut rng(311));
+
+        // Give bob his records locally so he is a fully-formed editor.
+        let bob = bus.bob.member_id().to_bytes();
+        bus.bob
+            .manifest()
+            .set_device(&bob, &bob, "first device")
+            .expect("recording bob's device");
+        bus.bob
+            .manifest()
+            .set_role(&bob, Role::Editor)
+            .expect("granting bob a role");
+
+        let result = bus.bob.handle(
+            Event::AddDevice {
+                member: rogue_id,
+                share_key: rogue_secret.share_key(),
+                user: alice_user,
+                label: "not really alice's".into(),
+            },
+            &mut rng(312),
+        );
+
+        assert!(
+            matches!(result, Err(CoreError::NotThisUsersDevice)),
+            "binding a device to another user's account must be refused, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn removing_one_device_leaves_the_users_other_devices_alone() {
+        let mut bus = two_node_workspace();
+        let alice_user = bus.alice.member_id().to_bytes();
+
+        let laptop = MemorySigner::generate(&mut rng(320));
+        let laptop_id = beekem::id::MemberId::from(laptop.verifying_key());
+        let laptop_secret = ShareSecretKey::generate(&mut rng(321));
+        bus.alice_does(
+            Event::AddDevice {
+                member: laptop_id,
+                share_key: laptop_secret.share_key(),
+                user: alice_user,
+                label: "laptop".into(),
+            },
+            322,
+        );
+
+        // Removing one of the sole admin's two devices must be allowed: the
+        // user keeps administering the workspace from the other one. Guarding
+        // on the leaf rather than the user would refuse this.
+        let removed = bus
+            .alice
+            .handle(Event::RemoveMember { member: laptop_id }, &mut rng(323));
+        assert!(
+            removed.is_ok(),
+            "removing one device of a multi-device admin must be allowed, got {removed:?}"
+        );
+        assert_eq!(
+            bus.alice.manifest().role_of(&alice_user),
+            Some(Role::Admin),
+            "the user keeps their role when one of their devices is removed"
+        );
+    }
+}
+
+/// Content mutation beyond append-only. Each of these publishes through the
+/// same path as a plain edit, so what is being checked is the text semantics
+/// and the delete bookkeeping, not the transport.
+mod file_crud {
+    use iroh_beekem_core::{CoreError, Effect, Event, FileEntry};
+
+    use super::{DOC, rng, two_node_workspace};
+
+    fn entry() -> FileEntry {
+        FileEntry {
+            uuid: DOC,
+            logical_path: "/notes.md".into(),
+            mime_type: "text/markdown".into(),
+        }
+    }
+
+    #[test]
+    fn write_replaces_the_whole_document() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "original".into(),
+            },
+            400,
+        );
+        bus.alice_does(
+            Event::WriteFile {
+                doc: DOC,
+                text: "replaced".into(),
+            },
+            401,
+        );
+        bus.deliver_all_to_bob();
+
+        assert_eq!(bus.alice.document_text(DOC), "replaced");
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            "replaced",
+            "a whole-document write must converge like any other edit"
+        );
+    }
+
+    #[test]
+    fn insert_and_remove_address_character_offsets() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "hello world".into(),
+            },
+            410,
+        );
+        bus.alice_does(
+            Event::InsertText {
+                doc: DOC,
+                pos: 5,
+                text: ",".into(),
+            },
+            411,
+        );
+        assert_eq!(bus.alice.document_text(DOC), "hello, world");
+
+        bus.alice_does(
+            Event::RemoveText {
+                doc: DOC,
+                pos: 0,
+                len: 7,
+            },
+            412,
+        );
+        assert_eq!(bus.alice.document_text(DOC), "world");
+
+        bus.deliver_all_to_bob();
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            "world",
+            "positional edits must converge, not just apply locally"
+        );
+    }
+
+    #[test]
+    fn out_of_range_positions_are_clamped_rather_than_rejected() {
+        // A caller's offsets come from a view a concurrent remote edit may
+        // already have shortened. That is ordinary in a CRDT, so it clamps.
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "abc".into(),
+            },
+            420,
+        );
+
+        bus.alice_does(
+            Event::InsertText {
+                doc: DOC,
+                pos: 999,
+                text: "!".into(),
+            },
+            421,
+        );
+        assert_eq!(bus.alice.document_text(DOC), "abc!");
+
+        bus.alice_does(
+            Event::RemoveText {
+                doc: DOC,
+                pos: 2,
+                len: 999,
+            },
+            422,
+        );
+        assert_eq!(bus.alice.document_text(DOC), "ab");
+    }
+
+    #[test]
+    fn delete_removes_the_document_and_withdraws_its_entry() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(Event::UpsertFile { entry: entry() }, 430);
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "doomed".into(),
+            },
+            431,
+        );
+
+        let effects = bus
+            .alice
+            .handle(Event::DeleteFile { doc: DOC }, &mut rng(432))
+            .expect("alice may delete her own document");
+
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeleteEntry { doc, .. } if *doc == DOC)),
+            "deleting must withdraw this node's index entry, got {effects:?}"
+        );
+        assert_eq!(
+            bus.alice.manifest().resolve_path("/notes.md"),
+            None,
+            "the deleted document must leave the file index"
+        );
+        assert_eq!(
+            bus.alice.document_text(DOC),
+            "",
+            "the local replica must be dropped too"
+        );
+    }
+
+    #[test]
+    fn a_chunk_arriving_after_a_delete_does_not_resurrect_the_document() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(Event::UpsertFile { entry: entry() }, 440);
+
+        // Bob writes; his chunk is in flight when alice deletes.
+        bus.bob
+            .handle(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: "in flight".into(),
+                },
+                &mut rng(441),
+            )
+            .expect("bob writes");
+
+        bus.alice
+            .handle(Event::DeleteFile { doc: DOC }, &mut rng(442))
+            .expect("alice deletes");
+
+        assert_eq!(
+            bus.alice.pending_len(),
+            0,
+            "deleting must also drop anything parked for that document"
+        );
+        assert_eq!(
+            bus.alice.document_text(DOC),
+            "",
+            "a delete must leave the document empty locally"
+        );
+    }
+
+    #[test]
+    fn deleting_an_unknown_document_is_an_error() {
+        let mut bus = two_node_workspace();
+        let result = bus
+            .alice
+            .handle(Event::DeleteFile { doc: DOC }, &mut rng(450));
+        assert!(
+            matches!(result, Err(CoreError::UnknownDocument)),
+            "deleting a document that was never recorded should fail, got {result:?}"
+        );
+    }
 }

@@ -18,7 +18,8 @@ use beekem::{
 use bytes::Bytes;
 use iroh::EndpointId;
 use iroh_beekem_core::{
-    CgkaController, DocumentUuid, Effect, Event, FileEntry, Role, WorkspaceSecret, WorkspaceState,
+    CgkaController, DeviceRecord, DocumentUuid, Effect, Event, FileEntry, Role, WorkspaceInfo,
+    WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{
@@ -34,12 +35,7 @@ use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
     proto::TopicId,
 };
-use keyhive_crypto::{
-    share_key::{ShareKey, ShareSecretKey},
-    signed::Signed,
-    signer::memory::MemorySigner,
-    verifiable::Verifiable,
-};
+use keyhive_crypto::{share_key::ShareKey, signed::Signed, verifiable::Verifiable};
 use n0_future::StreamExt;
 use rand::{CryptoRng, RngCore};
 use tokio::{
@@ -49,6 +45,7 @@ use tokio::{
 
 use crate::{
     error::WorkspaceError,
+    identity::Identity,
     node::Node,
     wire::{ControlMsg, decode_chunk, encode_chunk},
 };
@@ -83,6 +80,31 @@ pub struct Invite {
     pub inviter: EndpointId,
 }
 
+/// One person in the workspace, with everything an application needs to show
+/// them: their role, and the devices acting on their behalf.
+#[derive(Debug, Clone)]
+pub struct User {
+    /// Stable identifier — the member id of this user's founding device.
+    pub id: [u8; 32],
+    /// Human-readable name, for display only.
+    pub display_name: String,
+    /// This user's role, if an admin has assigned one yet.
+    pub role: Option<Role>,
+    /// The devices acting for this user, each holding one CGKA leaf.
+    pub devices: Vec<DeviceRecord>,
+}
+
+/// What identifies one index entry: the blinded key and the author who wrote it.
+///
+/// Every member writes to the same blinded key for a given document, so the
+/// author is what distinguishes their entries from each other.
+type EntrySlot = ([u8; 32], [u8; 32]);
+
+/// Rebuild a `MemberId` from raw verifying-key bytes.
+fn member_id_from_bytes(bytes: &[u8; 32]) -> Option<MemberId> {
+    ed25519_verifying_key(bytes).map(MemberId::from)
+}
+
 /// Shared state behind the pump loops.
 struct Inner {
     state: Mutex<WorkspaceState>,
@@ -91,7 +113,17 @@ struct Inner {
     author: AuthorId,
     gossip_tx: GossipSender,
     secret: WorkspaceSecret,
-    document: DocumentUuid,
+    /// The content hash last ingested for each (blinded key, author) pair.
+    ///
+    /// `ingest_all` re-reads every entry on every sync event, and with several
+    /// documents that is N fetch-and-decrypt cycles per event for content that
+    /// has usually not changed. Skipping unchanged hashes keeps the cost
+    /// proportional to what actually moved.
+    ///
+    /// Keyed by author as well as by key: every member writes to the *same*
+    /// blinded key for a given document, so a single slot per key would be
+    /// overwritten by each peer's entry in turn and never register a hit.
+    seen_entries: Mutex<HashMap<EntrySlot, iroh_blobs::Hash>>,
     /// Rate limiter for the neighbour-up repair path.
     neighbor_cooldown: Mutex<Cooldown>,
     /// Raised when the current document state should be re-announced.
@@ -204,17 +236,22 @@ fn topic_for(tree_id: TreeId) -> TopicId {
 }
 
 impl Workspace {
-    /// Found a new workspace on this node.
+    /// Found a new workspace on this node, with `identity` as its first admin.
+    ///
+    /// The workspace's tree id is derived from `identity`, so founding twice
+    /// with the same identity yields the same tree id — which is what makes the
+    /// founder's identity worth persisting rather than generating in passing.
     ///
     /// # Errors
     ///
     /// Propagates endpoint, storage and CGKA failures.
     pub async fn create<R: CryptoRng + RngCore>(
         node: Node,
-        document: DocumentUuid,
+        identity: &Identity,
+        info: WorkspaceInfo,
         csprng: &mut R,
     ) -> Result<Self, WorkspaceError> {
-        let signer = MemorySigner::generate(csprng);
+        let signer = identity.signer();
         let tree_id = TreeId::from(signer.verifying_key());
         let cgka = CgkaController::create(tree_id, signer, csprng)?;
         let secret = WorkspaceSecret::generate(csprng);
@@ -227,26 +264,30 @@ impl Workspace {
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
         let state = WorkspaceState::found(cgka, WorkspaceSecret::new(secret.to_bytes()))?;
-        Self::assemble(node, state, secret, doc, tree_id, document, Vec::new()).await
+        let workspace = Self::assemble(node, state, secret, doc, tree_id, Vec::new()).await?;
+        workspace.set_info(info).await?;
+        Ok(workspace)
     }
 
     /// Join an existing workspace from an [`Invite`].
     ///
-    /// `share_secret` must be the secret half of the [`ShareKey`] the inviter
-    /// named in the `Add` operation.
+    /// `identity` must be the device whose [`share_key`](Identity::share_key)
+    /// the inviter named when admitting it. The secret half never travels in
+    /// the invite, which is what makes an intercepted invite useless for
+    /// joining.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceError::Invite`] if the log does not admit this member,
+    /// Returns [`WorkspaceError::Invite`] if the log does not admit this device,
     /// and propagates endpoint and storage failures.
     pub async fn join<R: CryptoRng + RngCore>(
         node: Node,
         invite: &Invite,
-        signer: MemorySigner,
-        share_secret: ShareSecretKey,
-        document: DocumentUuid,
+        identity: &Identity,
         _csprng: &mut R,
     ) -> Result<Self, WorkspaceError> {
+        let signer = identity.signer();
+        let share_secret = identity.share_secret();
         let tree_id = TreeId::from(
             ed25519_verifying_key(&invite.tree_id)
                 .ok_or_else(|| WorkspaceError::Invite("malformed tree id".into()))?,
@@ -269,16 +310,8 @@ impl Workspace {
         // ever crosses between them — the data plane would sync while the
         // control plane silently did not, leaving every chunk undecryptable.
         let state = WorkspaceState::joined(cgka, WorkspaceSecret::new(secret.to_bytes()));
-        let workspace = Self::assemble(
-            node,
-            state,
-            secret,
-            doc,
-            tree_id,
-            document,
-            vec![invite.inviter],
-        )
-        .await?;
+        let workspace =
+            Self::assemble(node, state, secret, doc, tree_id, vec![invite.inviter]).await?;
         workspace.sync_with(invite.inviter).await?;
         Ok(workspace)
     }
@@ -290,7 +323,6 @@ impl Workspace {
         secret: WorkspaceSecret,
         doc: Doc,
         tree_id: TreeId,
-        document: DocumentUuid,
         bootstrap: Vec<EndpointId>,
     ) -> Result<Self, WorkspaceError> {
         let namespace = doc.id();
@@ -320,7 +352,7 @@ impl Workspace {
             author,
             gossip_tx,
             secret,
-            document,
+            seen_entries: Mutex::new(HashMap::new()),
             neighbor_cooldown: Mutex::new(Cooldown::default()),
             republish_wanted: Notify::new(),
         });
@@ -409,31 +441,104 @@ impl Workspace {
         self.topic
     }
 
-    /// Admit a new member and build the invite they need.
+    /// Feed one event to the core and perform whatever it asks for.
+    ///
+    /// Every mutating method funnels through here. Before this existed the same
+    /// eight lines — lock, handle, drop the guard, apply — were repeated in a
+    /// dozen methods, and the CRUD surface below would have repeated them in a
+    /// dozen more. Note that the guard is dropped *before* the effects are
+    /// performed: holding it across the network writes in `apply_effects` would
+    /// serialise the whole workspace behind one blob upload.
+    async fn drive(&self, event: Event) -> Result<(), WorkspaceError> {
+        let effects = {
+            let mut state = self.inner.state.lock().await;
+            state.handle(event, &mut rand::rngs::OsRng)?
+        };
+        apply_effects(&self.inner, effects).await;
+        Ok(())
+    }
+
+    // ---- users and devices -------------------------------------------------
+
+    /// Admit a new person, along with their first device, and build the invite
+    /// they need.
+    ///
+    /// The role is chosen here rather than defaulted, because it decides what
+    /// capability the invite carries: a viewer's ticket grants read access to
+    /// the replica, an editor's grants write.
     ///
     /// # Errors
     ///
-    /// Propagates CGKA failures.
-    pub async fn invite(
+    /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` unless this node
+    /// is an admin, and propagates CGKA failures.
+    pub async fn add_user(
         &self,
         member: MemberId,
         share_key: ShareKey,
+        role: Role,
+        display_name: &str,
     ) -> Result<Invite, WorkspaceError> {
-        let (effects, log) = {
-            let mut state = self.inner.state.lock().await;
-            let effects = state.handle(
-                Event::AddMember { member, share_key },
-                &mut rand::rngs::OsRng,
-            )?;
-            let log = state.op_log()?;
-            (effects, log)
-        };
-        apply_effects(&self.inner, effects).await;
+        self.drive(Event::AddUser {
+            member,
+            share_key,
+            role,
+            display_name: display_name.to_string(),
+        })
+        .await?;
+        self.build_invite(role).await
+    }
 
+    /// Admit another device for an existing person.
+    ///
+    /// Enrolling a device for *your own* user needs no administrative role;
+    /// binding one to somebody else's does, or any member could inherit an
+    /// admin's permissions by claiming to be one of their devices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Core`] wrapping `NotThisUsersDevice` if this
+    /// node may not act for `user`.
+    pub async fn add_device(
+        &self,
+        member: MemberId,
+        share_key: ShareKey,
+        user: [u8; 32],
+        label: &str,
+    ) -> Result<Invite, WorkspaceError> {
+        self.drive(Event::AddDevice {
+            member,
+            share_key,
+            user,
+            label: label.to_string(),
+        })
+        .await?;
+        let role = {
+            let state = self.inner.state.lock().await;
+            state.manifest().role_of(&user).unwrap_or(Role::Viewer)
+        };
+        self.build_invite(role).await
+    }
+
+    /// Build the ticket a freshly admitted device needs.
+    ///
+    /// A viewer gets a read-only capability. `iroh-docs` has no per-member write
+    /// key, so a write ticket is impossible to withdraw short of rotating the
+    /// namespace — handing one to somebody who is not supposed to write is a
+    /// capability given away for nothing.
+    async fn build_invite(&self, role: Role) -> Result<Invite, WorkspaceError> {
+        let log = {
+            let state = self.inner.state.lock().await;
+            state.op_log()?
+        };
+        let mode = if role.can_write() {
+            ShareMode::Write
+        } else {
+            ShareMode::Read
+        };
         let doc_ticket = self
             .inner
             .doc
-            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .share(mode, AddrInfoOptions::RelayAndAddresses)
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
@@ -446,105 +551,162 @@ impl Workspace {
         })
     }
 
-    /// Revoke a member, so they cannot read anything written afterwards.
+    /// Revoke one device, so it cannot read anything written afterwards.
+    ///
+    /// A person's other devices are unaffected. To remove a person entirely,
+    /// use [`Self::remove_user`].
     ///
     /// # Errors
     ///
     /// Propagates CGKA failures.
-    pub async fn revoke(&self, member: MemberId) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(Event::RemoveMember { member }, &mut rand::rngs::OsRng)?
-        };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+    pub async fn remove_device(&self, member: MemberId) -> Result<(), WorkspaceError> {
+        self.drive(Event::RemoveMember { member }).await
     }
 
-    /// Rotate this member's leaf key, re-keying its path to the root.
-    ///
-    /// This is the post-compromise security primitive, and the reason BeeKEM is
-    /// here rather than a static group key: an attacker holding this member's
-    /// old leaf secret can derive no group key produced after the rotation.
-    /// Recovery from a compromise is therefore something a member can do
-    /// unilaterally, without the group re-forming around them.
-    ///
-    /// Needs no administrative role — rotating your own key harms nobody, and
-    /// requiring permission to recover from a compromise would be backwards.
+    /// Revoke every device belonging to a person.
     ///
     /// # Errors
     ///
-    /// Propagates CGKA failures.
-    pub async fn rotate(&self) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(Event::Rotate, &mut rand::rngs::OsRng)?
+    /// Propagates CGKA failures. If one device cannot be removed the rest are
+    /// still attempted, and the first failure is returned.
+    pub async fn remove_user(&self, user: [u8; 32]) -> Result<(), WorkspaceError> {
+        let devices: Vec<MemberId> = {
+            let state = self.inner.state.lock().await;
+            state
+                .manifest()
+                .devices_of(&user)
+                .iter()
+                .filter_map(|d| member_id_from_bytes(&d.member))
+                .collect()
         };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+        let mut first_error = None;
+        for device in devices {
+            if let Err(err) = self.remove_device(device).await {
+                first_error = first_error.or(Some(err));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
-    /// Append text to the workspace document.
+    /// Assign a role to a **user**, covering all of their devices.
+    ///
+    /// Demoting an admin who stays in the workspace is a pure manifest edit
+    /// with no key rotation; removing them entirely also needs
+    /// [`Self::remove_user`].
     ///
     /// # Errors
     ///
-    /// Propagates encryption and storage failures.
-    pub async fn append(&self, text: &str) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(
-                Event::LocalEdit {
-                    doc: self.inner.document,
-                    text: text.to_string(),
-                },
-                &mut rand::rngs::OsRng,
-            )?
-        };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+    /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` if this node is
+    /// not an admin, or `LastAdmin` if the change would leave none.
+    pub async fn set_role(&self, user: [u8; 32], role: Role) -> Result<(), WorkspaceError> {
+        self.drive(Event::SetRole { user, role }).await
     }
 
-    /// Re-publish the document's current state under the current epoch key.
+    /// Every person in the workspace, with their devices and role.
+    pub async fn users(&self) -> Vec<User> {
+        let state = self.inner.state.lock().await;
+        let manifest = state.manifest();
+        manifest
+            .users()
+            .into_iter()
+            .map(|record| User {
+                role: manifest.role_of(&record.id),
+                devices: manifest.devices_of(&record.id),
+                id: record.id,
+                display_name: record.display_name,
+            })
+            .collect()
+    }
+
+    /// Look up one person.
+    pub async fn user(&self, user: [u8; 32]) -> Option<User> {
+        self.users().await.into_iter().find(|u| u.id == user)
+    }
+
+    /// This device, and the person it belongs to.
     ///
-    /// Two distinct jobs, both necessary:
+    /// Returns `None` until the records naming this device have synced, which
+    /// for a joiner is a normal early state rather than an error.
+    pub async fn me(&self) -> Option<User> {
+        let member = {
+            let state = self.inner.state.lock().await;
+            state.member_id().to_bytes()
+        };
+        let user = {
+            let state = self.inner.state.lock().await;
+            state.manifest().user_of(&member)?
+        };
+        self.user(user).await
+    }
+
+    /// Set the display name of the person this device belongs to.
     ///
-    /// * **Granting a new member access to existing content.** A joiner
-    ///   reconstructs the group from the operation log, but not the historical
-    ///   PCS keys, so they *cannot* decrypt anything written before they were
-    ///   admitted. That is forward secrecy working as intended, not a defect.
-    ///   Re-publishing after an invite re-encrypts the current state under a
-    ///   key the new member can derive.
-    /// * **Anti-entropy.** A chunk lost in transit has no later chunk to carry
-    ///   its content until someone edits again; a periodic re-announcement
-    ///   closes that gap.
+    /// Self-only, by design: a display name is how someone presents themselves,
+    /// and letting one member rename another is an impersonation vector rather
+    /// than a convenience.
     ///
     /// # Errors
     ///
-    /// Propagates encryption and storage failures.
-    pub async fn resync(&self) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(
-                Event::Resync {
-                    doc: self.inner.document,
-                },
-                &mut rand::rngs::OsRng,
-            )?
-        };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+    /// Returns [`WorkspaceError::Core`] wrapping `UnknownDevice` if the records
+    /// naming this device have not synced yet.
+    pub async fn set_display_name(&self, display_name: &str) -> Result<(), WorkspaceError> {
+        self.drive(Event::SetDisplayName {
+            display_name: display_name.to_string(),
+        })
+        .await
     }
 
-    /// Every document the manifest records, with its logical path.
-    pub async fn files(&self) -> Vec<FileEntry> {
-        self.inner.state.lock().await.manifest().files()
-    }
-
-    /// Every role assignment the manifest records.
+    /// Every role assignment the manifest records, keyed by user.
     pub async fn roles(&self) -> Vec<([u8; 32], Role)> {
         self.inner.state.lock().await.manifest().roles()
     }
 
-    /// Record or replace a document's metadata in the manifest.
+    // ---- workspace ---------------------------------------------------------
+
+    /// This workspace's name and description.
+    pub async fn info(&self) -> WorkspaceInfo {
+        self.inner.state.lock().await.manifest().info()
+    }
+
+    /// Rename or re-describe the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` unless this node
+    /// is an admin.
+    pub async fn set_info(&self, info: WorkspaceInfo) -> Result<(), WorkspaceError> {
+        self.drive(Event::SetInfo { info }).await
+    }
+
+    // ---- files -------------------------------------------------------------
+
+    /// Create a document and record it in the manifest.
+    ///
+    /// The returned UUID, not the path, is what identifies the document from
+    /// here on: renaming changes only a manifest field, leaving every stored
+    /// chunk exactly where it is.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and manifest failures.
+    pub async fn create_file(
+        &self,
+        path: &str,
+        mime_type: &str,
+    ) -> Result<DocumentUuid, WorkspaceError> {
+        let uuid = DocumentUuid::generate(&mut rand::rngs::OsRng);
+        self.drive(Event::UpsertFile {
+            entry: FileEntry {
+                uuid,
+                logical_path: path.to_string(),
+                mime_type: mime_type.to_string(),
+            },
+        })
+        .await?;
+        Ok(uuid)
+    }
+
+    /// Record or replace a document's metadata.
     ///
     /// Logical paths live only here, never in `iroh-docs`, which sees a blinded
     /// 32-byte key and nothing else.
@@ -553,12 +715,98 @@ impl Workspace {
     ///
     /// Propagates encryption and manifest failures.
     pub async fn upsert_file(&self, entry: FileEntry) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(Event::UpsertFile { entry }, &mut rand::rngs::OsRng)?
-        };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+        self.drive(Event::UpsertFile { entry }).await
+    }
+
+    /// Every document the manifest records, with its logical path.
+    pub async fn files(&self) -> Vec<FileEntry> {
+        self.inner.state.lock().await.manifest().files()
+    }
+
+    /// Resolve a logical path to the document it names.
+    pub async fn resolve(&self, path: &str) -> Option<DocumentUuid> {
+        self.inner.state.lock().await.manifest().resolve_path(path)
+    }
+
+    /// A document's current text as this node sees it.
+    pub async fn read(&self, doc: DocumentUuid) -> String {
+        self.inner.state.lock().await.document_text(doc)
+    }
+
+    /// Read a document by its logical path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::NoSuchPath`] if the manifest has no such path.
+    pub async fn read_path(&self, path: &str) -> Result<String, WorkspaceError> {
+        let doc = self
+            .resolve(path)
+            .await
+            .ok_or_else(|| WorkspaceError::NoSuchPath(path.to_string()))?;
+        Ok(self.read(doc).await)
+    }
+
+    /// Append text to a document.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures.
+    pub async fn append(&self, doc: DocumentUuid, text: &str) -> Result<(), WorkspaceError> {
+        self.drive(Event::LocalEdit {
+            doc,
+            text: text.to_string(),
+        })
+        .await
+    }
+
+    /// Replace a document's entire contents.
+    ///
+    /// Diffed against the current text rather than cleared and rewritten, so a
+    /// one-word change stays a one-word change in the CRDT and still merges
+    /// with a concurrent edit elsewhere in the document.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures.
+    pub async fn write(&self, doc: DocumentUuid, text: &str) -> Result<(), WorkspaceError> {
+        self.drive(Event::WriteFile {
+            doc,
+            text: text.to_string(),
+        })
+        .await
+    }
+
+    /// Insert text at a character offset, clamped to the document's length.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures.
+    pub async fn insert(
+        &self,
+        doc: DocumentUuid,
+        pos: usize,
+        text: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.drive(Event::InsertText {
+            doc,
+            pos,
+            text: text.to_string(),
+        })
+        .await
+    }
+
+    /// Delete a range of text, clamped to what the document actually holds.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures.
+    pub async fn remove(
+        &self,
+        doc: DocumentUuid,
+        pos: usize,
+        len: usize,
+    ) -> Result<(), WorkspaceError> {
+        self.drive(Event::RemoveText { doc, pos, len }).await
     }
 
     /// Move or rename a document.
@@ -571,51 +819,71 @@ impl Workspace {
     /// Returns [`WorkspaceError::Core`] wrapping `UnknownDocument` if the
     /// manifest has no such document.
     pub async fn rename(&self, doc: DocumentUuid, path: &str) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(
-                Event::RenameFile {
-                    doc,
-                    path: path.to_string(),
-                },
-                &mut rand::rngs::OsRng,
-            )?
-        };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+        self.drive(Event::RenameFile {
+            doc,
+            path: path.to_string(),
+        })
+        .await
     }
 
-    /// Assign a role to a member.
+    /// Delete a document from the workspace.
     ///
-    /// Demoting an admin who stays in the workspace is a pure manifest edit
-    /// with no key rotation; removing them entirely also needs [`Self::revoke`].
+    /// **Not erasure.** It withdraws this node's index entry and tombstones the
+    /// manifest record, so the document disappears from every peer's view as
+    /// they observe it. It cannot remove the plaintext from the disk of anyone
+    /// who already synced it, and `iroh-docs` deletion is per author, so each
+    /// member withdraws their own entry as they process the tombstone.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` if this node is
-    /// not an admin, or `LastAdmin` if the change would leave none.
-    pub async fn set_role(&self, member: MemberId, role: Role) -> Result<(), WorkspaceError> {
-        let effects = {
-            let mut state = self.inner.state.lock().await;
-            state.handle(
-                Event::SetRole {
-                    member: member.to_bytes(),
-                    role,
-                },
-                &mut rand::rngs::OsRng,
-            )?
-        };
-        apply_effects(&self.inner, effects).await;
-        Ok(())
+    /// Returns [`WorkspaceError::Core`] wrapping `UnknownDocument` if the
+    /// manifest has no such document.
+    pub async fn delete_file(&self, doc: DocumentUuid) -> Result<(), WorkspaceError> {
+        self.drive(Event::DeleteFile { doc }).await
     }
 
-    /// The document's current text as this node sees it.
-    pub async fn text(&self) -> String {
-        self.inner
-            .state
-            .lock()
-            .await
-            .document_text(self.inner.document)
+    // ---- maintenance -------------------------------------------------------
+
+    /// Rotate this device's leaf key, re-keying its path to the root.
+    ///
+    /// This is the post-compromise security primitive, and the reason BeeKEM is
+    /// here rather than a static group key: an attacker holding this device's
+    /// old leaf secret can derive no group key produced after the rotation.
+    /// Recovery from a compromise is therefore something a member can do
+    /// unilaterally, without the group re-forming around them.
+    ///
+    /// Needs no administrative role — rotating your own key harms nobody, and
+    /// requiring permission to recover from a compromise would be backwards.
+    ///
+    /// # Errors
+    ///
+    /// Propagates CGKA failures.
+    pub async fn rotate(&self) -> Result<(), WorkspaceError> {
+        self.drive(Event::Rotate).await
+    }
+
+    /// Re-publish every document's current state under the current epoch key.
+    ///
+    /// Two distinct jobs, both necessary:
+    ///
+    /// * **Granting a new member access to existing content.** A joiner
+    ///   reconstructs the group from the operation log, but not the historical
+    ///   PCS keys, so they *cannot* decrypt anything written before they were
+    ///   admitted. That is forward secrecy working as intended, not a defect.
+    ///   Re-publishing after an invite re-encrypts current state under a key the
+    ///   new member can derive.
+    /// * **Anti-entropy.** A chunk lost in transit has no later chunk to carry
+    ///   its content until someone edits again; a periodic re-announcement
+    ///   closes that gap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures.
+    pub async fn resync(&self) -> Result<(), WorkspaceError> {
+        for doc in self.files().await.into_iter().map(|f| f.uuid) {
+            self.drive(Event::Resync { doc }).await?;
+        }
+        Ok(())
     }
 
     /// Chunks parked awaiting key material or CRDT dependencies.
@@ -628,30 +896,39 @@ impl Workspace {
         self.inner.state.lock().await.group_size()
     }
 
-    /// Diagnostic: how many index entries exist under this workspace's key,
-    /// and how many of their payloads are locally available.
+    /// Diagnostic: how many index entries exist across this workspace's
+    /// documents, and how many of their payloads are locally available.
     pub async fn index_status(&self) -> (usize, usize) {
-        let key = self.inner.secret.storage_key(self.inner.document);
-        let Ok(entries) = self
-            .inner
-            .doc
-            .get_many(Query::key_exact(Bytes::copy_from_slice(key.as_bytes())))
+        let mut keys: Vec<[u8; 32]> = self
+            .files()
             .await
-        else {
-            return (0, 0);
-        };
-        let mut entries = std::pin::pin!(entries);
+            .into_iter()
+            .map(|f| *self.inner.secret.storage_key(f.uuid).as_bytes())
+            .collect();
+        keys.push(*self.inner.secret.manifest_key().as_bytes());
+
         let (mut total, mut local) = (0, 0);
-        while let Some(Ok(entry)) = entries.next().await {
-            total += 1;
-            if self
+        for key in keys {
+            let Ok(entries) = self
                 .inner
-                .blobs
-                .get_bytes(entry.content_hash())
+                .doc
+                .get_many(Query::key_exact(Bytes::copy_from_slice(&key)))
                 .await
-                .is_ok()
-            {
-                local += 1;
+            else {
+                continue;
+            };
+            let mut entries = std::pin::pin!(entries);
+            while let Some(Ok(entry)) = entries.next().await {
+                total += 1;
+                if self
+                    .inner
+                    .blobs
+                    .get_bytes(entry.content_hash())
+                    .await
+                    .is_ok()
+                {
+                    local += 1;
+                }
             }
         }
         (total, local)
@@ -821,20 +1098,26 @@ async fn send_log(inner: &Inner) {
     }
 }
 
-/// Re-encrypt and re-announce the current document state.
+/// Re-encrypt and re-announce every document this node knows about.
 async fn republish(inner: &Inner) {
-    let effects = {
-        let mut state = inner.state.lock().await;
+    let docs: Vec<DocumentUuid> = {
+        let state = inner.state.lock().await;
         state
-            .handle(
-                Event::Resync {
-                    doc: inner.document,
-                },
-                &mut rand::rngs::OsRng,
-            )
-            .unwrap_or_default()
+            .manifest()
+            .files()
+            .into_iter()
+            .map(|f| f.uuid)
+            .collect()
     };
-    apply_effects(inner, effects).await;
+    for doc in docs {
+        let effects = {
+            let mut state = inner.state.lock().await;
+            state
+                .handle(Event::Resync { doc }, &mut rand::rngs::OsRng)
+                .unwrap_or_default()
+        };
+        apply_effects(inner, effects).await;
+    }
 }
 
 /// Perform the effects the core asked for.
@@ -858,6 +1141,25 @@ async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
             Effect::StoreManifest { key, chunk } => {
                 if let Err(err) = store_chunk(inner, key.as_bytes(), &chunk).await {
                     tracing::error!(%err, "failed to store the encrypted manifest");
+                }
+            }
+            Effect::DeleteEntry { key, .. } => {
+                // Withdraws only *our* entry: `Doc::del` is scoped to an author,
+                // so each member must retract their own as they observe the
+                // manifest tombstone. Forget every cached hash under this key
+                // too, or a document later recreated at the same UUID would be
+                // skipped as unchanged.
+                inner
+                    .seen_entries
+                    .lock()
+                    .await
+                    .retain(|(k, _), _| k != key.as_bytes());
+                if let Err(err) = inner
+                    .doc
+                    .del(inner.author, Bytes::copy_from_slice(key.as_bytes()))
+                    .await
+                {
+                    tracing::error!(%err, "failed to withdraw an index entry");
                 }
             }
             Effect::Applied { .. } | Effect::ManifestUpdated => {}
@@ -915,19 +1217,33 @@ async fn ingest_all(inner: &Inner) {
         apply_effects(inner, effects).await;
     }
 
-    let key = inner.secret.storage_key(inner.document);
-    for chunk in fetch_chunks(inner, key.as_bytes(), true).await {
-        let effects = {
-            let mut state = inner.state.lock().await;
-            report_rejection(state.handle(
-                Event::ChunkArrived {
-                    doc: inner.document,
-                    chunk: Box::new(chunk),
-                },
-                &mut rand::rngs::OsRng,
-            ))
-        };
-        apply_effects(inner, effects).await;
+    // Now every document the manifest knows about. Reading the list *after*
+    // ingesting the manifest matters: a document created by a peer becomes
+    // visible on the same pass that learns of it, rather than the next one.
+    let docs: Vec<DocumentUuid> = {
+        let state = inner.state.lock().await;
+        state
+            .manifest()
+            .files()
+            .into_iter()
+            .map(|f| f.uuid)
+            .collect()
+    };
+    for doc in docs {
+        let key = inner.secret.storage_key(doc);
+        for chunk in fetch_chunks(inner, key.as_bytes(), true).await {
+            let effects = {
+                let mut state = inner.state.lock().await;
+                report_rejection(state.handle(
+                    Event::ChunkArrived {
+                        doc,
+                        chunk: Box::new(chunk),
+                    },
+                    &mut rand::rngs::OsRng,
+                ))
+            };
+            apply_effects(inner, effects).await;
+        }
     }
 }
 
@@ -961,8 +1277,8 @@ async fn fetch_chunks(
 
     let mut chunks = Vec::new();
     while let Some(Ok(entry)) = entries.next().await {
+        let author = entry.author().to_bytes();
         if check_author {
-            let author = entry.author().to_bytes();
             // Our own entries always pass: we have not necessarily read back
             // our own author claim from the manifest yet, and refusing our own
             // writes would be a startup deadlock.
@@ -980,9 +1296,22 @@ async fn fetch_chunks(
                 continue;
             }
         }
-        if let Ok(bytes) = inner.blobs.get_bytes(entry.content_hash()).await
+        // Skip anything already ingested. `ingest_all` re-reads every entry on
+        // every sync event, and with several documents that is a fetch and a
+        // decrypt per document per event for content that has usually not
+        // moved. The hash is what changed or did not, so it is what to compare.
+        let hash = entry.content_hash();
+        if inner.seen_entries.lock().await.get(&(*key, author)) == Some(&hash) {
+            continue;
+        }
+        // Recorded only once the payload is genuinely in hand. An index entry
+        // routinely arrives before its blob, and marking it seen on sight would
+        // make the `ContentReady` event that finally delivers the content skip
+        // it as unchanged — losing that content for good.
+        if let Ok(bytes) = inner.blobs.get_bytes(hash).await
             && let Ok(chunk) = decode_chunk(&bytes)
         {
+            inner.seen_entries.lock().await.insert((*key, author), hash);
             chunks.push(chunk);
         }
     }

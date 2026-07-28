@@ -37,5 +37,5 @@ pub use blinding::{DocumentUuid, StorageKey, WorkspaceSecret};
 pub use content::{Chunk, ChunkRef};
 pub use error::CoreError;
 pub use keys::{CgkaController, ControlOp, MergeOutcome};
-pub use manifest::{FileEntry, Manifest, Role};
+pub use manifest::{DeviceRecord, FileEntry, Manifest, Role, UserRecord, WorkspaceInfo};
 pub use state::{Effect, Event, WorkspaceState};

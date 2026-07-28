@@ -16,6 +16,23 @@
 //! The manifest is a Loro document, so two peers who edit it concurrently while
 //! partitioned converge without a coordinator.
 //!
+//! # Users and devices
+//!
+//! A CGKA leaf is a *device*, not a person. Sharing one leaf across a person's
+//! laptop and phone is not merely untidy, it is unsound: rotating a leaf
+//! replaces the local secret, so two devices rotating the same leaf concurrently
+//! issue conflicting updates for it. Each device therefore holds its own leaf,
+//! and [`Manifest::set_device`] records which user it belongs to.
+//!
+//! **Roles attach to users, not devices** — a laptop that is an admin while its
+//! owner's phone is a viewer is a distinction nobody wants to reason about. Use
+//! [`Manifest::role_of_member`] to resolve a device to its owner's role;
+//! [`Manifest::role_of`] takes a *user* id.
+//!
+//! A user id is the member id of that user's founding device. It needs no new
+//! key material and is stable for the user's lifetime, even after the founding
+//! device is itself removed.
+//!
 //! # Trust boundary
 //!
 //! Roles are advisory against a *cryptographically* capable member: anyone
@@ -23,6 +40,20 @@
 //! a well-behaved peer will accept, not what a malicious one can read. Genuine
 //! read revocation is a CGKA removal; see
 //! [`CgkaController::remove_member`](crate::keys::CgkaController::remove_member).
+//!
+//! The same boundary applies to the device-to-user binding, and it is worth
+//! stating explicitly because the consequence is sharper. The manifest is a
+//! CRDT that merges unconditionally, so a *malicious* member can write a record
+//! claiming their device belongs to an admin's user and every replica will
+//! merge it. What stops that being a privilege escalation is not this module —
+//! it is that the check runs before a well-behaved node acts, and that reading
+//! anything at all still requires a leaf the CGKA granted.
+//!
+//! Closing it properly means making the binding self-certifying: a signature by
+//! an existing device of that user, chained to the founder, who *is*
+//! cryptographically identified by the CGKA's init-add operation. That is a
+//! genuine trust root and the natural next step, but it is a certificate scheme
+//! rather than a map lookup, and it is not what this module does today.
 
 use std::fmt::Write as _;
 
@@ -33,8 +64,26 @@ use crate::{blinding::DocumentUuid, error::CoreError};
 
 /// Root container holding document metadata, keyed by hex document UUID.
 const FILES_CONTAINER: &str = "files";
-/// Root container holding role assignments, keyed by hex member id.
+/// Root container holding role assignments, keyed by hex **user** id.
+///
+/// Keyed by user rather than by device so that a person's laptop and phone
+/// cannot hold different permissions; see [`Manifest::role_of_member`].
 const ROLES_CONTAINER: &str = "roles";
+
+/// Root container holding user records, keyed by hex user id.
+const USERS_CONTAINER: &str = "users";
+
+/// Root container holding device records, keyed by hex member id.
+///
+/// This is the mapping that makes a CGKA leaf attributable to a person. It is
+/// written by whoever admits the device — an admin for a new user's first
+/// device, an existing device of the same user for subsequent ones — and never
+/// by the device itself, since a self-attested claim of "I belong to Alice"
+/// would inherit Alice's role.
+const DEVICES_CONTAINER: &str = "devices";
+
+/// Root container holding workspace-level metadata: name and description.
+const META_CONTAINER: &str = "meta";
 
 /// Root container mapping hex data-plane author id to hex CGKA member id.
 ///
@@ -92,6 +141,44 @@ impl Role {
     }
 }
 
+/// One person in the workspace.
+///
+/// The `id` is the member id of this user's founding device; see the module
+/// documentation for why that identifier rather than a fresh random one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRecord {
+    /// Stable identifier for this user.
+    pub id: [u8; 32],
+    /// Human-readable name, for display only.
+    pub display_name: String,
+}
+
+/// One device belonging to a user, holding exactly one CGKA leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRecord {
+    /// This device's CGKA member id — its leaf in the tree.
+    pub member: [u8; 32],
+    /// The user this device belongs to.
+    pub user: [u8; 32],
+    /// This device's `iroh` endpoint id, once it has announced one.
+    ///
+    /// Self-attested, and safe to be: claiming an endpoint id grants nothing on
+    /// its own, because a peer is admitted only when the *member* holding it is
+    /// one the group already accepted.
+    pub endpoint_id: Option<[u8; 32]>,
+    /// Human-readable label, for display only.
+    pub label: String,
+}
+
+/// Workspace-level metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    /// Human-readable workspace name.
+    pub name: String,
+    /// Longer description, if any.
+    pub description: String,
+}
+
 /// Metadata for one logical document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -134,6 +221,11 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex_16(raw: &str) -> Option<[u8; 16]> {
+    let bytes = unhex(raw)?;
+    bytes.try_into().ok()
+}
+
+fn unhex_32(raw: &str) -> Option<[u8; 32]> {
     let bytes = unhex(raw)?;
     bytes.try_into().ok()
 }
@@ -184,6 +276,215 @@ impl Manifest {
         self.doc.get_map(AUTHORS_CONTAINER)
     }
 
+    fn users_map(&self) -> LoroMap {
+        self.doc.get_map(USERS_CONTAINER)
+    }
+
+    fn devices_map(&self) -> LoroMap {
+        self.doc.get_map(DEVICES_CONTAINER)
+    }
+
+    fn meta_map(&self) -> LoroMap {
+        self.doc.get_map(META_CONTAINER)
+    }
+
+    /// Read one string field from a nested container in `map`.
+    ///
+    /// Nested records must be resolved as containers rather than read from the
+    /// shallow `get_value()` snapshot, which is easy to get wrong once and then
+    /// copy; this keeps it in one place.
+    fn nested_field(map: &LoroMap, key: &str, field: &str) -> Option<String> {
+        let node = map.get(key)?.into_container().ok()?.into_map().ok()?;
+        node.get(field)?
+            .into_value()
+            .ok()?
+            .into_string()
+            .ok()
+            .map(|s| s.to_string())
+    }
+
+    /// Record or replace this workspace's name and description.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the Loro write fails.
+    pub fn set_info(&self, info: &WorkspaceInfo) -> Result<(), CoreError> {
+        let meta = self.meta_map();
+        meta.insert("name", info.name.as_str())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        meta.insert("description", info.description.as_str())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// This workspace's name and description, empty until one is set.
+    #[must_use]
+    pub fn info(&self) -> WorkspaceInfo {
+        let meta = self.meta_map();
+        let get = |field: &str| -> String {
+            meta.get(field)
+                .and_then(|v| v.into_value().ok())
+                .and_then(|v| v.into_string().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        };
+        WorkspaceInfo {
+            name: get("name"),
+            description: get("description"),
+        }
+    }
+
+    /// Record or replace a user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the Loro write fails.
+    pub fn set_user(&self, user: &[u8; 32], display_name: &str) -> Result<(), CoreError> {
+        let node = self
+            .users_map()
+            .insert_container(&hex(user), LoroMap::new())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        node.insert("display_name", display_name)
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Look up one user.
+    #[must_use]
+    pub fn user(&self, user: &[u8; 32]) -> Option<UserRecord> {
+        let display_name = Self::nested_field(&self.users_map(), &hex(user), "display_name")?;
+        Some(UserRecord {
+            id: *user,
+            display_name,
+        })
+    }
+
+    /// Every recorded user, in arbitrary order.
+    #[must_use]
+    pub fn users(&self) -> Vec<UserRecord> {
+        let mut out = Vec::new();
+        let users = self.users_map();
+        users.for_each(|key, _| {
+            let Some(id) = unhex_32(key) else { return };
+            if let Some(record) = self.user(&id) {
+                out.push(record);
+            }
+        });
+        out
+    }
+
+    /// Bind a device's CGKA leaf to the user who owns it.
+    ///
+    /// **Not self-attestation.** Unlike [`Self::set_author`], this must be
+    /// written by whoever admits the device — an admin for a user's first
+    /// device, an existing device of the same user thereafter — because a
+    /// device that could name its own user would inherit that user's role. The
+    /// caller is responsible for that check; see `WorkspaceState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the Loro write fails.
+    pub fn set_device(
+        &self,
+        member: &[u8; 32],
+        user: &[u8; 32],
+        label: &str,
+    ) -> Result<(), CoreError> {
+        let node = self
+            .devices_map()
+            .insert_container(&hex(member), LoroMap::new())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        node.insert("user", hex(user).as_str())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        node.insert("label", label)
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Record this device's `iroh` endpoint id.
+    ///
+    /// Self-attested, and safe to be: an endpoint id grants nothing on its own,
+    /// since a peer is admitted only when the member holding it is one the
+    /// group already accepted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::UnknownDevice`] if no record binds this member yet,
+    /// or [`CoreError::Manifest`] if the Loro write fails.
+    pub fn set_device_endpoint(
+        &self,
+        member: &[u8; 32],
+        endpoint_id: &[u8; 32],
+    ) -> Result<(), CoreError> {
+        let node = self
+            .devices_map()
+            .get(&hex(member))
+            .and_then(|v| v.into_container().ok())
+            .and_then(|c| c.into_map().ok())
+            .ok_or(CoreError::UnknownDevice)?;
+        node.insert("endpoint_id", hex(endpoint_id).as_str())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Look up one device.
+    #[must_use]
+    pub fn device(&self, member: &[u8; 32]) -> Option<DeviceRecord> {
+        let devices = self.devices_map();
+        let key = hex(member);
+        let user = Self::nested_field(&devices, &key, "user").and_then(|s| unhex_32(&s))?;
+        Some(DeviceRecord {
+            member: *member,
+            user,
+            endpoint_id: Self::nested_field(&devices, &key, "endpoint_id")
+                .and_then(|s| unhex_32(&s)),
+            label: Self::nested_field(&devices, &key, "label").unwrap_or_default(),
+        })
+    }
+
+    /// Every recorded device, in arbitrary order.
+    #[must_use]
+    pub fn devices(&self) -> Vec<DeviceRecord> {
+        let mut out = Vec::new();
+        let devices = self.devices_map();
+        devices.for_each(|key, _| {
+            let Some(member) = unhex_32(key) else { return };
+            if let Some(record) = self.device(&member) {
+                out.push(record);
+            }
+        });
+        out
+    }
+
+    /// Every device belonging to one user.
+    #[must_use]
+    pub fn devices_of(&self, user: &[u8; 32]) -> Vec<DeviceRecord> {
+        self.devices()
+            .into_iter()
+            .filter(|d| d.user == *user)
+            .collect()
+    }
+
+    /// The user a device belongs to, if a record binds it.
+    #[must_use]
+    pub fn user_of(&self, member: &[u8; 32]) -> Option<[u8; 32]> {
+        self.device(member).map(|d| d.user)
+    }
+
+    /// The role a *device* acts under: its owner's role.
+    ///
+    /// Distinct from [`Self::role_of`], which takes a user id. A device with no
+    /// record yet resolves to `None` rather than to some default, so callers can
+    /// tell "not yet synced" apart from "explicitly has no permissions".
+    #[must_use]
+    pub fn role_of_member(&self, member: &[u8; 32]) -> Option<Role> {
+        self.role_of(&self.user_of(member)?)
+    }
+
     /// Record that `author` is the data-plane identity of `member`.
     ///
     /// # Errors
@@ -210,9 +511,10 @@ impl Manifest {
 
     /// Whether an entry signed by `author` should be accepted.
     ///
-    /// Requires *both* halves: a member must have claimed the author id, and an
-    /// admin must have given that member a role that can write. An unclaimed
-    /// author, or a claimed one belonging to a viewer, fails.
+    /// Requires *all three* links: a member must have claimed the author id, a
+    /// record must bind that member's device to a user, and an admin must have
+    /// given that user a role that can write. An unclaimed author, an
+    /// unattributed device, or a viewer's device all fail.
     ///
     /// This is advisory in the same sense as every other role check — it
     /// constrains what a well-behaved peer accepts, not what a peer holding the
@@ -220,7 +522,7 @@ impl Manifest {
     #[must_use]
     pub fn author_may_write(&self, author: &[u8; 32]) -> bool {
         self.member_for_author(author)
-            .and_then(|member| self.role_of(&member))
+            .and_then(|member| self.role_of_member(&member))
             .is_some_and(Role::can_write)
     }
 
@@ -261,6 +563,32 @@ impl Manifest {
             .into_map()
             .map_err(|_| CoreError::Manifest("files entry is not a map".into()))?;
         node.insert("logical_path", new_path)
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Remove a document from the index.
+    ///
+    /// A CRDT tombstone, so it converges: a peer that concurrently renamed the
+    /// document sees the deletion win or lose deterministically, rather than
+    /// the two replicas disagreeing.
+    ///
+    /// This removes the document from the *workspace*. It does not erase it
+    /// from the disk of any member who already synced it, and it cannot: they
+    /// hold the plaintext already.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::UnknownDocument`] if no such document is recorded.
+    pub fn delete_file(&self, uuid: DocumentUuid) -> Result<(), CoreError> {
+        let files = self.files_map();
+        let key = hex(&uuid.0);
+        if files.get(&key).is_none() {
+            return Err(CoreError::UnknownDocument);
+        }
+        files
+            .delete(&key)
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
         self.doc.commit();
         Ok(())
@@ -307,31 +635,34 @@ impl Manifest {
             .map(|f| f.uuid)
     }
 
-    /// Assign a role to a member.
+    /// Assign a role to a **user**.
+    ///
+    /// Takes a user id, not a device's member id — a person's devices all act
+    /// under one role. Use [`Self::role_of_member`] to go the other way.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Manifest`] if the Loro write fails.
-    pub fn set_role(&self, member: &[u8; 32], role: Role) -> Result<(), CoreError> {
+    pub fn set_role(&self, user: &[u8; 32], role: Role) -> Result<(), CoreError> {
         self.roles_map()
-            .insert(&hex(member), role.as_str())
+            .insert(&hex(user), role.as_str())
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
         self.doc.commit();
         Ok(())
     }
 
-    /// The role assigned to a member, if any.
+    /// The role assigned to a **user**, if any.
     #[must_use]
-    pub fn role_of(&self, member: &[u8; 32]) -> Option<Role> {
+    pub fn role_of(&self, user: &[u8; 32]) -> Option<Role> {
         self.roles_map()
-            .get(&hex(member))
+            .get(&hex(user))
             .and_then(|v| v.into_value().ok())
             .and_then(|v| v.as_string().map(|s| s.to_string()))
             .as_deref()
             .and_then(Role::from_str)
     }
 
-    /// Every role assignment, in arbitrary order.
+    /// Every role assignment, keyed by user, in arbitrary order.
     #[must_use]
     pub fn roles(&self) -> Vec<([u8; 32], Role)> {
         let mut out = Vec::new();
@@ -352,7 +683,11 @@ impl Manifest {
         out
     }
 
-    /// How many admins the workspace currently has.
+    /// How many admin *users* the workspace currently has.
+    ///
+    /// Counted per user, not per device: a person with three devices is one
+    /// administrator, and counting leaves would let the last admin be removed
+    /// while the count still looked healthy.
     ///
     /// Callers should refuse to demote or remove the last admin; losing every
     /// admin leaves a workspace that nobody can ever administer again.

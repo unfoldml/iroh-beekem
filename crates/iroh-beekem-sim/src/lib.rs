@@ -24,14 +24,15 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, marker::PhantomData, sync::Arc, time::Duration};
 
 use beekem::{
     id::{MemberId, TreeId},
     operation::CgkaOperation,
 };
 use iroh_beekem_core::{
-    CgkaController, Chunk, DocumentUuid, Effect, Event, WorkspaceSecret, WorkspaceState,
+    CgkaController, Chunk, DocumentUuid, Effect, Event, Role, StorageKey, WorkspaceSecret,
+    WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -157,14 +158,35 @@ pub enum Msg {
     },
     /// Control plane: a signed CGKA operation.
     Op(Box<Signed<CgkaOperation>>),
-    /// Data plane: an encrypted content chunk.
-    Chunk(Box<Chunk>),
-    /// Data plane: an encrypted manifest replica.
+    /// Data plane: one entry in the replicated index.
     ///
-    /// Carried separately from [`Msg::Chunk`] because it lands at the manifest's
-    /// well-known key rather than a document's, and because a receiver must not
-    /// try to import it into a CRDT document.
-    Manifest(Box<Chunk>),
+    /// Carries the *blinded key* rather than a document id, because that is all
+    /// `iroh-docs` ever sees and all a receiver ever gets. Working out which
+    /// document an entry belongs to — or that it belongs to none this node
+    /// knows about — is the receiver's job, exactly as it is in the real
+    /// `ingest_all`. Modelling it any other way would hand the receiver
+    /// information the wire does not carry, and would make it impossible to ask
+    /// what a node can *see* as distinct from what it can *read*.
+    Entry {
+        /// The blinded key this entry is stored under.
+        key: StorageKey,
+        /// Which node wrote it.
+        author: NodeId,
+        /// The ciphertext.
+        chunk: Box<Chunk>,
+    },
+}
+
+/// What a node can observe about an index entry without decrypting it.
+///
+/// This is the whole of the metadata the data plane leaks: who wrote it, how
+/// big it is, and that it exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryMeta {
+    /// Which node wrote the entry.
+    pub author: NodeId,
+    /// Ciphertext length.
+    pub size: usize,
 }
 
 /// Timers a node arms for itself.
@@ -207,6 +229,15 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     me: u64,
     /// Text this node has contributed locally, for convergence assertions.
     contributed: Vec<String>,
+    /// The modelled `iroh-docs` replica: every entry this node can see.
+    ///
+    /// Deliberately separate from [`WorkspaceState`], which holds only what this
+    /// node could *decrypt*. Keeping the two apart is what lets a property
+    /// distinguish "cannot read the content" from "cannot even tell the content
+    /// exists" — and a revoked member is supposed to be denied both.
+    index: BTreeMap<StorageKey, EntryMeta>,
+    /// Control-plane operations seen, whether or not they applied.
+    observed_ops: u64,
     _scenario: PhantomData<S>,
 }
 
@@ -297,6 +328,39 @@ impl<S: Scenario> WorkspaceNode<S> {
         &self.contributed
     }
 
+    /// Every blinded key this node has seen an entry under.
+    ///
+    /// This is *visibility*, not readability. A node appears here for content it
+    /// could never decrypt, which is the point: "cannot read the file" and
+    /// "cannot tell the file exists" are different guarantees, and a removed
+    /// member is meant to be denied both.
+    #[must_use]
+    pub fn observed_keys(&self) -> Vec<StorageKey> {
+        self.index.keys().copied().collect()
+    }
+
+    /// How many entries this node can see in the modelled replica.
+    #[must_use]
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// What this node can observe about one entry, if it has seen it.
+    #[must_use]
+    pub fn entry(&self, key: &StorageKey) -> Option<EntryMeta> {
+        self.index.get(key).copied()
+    }
+
+    /// How many control-plane operations this node has seen.
+    ///
+    /// Counts arrivals, not applications: a revoked member that still receives
+    /// broadcasts is still learning who joined and who left, whether or not it
+    /// can do anything with them.
+    #[must_use]
+    pub fn observed_ops(&self) -> u64 {
+        self.observed_ops
+    }
+
     /// How many members this node believes are in the group.
     #[must_use]
     pub fn group_size(&self) -> u32 {
@@ -314,20 +378,72 @@ impl<S: Scenario> WorkspaceNode<S> {
         });
     }
 
+    /// Record an entry in the modelled replica.
+    ///
+    /// Recorded whether or not it can ever be decrypted: seeing an entry is a
+    /// separate capability from reading it, and conflating the two is what made
+    /// "a removed member should not see files" impossible to state.
+    fn observe(&mut self, key: StorageKey, author: NodeId, chunk: &Chunk) {
+        self.index.insert(
+            key,
+            EntryMeta {
+                author,
+                size: chunk.ciphertext.len(),
+            },
+        );
+    }
+
+    /// Handle an arriving index entry.
+    ///
+    /// The wire carries a blinded key and nothing else, so this has to work out
+    /// what the entry *is* the same way the real `ingest_all` does: by comparing
+    /// against the keys it can derive. An entry under a key this node cannot
+    /// place is still recorded — it can see that something exists — but there is
+    /// nothing to apply it to.
+    fn on_entry(
+        &mut self,
+        key: StorageKey,
+        author: NodeId,
+        chunk: Box<Chunk>,
+        cx: &mut dyn Ctx<Self>,
+        salt: u64,
+    ) {
+        self.observe(key, author, &chunk);
+        let secret = WorkspaceSecret::new(workspace_secret_bytes());
+        if key == secret.manifest_key() {
+            self.drive(Event::ManifestArrived { chunk }, cx, salt);
+        } else if key == secret.storage_key(DOC) {
+            self.drive(Event::ChunkArrived { doc: DOC, chunk }, cx, salt);
+        }
+    }
+
     /// Feed an event to the local state machine, gossiping whatever it emits.
     fn drive(&mut self, event: Event, cx: &mut dyn Ctx<Self>, salt: u64) {
+        let me = cx.me();
         let Some(state) = self.state.as_mut() else {
             return;
         };
-        let mut rng = node_rng(cx.me(), salt);
+        let mut rng = node_rng(me, salt);
         let Ok(effects) = state.handle(event, &mut rng) else {
             return;
         };
         for effect in effects {
             match effect {
                 Effect::BroadcastOp(op) => cx.broadcast(Msg::Op(op)),
-                Effect::StoreChunk { chunk, .. } => cx.broadcast(Msg::Chunk(chunk)),
-                Effect::StoreManifest { chunk, .. } => cx.broadcast(Msg::Manifest(chunk)),
+                Effect::StoreChunk { key, chunk, .. } | Effect::StoreManifest { key, chunk } => {
+                    // Recorded locally as well as broadcast: a node sees its own
+                    // writes in its own index, exactly as it would after writing
+                    // them into `iroh-docs`.
+                    self.observe(key, me, &chunk);
+                    cx.broadcast(Msg::Entry {
+                        key,
+                        author: me,
+                        chunk,
+                    });
+                }
+                Effect::DeleteEntry { key, .. } => {
+                    self.index.remove(&key);
+                }
                 // Purely local; nothing to tell the network about.
                 Effect::Applied { .. } | Effect::ManifestUpdated => {}
             }
@@ -338,9 +454,11 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn flush_inbox(&mut self, cx: &mut dyn Ctx<Self>) {
         for msg in std::mem::take(&mut self.inbox) {
             match msg {
-                Msg::Op(op) => self.drive(Event::ControlOp(Arc::new(*op)), cx, 0),
-                Msg::Chunk(chunk) => self.drive(Event::ChunkArrived { doc: DOC, chunk }, cx, 0),
-                Msg::Manifest(chunk) => self.drive(Event::ManifestArrived { chunk }, cx, 0),
+                Msg::Op(op) => {
+                    self.observed_ops += 1;
+                    self.drive(Event::ControlOp(Arc::new(*op)), cx, 0);
+                }
+                Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 0),
                 // Join-protocol messages; by the time we flush, joining is done.
                 Msg::Hello { .. } | Msg::Welcome { .. } => {}
             }
@@ -376,7 +494,18 @@ impl<S: Scenario> WorkspaceNode<S> {
         if cx.me().0 != FOUNDER {
             return;
         }
-        self.drive(Event::AddMember { member, share_key }, cx, 1);
+        // Each simulated node is one device belonging to one person, so a join
+        // admits a new user rather than enrolling a device onto an existing one.
+        self.drive(
+            Event::AddUser {
+                member,
+                share_key,
+                role: Role::Editor,
+                display_name: format!("node-{}", from.0),
+            },
+            cx,
+            1,
+        );
 
         let Some(state) = self.state.as_ref() else {
             return;
@@ -467,9 +596,14 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 // permanently undecryptable.
                 self.inbox.push(other);
             }
-            Msg::Op(op) => self.drive(Event::ControlOp(Arc::new(*op)), cx, 2),
-            Msg::Chunk(chunk) => self.drive(Event::ChunkArrived { doc: DOC, chunk }, cx, 3),
-            Msg::Manifest(chunk) => self.drive(Event::ManifestArrived { chunk }, cx, 6),
+            Msg::Op(op) => {
+                // Counted before merging, and regardless of the outcome: this is
+                // what the node *saw* on the control plane, which is the
+                // question the revocation properties ask.
+                self.observed_ops += 1;
+                self.drive(Event::ControlOp(Arc::new(*op)), cx, 2);
+            }
+            Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 3),
         }
     }
 

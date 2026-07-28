@@ -21,6 +21,7 @@ ed25519-dalek.workspace = true
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 iroh = "1.0.3"
 iroh-blobs = "0.103.0"

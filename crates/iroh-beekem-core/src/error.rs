@@ -80,6 +80,22 @@ pub enum CoreError {
     #[error("no such document in the workspace manifest")]
     UnknownDocument,
 
+    /// The manifest has no record binding this device to a user.
+    ///
+    /// Usually means the record has not synced yet rather than that the device
+    /// is illegitimate — a joiner's manifest starts empty.
+    #[error("no such device in the workspace manifest")]
+    UnknownDevice,
+
+    /// A device tried to join a user it was not authorised to act for.
+    ///
+    /// Admitting a user's first device is an admin action; admitting a further
+    /// device for that user requires already holding one of them. Without this,
+    /// any member could bind a device of their own to an admin's user and
+    /// inherit the role.
+    #[error("not authorised to add a device to this user")]
+    NotThisUsersDevice,
+
     /// An administrative action was attempted by a member without the role.
     ///
     /// Advisory against a cryptographically capable member — anyone holding a
