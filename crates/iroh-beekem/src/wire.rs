@@ -14,6 +14,7 @@
 
 use beekem::operation::CgkaOperation;
 use iroh_beekem_core::{EpochId, RepairTarget};
+use iroh_docs::DocTicket;
 use keyhive_crypto::signed::Signed;
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,67 @@ pub enum ControlMsg {
         /// The epoch they cannot derive.
         epoch: EpochId,
     },
+    /// A rotation to a fresh replicated index.
+    ///
+    /// The `iroh-docs` write capability is all-or-nothing, so it cannot be
+    /// withdrawn from one holder: a removed device keeps syncing the index and
+    /// goes on observing entry existence, size, author and timing. Abandoning
+    /// the namespace for a new one is the only way to stop that.
+    ///
+    /// The capability travels **encrypted under the group key**, which is what
+    /// makes this work at all — a device removed before the rotation cannot
+    /// derive that key, so it cannot follow. The chunk is an ordinary
+    /// `Chunk` and is decrypted by the same path as any content.
+    ///
+    /// Carried on the control plane and not the data plane for the obvious
+    /// reason: the data plane is the thing being replaced, so a peer that has
+    /// not yet moved could not be told where to move to.
+    Namespace {
+        /// The generation being announced.
+        epoch: u32,
+        /// The encrypted capability.
+        chunk: Box<iroh_beekem_core::Chunk>,
+    },
+}
+
+/// How a namespace capability is encoded inside the encrypted announcement.
+///
+/// Both tickets travel together because the group key is a *group* key: beekem
+/// encrypts to the whole tree, so there is no way to hand writers one secret
+/// and viewers another. Each node picks the one its own role allows.
+///
+/// That is weaker than the invite path, where a viewer is handed a read ticket
+/// and never holds the write capability at all. The gap is real and is recorded
+/// in the README: a viewer who ignores their role gains write capability on the
+/// replica, and `Manifest::author_may_write` — not the capability — is what
+/// still rejects their entries. Closing it needs per-role key material the CGKA
+/// does not provide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamespaceCapability {
+    /// The ticket for members who may write.
+    pub write: DocTicket,
+    /// The ticket for members who may only read.
+    pub read: DocTicket,
+}
+
+impl NamespaceCapability {
+    /// Encode for encryption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Codec`] if serialization fails.
+    pub fn encode(&self) -> Result<Vec<u8>, WorkspaceError> {
+        postcard::to_stdvec(self).map_err(WorkspaceError::Codec)
+    }
+
+    /// Decode after decryption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Codec`] if the bytes are not a capability.
+    pub fn decode(bytes: &[u8]) -> Result<Self, WorkspaceError> {
+        postcard::from_bytes(bytes).map_err(WorkspaceError::Codec)
+    }
 }
 
 impl ControlMsg {

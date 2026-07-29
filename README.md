@@ -149,6 +149,37 @@ manifest that would authorise anyone, so `Invite.inviter` is admitted unconditio
 never pruned — a workspace whose inviter later leaves should not become unjoinable
 mid-handshake.
 
+### Removal abandons the namespace
+
+The CGKA revokes *reading*. It cannot revoke *watching*, because the `iroh-docs`
+write capability is all-or-nothing: every writer holds the same `NamespaceSecret`, so
+there is no per-member key to withdraw. A removed device therefore went on syncing the
+index — entry existence, size, author and timing for every document — and on receiving
+every control-plane broadcast, for as long as it cared to look.
+
+Removal now **rotates the namespace**, and the order is the security property:
+
+1. **Broadcast the CGKA `Remove` first.** This takes the leaf out of the tree.
+2. **Mint a fresh namespace** and encrypt its capability under the group key — which,
+   after step 1, is a key the removed device can no longer derive.
+3. **Announce it** on the control plane, since the data plane is the thing being replaced.
+4. **Re-publish everything** into it, and abandon the old one.
+
+Reversed, the removed device could still read the announcement and follow the group into
+the namespace the rotation existed to keep it out of. `NamespaceEpoch` orders on
+`(epoch, digest)` rather than on a bare counter: two admins removing different members
+concurrently both mint *n+1*, and without a total order computable from the values the
+group would split across two replicas with each half convinced it was current. The digest
+is recomputed from the decrypted capability, so a peer cannot win a tie by claiming a
+large one.
+
+A rotation is announced **once**, so unlike a document it has nothing behind it to carry
+a lost copy. Two mechanisms close that: `Event::ResyncNamespace` re-announces under the
+current epoch on the ordinary anti-entropy schedule, and `RepairTarget::Namespace` lets a
+member that cannot decrypt any of them ask for one keyed under a fresh epoch. Without
+them a single lost announcement strands a member on an abandoned replica — removed in
+effect, without anyone having removed them.
+
 ### Two DAGs must both be satisfied
 
 An arriving chunk applies only when the CGKA operation graph has caught up far enough to reach its PCS
@@ -179,12 +210,22 @@ not work left undone — but nor are they permanent: a user story that needs a d
 reason enough to revisit the choice underneath.
 
 1. **`iroh-docs` write capability is all-or-nothing.** Every writer holds the same `NamespaceSecret`,
-   so a revoked member keeps it and can still push entries into the replica. They cannot *read*
-   anything written after their removal — that is the CGKA — peers refuse their entries (see
-   `Manifest::author_may_write`), and once every peer has seen the removal the roster refuses
-   their connections outright. But a peer that has not yet merged the removal still accepts them,
-   so genuinely shutting off their writes needs a namespace rotation, which is not automatic.
-2. **A new member cannot read content written before they joined — until somebody re-encrypts it.**
+   so a revoked member keeps the one they were given. It is made worthless rather than withdrawn:
+   removal rotates to a namespace whose capability they never receive, so the replica they can
+   still write to is one nobody reconciles with. Between the removal and a peer merging it, that
+   peer still accepts their entries — eviction is eventual on both planes.
+2. **A rotation costs a full re-publish.** Every document is re-encrypted and re-announced into
+   the new namespace, and every member re-imports. This is expensive by construction and is the
+   right place to spend it: removal is rare, and the alternative is a removed device that keeps
+   watching. Superseded blobs in the abandoned namespace are not reclaimed until blob GC exists.
+3. **Viewers hold a write capability after a rotation, though not after an invite.** The
+   announcement carries both tickets and each node takes the one its role allows, because beekem
+   encrypts to the whole tree and cannot hand writers one secret and viewers another. A viewer who
+   ignores their role gains write capability on the replica; `Manifest::author_may_write` still
+   rejects their entries, which is the same guarantee trade-off 9 describes. `build_invite` does
+   better — a viewer is handed only a read ticket — and closing the gap needs per-role key material
+   the CGKA does not provide.
+4. **A new member cannot read content written before they joined — until somebody re-encrypts it.**
    They reconstruct the group from the operation log but not the historical PCS keys, which is
    forward secrecy working as intended. What makes the workspace usable anyway is re-encryption:
    `Workspace` re-publishes current state when a peer joins the overlay, and a peer that is *still*
@@ -194,23 +235,23 @@ reason enough to revisit the choice underneath.
    rather than an optimisation. The cost is one CGKA operation per genuinely stuck `(target, epoch)`,
    rate-limited per peer; content that was superseded before the join is never recovered, only
    current state is.
-3. **Timestamp quantization is not achievable with `iroh-docs` as the index.** `Doc::set_bytes`/`set_hash`
+5. **Timestamp quantization is not achievable with `iroh-docs` as the index.** `Doc::set_bytes`/`set_hash`
    do not accept a timestamp; `iroh-docs` sets it internally. Modification times leak to any syncing
    peer. This is a property of the index we chose, not of the problem.
-4. **Blinding hides names, not traffic.** Entry count, sizes, write frequency and author activity all
+6. **Blinding hides names, not traffic.** Entry count, sizes, write frequency and author activity all
    remain visible during reconciliation.
-5. **Forward secrecy is bounded by retention.** Decryption keys are recovered from the CGKA operation
+7. **Forward secrecy is bounded by retention.** Decryption keys are recovered from the CGKA operation
    graph, so pruning old operations to gain forward secrecy also destroys the ability to read old
    content. Retention is a policy knob, not a free win.
-6. **The workspace blinding secret does not rotate.** A revoked member can still recognise which
+8. **The workspace blinding secret does not rotate.** A revoked member can still recognise which
    blinded key belongs to a document UUID they already knew. Rotating it under the current scheme —
    one secret keying every entry — would force every peer to rewrite every entry, which is why it is
    not done. They learn nothing about documents created after their removal, and can read no content
    either way.
-7. **Roles are advisory against a cryptographically capable member.** Anyone holding a leaf can
+9. **Roles are advisory against a cryptographically capable member.** Anyone holding a leaf can
    decrypt, whatever the manifest says. Roles constrain what a well-behaved peer accepts, not what a
    malicious one can read. Genuine read revocation is a CGKA removal.
-8. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
+10. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
    bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`) and evict oldest-first, because an unbounded
    queue is a remote memory-exhaustion vector. Evicted operations return with the next neighbour log
    exchange; evicted chunks wait for a resync. A property test asserts honest runs never evict.
@@ -231,15 +272,12 @@ These are gaps, not trades. Nothing in the design prevents them.
 3. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
    re-encrypts them and writes a new blob; superseded blobs are never collected. Cost grows
    quadratically in edits.
-4. **Removal revokes reading and connecting, but eviction is eventual.** Connection-level
-   admission control now exists, so a removed device is refused on all three ALPNs by every peer
-   that has merged the removal. Two gaps remain. A peer that has *not* yet merged it still
-   accepts the connection, and the removed device still holds the docs write capability and the
-   blinding secret — so during that window it goes on observing the replicated index (entry
-   existence, size, author, timing) and membership churn. Closing it fully needs namespace
-   rotation, which is not implemented. The `a_removed_member_still_watches` properties in
-   `iroh-beekem-sim` record exactly where the line sits today, so it cannot move without a test
-   noticing.
+4. **Eviction is eventual on every plane.** Removal now revokes reading (the CGKA), connecting
+   (the roster) and watching (namespace rotation) — but all three converge asynchronously, so a
+   peer that has not yet merged the removal still accepts the removed device's connections and
+   entries, and nothing retracts what it already synced. The `a_removed_member_stops_seeing`
+   properties in `iroh-beekem-sim` state exactly where the line now sits.
+
 5. **Invites are replayable.** No expiry, no nonce, no binding to the invitee — and the ticket
    carries the raw workspace secret, so it must travel over an authenticated, confidential channel.
    It does *not* grant read access: joining also needs the leaf secret, which never leaves the

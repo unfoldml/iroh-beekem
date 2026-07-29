@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     alice.set_display_name("Alice").await?;
     println!("alice founded workspace {:?}", alice.info().await.name);
-    println!("  namespace: {}", alice.namespace());
+    println!("  namespace: {}", alice.namespace().await);
     println!("  endpoint:  {}", alice.endpoint_id());
 
     // Logical paths live only in the encrypted manifest; `iroh-docs` sees a

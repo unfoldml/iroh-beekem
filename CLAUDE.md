@@ -118,6 +118,12 @@ None of them is settled; if a user story needs a different answer, change it.
   on a stable UUID rather than a path so a rename touches only the encrypted manifest
   ([blinding.rs](crates/iroh-beekem-core/src/blinding.rs)). Follows from `iroh-docs` reconciling by
   key with keys in the clear.
+- **Removal rotates to a fresh `iroh-docs` namespace** ([workspace.rs](crates/iroh-beekem/src/workspace.rs)):
+  the `Doc` lives behind an `RwLock` because it is *replaced*, and the data-plane pump is respawned
+  against the new subscription with the ingestion cache cleared. The removed device keeps the write
+  capability it was given — `iroh-docs` has no per-member key to withdraw — so the capability is made
+  worthless rather than revoked. The old namespace is left rather than dropped, since peers may still
+  be catching up on it.
 - **The manifest is where permissions live**
   ([manifest.rs](crates/iroh-beekem-core/src/manifest.rs)): logical paths, roles, and the `iroh-docs`
   author → CGKA member mapping. The CGKA decides who *can* decrypt; the manifest decides who is
@@ -130,6 +136,14 @@ None of them is settled; if a user story needs a different answer, change it.
   membership is checked only *after* predecessors are in hand, or a member whose own `Add` is still in
   flight would be rejected. `known_members` is currently monotone (a `Remove` does not retract) because
   retracting would make admissibility depend on delivery order and diverge peers.
+- **Removal rotates the namespace, and the order is the security property.** `on_remove_member`
+  ([state.rs](crates/iroh-beekem-core/src/state.rs)) broadcasts the CGKA `Remove` *before* emitting
+  `Effect::RotateNamespace`; the capability for the new namespace is then encrypted under a group
+  key the removed leaf can no longer derive. Reversed, the removed device reads the announcement and
+  follows the group. `NamespaceEpoch` orders on `(epoch, digest)` — a bare counter cannot settle two
+  concurrent rotations, and the digest is recomputed from the decrypted capability so it cannot be
+  claimed. Rotation is skipped entirely when the target was not a member, or any admin could force a
+  full re-publish at will.
 - **Admission control is an authenticated allowlist over endpoint ids.** All three ALPNs are wrapped
   in `RosterGuard` ([roster.rs](crates/iroh-beekem/src/roster.rs)); an `EndpointId` is the peer's
   public key, authenticated by the QUIC handshake. The roster is *derived*, never authored —
@@ -170,6 +184,15 @@ them *without* noticing will not fail loudly.
   to be order-sensitive, because disagreeing costs a refused connection the next merge repairs.
   Collapsing them has no safe direction: monotone, and a revoked device stays admitted forever;
   non-monotone, and `merge` starts rejecting on a delivery-order-dependent predicate.
+- **A rotation is announced once, so it needs both anti-entropy and repair.** Unlike a document, it
+  has no later write behind it. `Event::ResyncNamespace` re-announces under the current epoch on the
+  ordinary schedule (for a peer that missed the message), and `RepairTarget::Namespace` mints a
+  *fresh* epoch (for a peer that cannot derive the key at all). Dropping either strands a member on
+  an abandoned replica — removed in effect, without anyone having removed them. Both backends must
+  drive `ResyncNamespace` from their resync path.
+- **The minter adopts its own rotation through `Effect::AdoptNamespace`,** not through a second code
+  path in each backend. `on_namespace_minted` appends it deliberately; without it the admin who
+  issued the removal is the one member still publishing into the namespace it just abandoned.
 - **The manifest needs its own anti-entropy.** It is published only when it *changes*, so unlike a
   document it has no later write to carry lost content. `Event::ResyncManifest` exists for that, and
   both `Workspace::resync`/`republish` and the simulator's resync tick must drive it — device records
@@ -180,6 +203,12 @@ them *without* noticing will not fail loudly.
   derive it, and re-announcing content re-encrypts under that same key. `Msg::Log` is the simulator's
   counterpart to `ControlMsg::Log`; without it the harness is strictly more fragile than production
   and every resulting failure is an artefact.
+- **Fault plans must set `Mode::Liveness` explicitly.** `Faults::swarm()` defaults to `Mode::Safety`,
+  which injures uniformly and **never heals a partition** — under which no `eventually_within`
+  property is sound, because a permanently severed node cannot converge. Such a property then passes
+  or fails according to whether the seed happened to enable partitions at all, which looks like
+  flakiness and is really an unsound scenario. See `network_faults` in
+  [properties.rs](crates/iroh-beekem-sim/tests/properties.rs).
 - **Pinned dependencies are pinned for a reason** (see comments in the manifests): `rand` at 0.8.5 to
   unify with beekem's public API, `propsim` at a git rev because it has no semver.
 

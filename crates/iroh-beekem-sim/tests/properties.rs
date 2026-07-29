@@ -19,14 +19,33 @@ fn joined<'a, S: Scenario>(w: &'a World<'a, WorkspaceNode<S>>) -> Vec<&'a Worksp
 
 /// The network conditions every plan runs under.
 ///
-/// Partitions in particular are not decoration. The roster derives from state
-/// that converges asynchronously, so eviction and admission are both *eventual*
-/// — and on a perfect network every "eventually" collapses to "immediately",
-/// which would let a roster that never converges pass. Reordering matters for
-/// the same reason: a device record and the `Add` that authorises it travel on
-/// different planes and routinely arrive out of order.
+/// Partitions in particular are not decoration. The roster and the namespace
+/// both derive from state that converges asynchronously, so admission and
+/// eviction are *eventual* — and on a perfect network every "eventually"
+/// collapses to "immediately", which would let a roster that never converges
+/// pass. Reordering matters for the same reason: a device record and the `Add`
+/// that authorises it travel on different planes and routinely arrive out of
+/// order.
+///
+/// # Why the mode is set explicitly
+///
+/// `Faults::swarm()` defaults to [`Mode::Safety`], which injures uniformly and
+/// **never heals a partition**. Under that mode no `eventually_within` property
+/// in this file is sound: a permanently severed node cannot converge with the
+/// group, so the property is asserting something false about the scenario
+/// rather than something true about the protocol, and it fails or passes
+/// according to whether the seed happened to enable partitions at all.
+///
+/// [`Mode::Liveness`] injures, heals, and then leaves a window in which
+/// progress can be asserted — which is exactly the shape of every property here
+/// (`documents_converge_once_the_network_settles` says so in its name). The
+/// injury window is still exercised, so the `always` properties lose nothing.
 fn network_faults() -> Faults {
-    Faults::swarm().partitions().latency_ms(1..40).reorder()
+    Faults::swarm()
+        .partitions()
+        .latency_ms(1..40)
+        .reorder()
+        .mode(Mode::Liveness)
 }
 
 fn plan<S: Scenario>(properties: Vec<Property<WorkspaceNode<S>>>) -> TestPlan<WorkspaceNode<S>> {
@@ -331,64 +350,183 @@ fn the_simulation_is_reproducible() {
 /// existence, size, author and timing — and keeps watching membership churn.
 /// Closing that is what namespace rotation and the device roster are for; see
 /// the plan's Phases 3 and 4.
-mod a_removed_member_still_watches {
-    use iroh_beekem_sim::{Churn, WorkspaceNode};
+/// Story 3: *"remove a departing team member so they can no longer read
+/// documents, document updates or workspace changes."*
+///
+/// Split by plane, because the two fail independently and the implementation
+/// used to get exactly one of them right. **Confidentiality** is the CGKA: the
+/// victim cannot decrypt what the group writes afterwards. **Visibility** is
+/// the namespace: the victim cannot even tell that it was written. Before
+/// namespace rotation only the first held, and the properties in this module
+/// were inverted — they asserted that the victim went on watching, so that the
+/// line could not move without a test noticing. It has now moved.
+mod a_removed_member_stops_seeing {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{Eviction, POST_REVOCATION_DOC, WorkspaceNode, doc_key};
     use propsim::prelude::*;
 
     use super::plan;
 
-    /// The victim's own view, once the run has settled.
-    fn victim<'a>(w: &'a World<'a, WorkspaceNode<Churn>>) -> Option<&'a WorkspaceNode<Churn>> {
+    /// The removed device, once it has joined and been revoked.
+    fn victim<'a>(
+        w: &'a World<'a, WorkspaceNode<Eviction>>,
+    ) -> Option<&'a WorkspaceNode<Eviction>> {
         w.nodes()
             .find(|n| n.is_revocation_target() && n.has_joined())
     }
 
-    #[test]
-    fn the_victim_sees_index_entries_it_can_never_decrypt() {
-        // Visibility is not readability. This passing is not a good thing — it
-        // is the statement of the gap, and it should be inverted the moment
-        // namespace rotation lands.
-        plan::<Churn>(vec![property::sometimes(
-            "the victim observes entries",
-            |w: &World<'_, WorkspaceNode<Churn>>| victim(w).is_some_and(|v| v.index_len() > 0),
-        )])
-        .run(deterministic());
+    /// The members still in the group after the revocation.
+    fn remaining<'a>(
+        w: &'a World<'a, WorkspaceNode<Eviction>>,
+    ) -> Vec<&'a WorkspaceNode<Eviction>> {
+        w.nodes()
+            .filter(|n| n.has_joined() && !n.is_revocation_target())
+            .collect()
     }
 
+    /// Given a revoked device, at every point after the group rotates, we expect
+    /// it never to observe an index entry for a document first written after its
+    /// removal.
+    ///
+    /// **The property this phase exists for.** Not "cannot read it" — the CGKA
+    /// already gave that — but cannot see that it exists, how big it is, or who
+    /// wrote it. `always` rather than `eventually`: there is no moment at which
+    /// the victim is allowed to have seen the entry and then forgotten it, and
+    /// no later rotation can unlearn what it already observed.
     #[test]
-    fn the_victim_keeps_observing_the_control_plane() {
-        // The gossip topic is derived from the tree id, which every past invitee
-        // knows, so removal does not unsubscribe anyone. Membership churn stays
-        // visible to the removed member indefinitely.
-        plan::<Churn>(vec![property::sometimes(
-            "the victim observes control operations",
-            |w: &World<'_, WorkspaceNode<Churn>>| victim(w).is_some_and(|v| v.observed_ops() > 0),
-        )])
-        .run(deterministic());
-    }
-
-    #[test]
-    fn every_node_sees_the_same_entries_once_settled() {
-        // The index is replicated, so it converges like everything else. This
-        // one is a genuine invariant rather than a recorded gap, and it is what
-        // the visibility properties above are stated against.
-        plan::<Churn>(vec![property::eventually_within(
-            "indices converge",
-            Duration::from_secs(8),
-            |w: &World<'_, WorkspaceNode<Churn>>| {
-                let joined: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
-                let Some(first) = joined.first() else {
-                    return false;
-                };
-                joined
-                    .iter()
-                    .all(|n| n.observed_keys() == first.observed_keys())
+    fn the_victim_never_sees_an_entry_written_after_its_removal() {
+        plan::<Eviction>(vec![property::always(
+            "the victim observes no post-revocation entry",
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                victim(w).is_none_or(|v| v.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
             },
         )])
         .run(deterministic());
     }
 
-    use std::time::Duration;
+    /// Given the same run, when it settles, we expect every *remaining* member
+    /// to hold that entry.
+    ///
+    /// **The counterweight, and the one that makes the property above mean
+    /// anything.** A rotation that stranded everybody would satisfy the
+    /// eviction property perfectly while destroying the workspace. It also
+    /// guards the vacuity: if the late write never happened, this fails rather
+    /// than passing silently alongside it.
+    #[test]
+    fn every_remaining_member_sees_the_entry_the_victim_does_not() {
+        plan::<Eviction>(vec![property::eventually_within(
+            "remaining members observe the post-revocation entry",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                let members = remaining(w);
+                members.len() >= 2
+                    && members
+                        .iter()
+                        .all(|n| n.entry(&doc_key(POST_REVOCATION_DOC)).is_some())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given a revoked device, at every point in the run, we expect it never to
+    /// move off the namespace it was on when it was removed.
+    ///
+    /// The cause behind the two properties above, asserted separately so that a
+    /// failure says *why*. A victim that saw no new entry while sitting on the
+    /// group's current namespace would be excluded by luck — by message timing,
+    /// or by a run in which nobody happened to write — rather than by the
+    /// rotation. The capability travels encrypted under a key minted after the
+    /// victim's leaf left the tree, so there is nothing for it to decrypt.
+    #[test]
+    fn the_victim_never_adopts_the_rotation() {
+        plan::<Eviction>(vec![property::always(
+            "the victim stays on the namespace it was removed from",
+            |w: &World<'_, WorkspaceNode<Eviction>>| victim(w).is_none_or(|v| !v.has_rotated()),
+        )])
+        .run(deterministic());
+    }
+
+    /// Given the group has rotated, when the run settles, we expect every
+    /// remaining member to agree on which generation is current.
+    ///
+    /// Two admins removing different members concurrently both mint the same
+    /// counter, and without the `(epoch, digest)` tie-break the group would
+    /// split across two namespaces with each half convinced it was current.
+    /// This is what says the tie-break is total and computed identically
+    /// everywhere.
+    #[test]
+    fn the_remaining_members_converge_on_one_namespace() {
+        plan::<Eviction>(vec![property::eventually_within(
+            "remaining members agree on the current namespace",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                let members = remaining(w);
+                let Some(first) = members.first() else {
+                    return false;
+                };
+                members.len() >= 2 && members.iter().all(|n| n.namespace() == first.namespace())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given a revoked device, at every point in the run, we expect no remaining
+    /// member's index to contain an entry the victim authored after its removal.
+    ///
+    /// The write half of eviction. The `iroh-docs` write capability is
+    /// all-or-nothing and cannot be withdrawn from one holder, so the victim
+    /// keeps the one it was given — abandoning the namespace is what makes it
+    /// worthless. A failure here means the group is still reconciling the
+    /// replica the victim can still write to.
+    #[test]
+    fn no_remaining_member_accepts_a_post_revocation_entry_from_the_victim() {
+        plan::<Eviction>(vec![property::always(
+            "no remaining member holds a post-revocation entry authored by the victim",
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                let Some(victim) = victim(w) else {
+                    return true;
+                };
+                let victim_id = propsim::NodeId(victim.id());
+                remaining(w).iter().all(|n| {
+                    n.entry(&doc_key(POST_REVOCATION_DOC))
+                        .is_none_or(|meta| meta.author != victim_id)
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given the group has rotated away from the victim, when the run settles,
+    /// we expect the remaining members still to converge on document content.
+    ///
+    /// Rotation re-publishes every document into a fresh namespace, which is the
+    /// single most disruptive thing the protocol does. This is the property that
+    /// notices if it strands content rather than moving it.
+    #[test]
+    fn rotation_does_not_cost_the_remaining_members_their_content() {
+        plan::<Eviction>(vec![property::eventually_within(
+            "remaining members converge across the rotation",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                let members = remaining(w);
+                if members.len() < 2 {
+                    return false;
+                }
+                let mut sorted: Vec<Vec<char>> = members
+                    .iter()
+                    .map(|n| {
+                        let mut cs: Vec<char> = n.all_text().join("").chars().collect();
+                        cs.sort_unstable();
+                        cs
+                    })
+                    .collect();
+                sorted.dedup();
+                sorted.len() == 1
+            },
+        )])
+        .run(deterministic());
+    }
 }
 
 /// The CRUD surface an application actually calls, driven by generated

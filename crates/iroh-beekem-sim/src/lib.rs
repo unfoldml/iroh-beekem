@@ -38,8 +38,8 @@ use beekem::{
     operation::CgkaOperation,
 };
 use iroh_beekem_core::{
-    CgkaController, Chunk, DocumentUuid, Effect, EpochId, Event, RepairTarget, Role, StorageKey,
-    WorkspaceSecret, WorkspaceState,
+    CgkaController, Chunk, DocumentUuid, Effect, EpochId, Event, NamespaceEpoch, RepairTarget,
+    Role, StorageKey, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -155,6 +155,20 @@ const MAX_ROTATIONS: u32 = 12;
 /// `Update` is the interleaving BeeKEM claims to handle and MLS/TreeKEM cannot.
 const REVOKE_AT: Duration = Duration::from_millis(3600);
 
+/// The document written only after the revocation, in scenarios that do so.
+///
+/// Deliberately one the timer-driven edits never touch, so that every entry
+/// under its blinded key postdates the removal and the victim seeing *any* of
+/// them is a failure rather than a leftover.
+pub const POST_REVOCATION_DOC: DocumentUuid = DOCS[2];
+
+/// When the founder writes to [`POST_REVOCATION_DOC`].
+///
+/// Far enough past [`REVOKE_AT`] that the rotation has been announced and
+/// adopted; otherwise the property would be testing a race rather than the
+/// eviction.
+const WRITE_AFTER_REVOKE_AT: Duration = Duration::from_secs(6);
+
 /// How often a forging node emits an operation signed by a non-member key.
 const FORGE_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -180,6 +194,14 @@ pub trait Scenario: Clone + Default + 'static {
     /// Whether non-founder nodes also broadcast operations signed by a key that
     /// no `Add` ever introduced.
     const FORGE: bool = false;
+    /// Whether the founder creates fresh content *after* the revocation.
+    ///
+    /// Without this, every "the victim never sees X" property is vacuous: in a
+    /// run where all content predates the removal there is no X to miss, and a
+    /// rotation that did nothing at all would pass. This writes to a document
+    /// nothing has touched, so the entry it produces is one that exists only in
+    /// the post-rotation namespace.
+    const WRITE_AFTER_REVOKE: bool = false;
     /// Which node never asks to be admitted, if any.
     ///
     /// Distinct from [`Self::FORGE`]: a forging node attacks the control plane
@@ -207,6 +229,20 @@ impl Scenario for Churn {
 pub struct Forging;
 impl Scenario for Forging {
     const FORGE: bool = true;
+}
+
+/// Revocation, rotation, and content created after the victim is gone.
+///
+/// The scenario Story 3 is actually about: *"remove a departing team member so
+/// they can no longer read documents, document updates or workspace changes"*.
+/// [`Churn`] establishes that the remaining members survive a removal; this one
+/// establishes what the removed member stops being able to see.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Eviction;
+impl Scenario for Eviction {
+    const ROTATE: bool = true;
+    const REVOKE: Option<u64> = Some(2);
+    const WRITE_AFTER_REVOKE: bool = true;
 }
 
 /// A node that never asks to join, sitting on the network and listening.
@@ -308,11 +344,32 @@ pub enum Msg {
     /// information the wire does not carry, and would make it impossible to ask
     /// what a node can *see* as distinct from what it can *read*.
     Entry {
+        /// Which replicated index this entry belongs to.
+        ///
+        /// `iroh-docs` reconciles *within* a namespace, so an entry written to
+        /// one is simply invisible in another — there is no filtering step in
+        /// production, only a peer syncing a replica it holds no capability
+        /// for. Carrying the namespace here and dropping mismatches on receipt
+        /// is the modelled equivalent, and it is what makes "the removed device
+        /// stops seeing entries" expressible at all.
+        namespace: NamespaceEpoch,
         /// The blinded key this entry is stored under.
         key: StorageKey,
         /// Which node wrote it.
         author: NodeId,
         /// The ciphertext.
+        chunk: Box<Chunk>,
+    },
+    /// A rotation to a fresh replicated index.
+    ///
+    /// The capability travels encrypted under the group key, so a device
+    /// removed before the rotation cannot read it and stays on the abandoned
+    /// namespace. Carried on the control plane because the data plane is the
+    /// thing being replaced.
+    Namespace {
+        /// The generation being announced.
+        epoch: u32,
+        /// The encrypted capability.
         chunk: Box<Chunk>,
     },
 }
@@ -415,6 +472,8 @@ pub enum Tick {
     Rotate,
     /// Time for the founder to revoke the scenario's victim.
     Revoke,
+    /// Time for the founder to write content the victim must never see.
+    LateEdit,
     /// Time for an attacking node to emit a forged operation.
     Forge,
 }
@@ -461,6 +520,13 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// inviter on faith, exactly as `Workspace::join` seeds the real roster from
     /// `Invite.inviter`. Deliberately one peer, and never pruned.
     bootstrap: BTreeSet<NodeId>,
+    /// Which generation of the replicated index this node is syncing.
+    ///
+    /// Mirrors what the core decided, so that outgoing entries are stamped and
+    /// incoming ones filtered. A removed device never receives the capability
+    /// for the next generation, so it stays here while the group moves on —
+    /// which is what makes its index stop growing.
+    namespace: NamespaceEpoch,
     /// Control-plane operations seen, whether or not they applied.
     observed_ops: u64,
     /// When each distinct repair request was last put on the wire.
@@ -535,6 +601,22 @@ pub fn endpoint_of(node: NodeId) -> [u8; 32] {
     bytes[..8].copy_from_slice(&ENDPOINT_TAG);
     bytes[8..16].copy_from_slice(&node.0.to_le_bytes());
     bytes
+}
+
+/// The capability a node mints for a rotation.
+///
+/// Production hands back an `iroh-docs` ticket; here the bytes only have to be
+/// *distinguishable*, because what the simulation models is which generation a
+/// node is on rather than how a replica is addressed. Derived from the minting
+/// node as well as the epoch, so that two admins rotating concurrently produce
+/// different digests — which is precisely the case the `(epoch, digest)`
+/// tie-break exists to settle.
+#[must_use]
+fn minted_ticket(minter: NodeId, epoch: u32) -> Vec<u8> {
+    let mut ticket = b"propsim-namespace".to_vec();
+    ticket.extend_from_slice(&minter.0.to_le_bytes());
+    ticket.extend_from_slice(&epoch.to_le_bytes());
+    ticket
 }
 
 /// Which node published this transport address, if any.
@@ -694,6 +776,25 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.state.as_ref().map_or(0, WorkspaceState::group_size)
     }
 
+    /// Which generation of the replicated index this node is syncing.
+    ///
+    /// A device removed at generation *n* never receives the capability for
+    /// *n+1*, so this is how "the group moved on without you" is observed.
+    #[must_use]
+    pub fn namespace(&self) -> NamespaceEpoch {
+        self.namespace
+    }
+
+    /// Whether this node has moved off the founding namespace.
+    ///
+    /// A device removed before a rotation never receives the capability for it,
+    /// so this is false for the victim and true for everyone else — which is
+    /// what makes "the group moved on without you" a single readable check.
+    #[must_use]
+    pub fn has_rotated(&self) -> bool {
+        self.namespace != NamespaceEpoch::INITIAL
+    }
+
     /// The peers this node currently accepts messages from, bootstrap included.
     ///
     /// Sorted, because it comes from a `BTreeSet`, so two nodes with the same
@@ -816,7 +917,11 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn admits(&self, from: NodeId, msg: &Msg) -> bool {
         match msg {
             Msg::Hello { .. } | Msg::Welcome { .. } => true,
-            Msg::Op(_) | Msg::Log(_) | Msg::Entry { .. } | Msg::Repair { .. } => {
+            Msg::Op(_)
+            | Msg::Log(_)
+            | Msg::Entry { .. }
+            | Msg::Repair { .. }
+            | Msg::Namespace { .. } => {
                 self.roster.contains(&from) || self.bootstrap.contains(&from)
             }
         }
@@ -846,12 +951,23 @@ impl<S: Scenario> WorkspaceNode<S> {
     /// nothing to apply it to.
     fn on_entry(
         &mut self,
+        namespace: NamespaceEpoch,
         key: StorageKey,
         author: NodeId,
         chunk: Box<Chunk>,
         cx: &mut dyn Ctx<Self>,
         salt: u64,
     ) {
+        // Dropped before it is observed, not merely before it is applied.
+        // `iroh-docs` reconciles within a namespace, so an entry in a replica
+        // this node holds no capability for is not something it declines to
+        // read — it is something it never hears about. Recording it and then
+        // ignoring it would hand a removed device exactly the metadata the
+        // rotation exists to take away: that the entry exists, how big it is,
+        // and who wrote it.
+        if namespace != self.namespace {
+            return;
+        }
         self.observe(key, author, &chunk);
         let secret = WorkspaceSecret::new(workspace_secret_bytes());
         if key == secret.manifest_key() {
@@ -920,6 +1036,7 @@ impl<S: Scenario> WorkspaceNode<S> {
         // lost in transit is refused forever, which looks like a membership bug
         // and is really a missing re-announcement.
         self.drive(Event::ResyncManifest, cx, 9100);
+        self.drive(Event::ResyncNamespace, cx, 9101);
     }
 
     /// Apply and complete everything queued while this node was still joining.
@@ -943,6 +1060,10 @@ impl<S: Scenario> WorkspaceNode<S> {
         let Ok(effects) = state.handle(event, &mut rng) else {
             return;
         };
+        // Two follow-ups that must happen *after* this loop, because both feed
+        // more events into `drive` and the borrow of `state` is still live here.
+        let mut pending_mint: Option<(u32, Vec<u8>)> = None;
+        let mut pending_republish = false;
         for effect in effects {
             match effect {
                 Effect::BroadcastOp(op) => cx.broadcast(Msg::Op(op)),
@@ -952,6 +1073,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                     // them into `iroh-docs`.
                     self.observe(key, me, &chunk);
                     cx.broadcast(Msg::Entry {
+                        namespace: self.namespace,
                         key,
                         author: me,
                         chunk,
@@ -963,11 +1085,44 @@ impl<S: Scenario> WorkspaceNode<S> {
                 Effect::RequestRepair { target, epoch } => {
                     self.ask_for_repair(target, epoch, cx);
                 }
+                // Minting is I/O in production — the caller creates a namespace
+                // and hands its capability back. Here the "capability" is the
+                // generation itself, derived from the minting node and epoch so
+                // that two admins rotating concurrently mint distinguishable
+                // ones and the tie-break has something to work with.
+                Effect::RotateNamespace { epoch } => {
+                    pending_mint = Some((epoch, minted_ticket(me, epoch)));
+                }
+                Effect::PublishNamespace { epoch, chunk } => {
+                    cx.broadcast(Msg::Namespace { epoch, chunk });
+                }
+                // The new index starts empty, so adopting without re-publishing
+                // would take this node's documents out of circulation.
+                Effect::AdoptNamespace { epoch, ticket } => {
+                    self.namespace = NamespaceEpoch::of(epoch, &ticket);
+                    // Entries from the abandoned namespace are no longer
+                    // reachable, exactly as they would not be after switching
+                    // replicas: the index this node can see starts empty again.
+                    self.index.clear();
+                    pending_republish = true;
+                }
                 // Purely local; nothing to tell the network about.
                 Effect::Applied { .. } | Effect::ManifestUpdated => {}
             }
         }
         self.refresh_roster();
+        if let Some((epoch, ticket)) = pending_mint {
+            // Straight back into the core, which encrypts the capability under
+            // the post-removal key and asks for it to be announced.
+            self.drive(Event::NamespaceMinted { epoch, ticket }, cx, salt ^ 0xE0E0);
+        } else {
+            // No rotation was requested by this event.
+        }
+        if pending_republish {
+            self.republish(cx);
+        } else {
+            // Still on the same namespace; nothing to re-announce.
+        }
     }
 
     /// Broadcast a repair request, at most once per window per `(target, epoch)`.
@@ -1010,7 +1165,15 @@ impl<S: Scenario> WorkspaceNode<S> {
                     self.flush_deferred_ops(cx);
                 }
                 Msg::Log(log) => self.on_log(log, cx),
-                Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 0),
+                Msg::Entry {
+                    namespace,
+                    key,
+                    author,
+                    chunk,
+                } => self.on_entry(namespace, key, author, chunk, cx, 0),
+                Msg::Namespace { epoch, chunk } => {
+                    self.drive(Event::NamespaceArrived { epoch, chunk }, cx, 0);
+                }
                 Msg::Repair {
                     member,
                     target,
@@ -1203,6 +1366,9 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         if me.0 == FOUNDER && S::REVOKE.is_some() {
             cx.set_timer(Tick::Revoke, REVOKE_AT);
         }
+        if me.0 == FOUNDER && S::WRITE_AFTER_REVOKE {
+            cx.set_timer(Tick::LateEdit, WRITE_AFTER_REVOKE_AT);
+        }
         if S::FORGE && me.0 != FOUNDER {
             cx.set_timer(Tick::Forge, FORGE_INTERVAL);
         }
@@ -1235,7 +1401,18 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 self.flush_deferred_ops(cx);
             }
             Msg::Log(log) => self.on_log(log, cx),
-            Msg::Entry { key, author, chunk } => self.on_entry(key, author, chunk, cx, 3),
+            Msg::Entry {
+                namespace,
+                key,
+                author,
+                chunk,
+            } => self.on_entry(namespace, key, author, chunk, cx, 3),
+            // The group has abandoned the namespace this node was syncing. A
+            // device removed before the rotation cannot decrypt the capability
+            // and stays behind, which is the entire mechanism.
+            Msg::Namespace { epoch, chunk } => {
+                self.drive(Event::NamespaceArrived { epoch, chunk }, cx, 5);
+            }
             Msg::Repair {
                 member,
                 target,
@@ -1302,6 +1479,10 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 // that peer's roster indefinitely.
                 let manifest_salt = 5000 + u64::from(self.resyncs_done) * 16 + DOCS.len() as u64;
                 self.drive(Event::ResyncManifest, cx, manifest_salt);
+                // And the rotation. Announced once when it happens, so a member
+                // that missed it is stranded on a replica the group abandoned
+                // until one of these reaches it.
+                self.drive(Event::ResyncNamespace, cx, manifest_salt + 1);
                 // Control-plane repair, on a deliberately sparser cadence. The
                 // real `Workspace` ships its log on `NeighborUp` behind a
                 // ten-second per-peer cooldown, so a log broadcast every
@@ -1338,6 +1519,18 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                     let member = MemberId::from(victim_signer.verifying_key());
                     self.drive(Event::RemoveMember { member }, cx, 0xBEEF);
                 }
+            }
+            Tick::LateEdit => {
+                // A document nothing has written to before, so every entry
+                // under its key belongs to the post-rotation namespace.
+                self.drive(
+                    Event::LocalEdit {
+                        doc: POST_REVOCATION_DOC,
+                        text: "written after the removal".into(),
+                    },
+                    cx,
+                    0x1A7E,
+                );
             }
             Tick::Forge => {
                 self.forge(cx);

@@ -38,4 +38,4 @@ pub use content::{Chunk, ChunkRef};
 pub use error::CoreError;
 pub use keys::{CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome};
 pub use manifest::{DeviceRecord, FileEntry, Manifest, Role, UserRecord, WorkspaceInfo};
-pub use state::{Effect, Event, RepairTarget, WorkspaceState};
+pub use state::{Effect, Event, NamespaceEpoch, RepairTarget, WorkspaceState};

@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -18,8 +19,8 @@ use beekem::{
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry, RepairTarget,
-    Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
+    CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry, NamespaceEpoch,
+    RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{
@@ -39,7 +40,7 @@ use keyhive_crypto::{share_key::ShareKey, signed::Signed, verifiable::Verifiable
 use n0_future::StreamExt;
 use rand::{CryptoRng, RngCore};
 use tokio::{
-    sync::{Mutex, Notify},
+    sync::{Mutex, Notify, RwLock},
     task::JoinHandle,
 };
 
@@ -48,7 +49,7 @@ use crate::{
     identity::Identity,
     node::Node,
     roster::Roster,
-    wire::{ControlMsg, decode_chunk, encode_chunk},
+    wire::{ControlMsg, NamespaceCapability, decode_chunk, encode_chunk},
 };
 
 /// Everything a new member needs to join.
@@ -110,7 +111,21 @@ fn member_id_from_bytes(bytes: &[u8; 32]) -> Option<MemberId> {
 struct Inner {
     state: Mutex<WorkspaceState>,
     blobs: MemStore,
-    doc: Doc,
+    /// The replicated index this node currently syncs.
+    ///
+    /// Behind a lock because it is *replaced* on a namespace rotation, not
+    /// merely mutated: removal abandons one namespace for a fresh one whose
+    /// capability the removed device never receives. Every reader takes a clone
+    /// and releases the lock immediately — `Doc` is a cheap handle, and holding
+    /// it across an await would let a rotation deadlock behind a slow sync.
+    doc: RwLock<Doc>,
+    /// The task pumping data-plane events for the current namespace.
+    ///
+    /// Owned here rather than on [`Workspace`] because a rotation has to abort
+    /// and respawn it, and rotations arrive through the effect pump, which sees
+    /// only `Inner`. A subscription is to one namespace; after a swap the old
+    /// one delivers nothing and the new one has nobody listening.
+    data_task: Mutex<Option<JoinHandle<()>>>,
     author: AuthorId,
     gossip_tx: GossipSender,
     secret: WorkspaceSecret,
@@ -159,22 +174,28 @@ struct Inner {
     /// which sees every membership change — can update it without needing the
     /// whole node.
     roster: Roster,
+    /// The node this workspace runs on.
+    ///
+    /// Cloned onto `Inner` because minting and importing a namespace happen in
+    /// the effect pump, which sees only `Inner`. `Node` is a handle, so this is
+    /// a second reference to the same endpoint and router rather than a copy.
+    node: Node,
 }
 
 /// A running, networked workspace.
 pub struct Workspace {
     node: Node,
     inner: Arc<Inner>,
-    namespace: NamespaceId,
     tree_id: TreeId,
     topic: TopicId,
+    /// The long-lived pumps. The data-plane pump is not among them: it is
+    /// replaced on rotation and therefore lives on [`Inner`].
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Workspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Workspace")
-            .field("namespace", &self.namespace)
             .field("endpoint", &self.node.endpoint().id())
             .finish_non_exhaustive()
     }
@@ -184,6 +205,18 @@ impl Drop for Workspace {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        // The data pump is reachable only through the lock, and `Drop` cannot
+        // await. `blocking_lock` is safe here because nothing else holds this
+        // lock across an await point — every other holder clones and releases.
+        if let Ok(mut task) = self.inner.data_task.try_lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        } else {
+            // Contended or poisoned: the task holds only an `Arc<Inner>` and a
+            // subscription, both of which drop with the workspace, so leaving
+            // it to be reaped is a leak of nothing.
         }
     }
 }
@@ -380,7 +413,6 @@ impl Workspace {
         tree_id: TreeId,
         bootstrap: Vec<EndpointId>,
     ) -> Result<Self, WorkspaceError> {
-        let namespace = doc.id();
         let topic = topic_for(tree_id);
 
         // A per-workspace author, not the node's global identity: `AuthorId`
@@ -412,7 +444,8 @@ impl Workspace {
         let inner = Arc::new(Inner {
             state: Mutex::new(state),
             blobs: node.blobs().clone(),
-            doc: doc.clone(),
+            doc: RwLock::new(doc.clone()),
+            data_task: Mutex::new(None),
             author,
             gossip_tx,
             secret,
@@ -422,6 +455,7 @@ impl Workspace {
             repair_answer_cooldown: Mutex::new(Cooldown::new(REPAIR_COOLDOWN)),
             republish_wanted: Notify::new(),
             roster: node.roster().clone(),
+            node: node.clone(),
         });
 
         // Claim this workspace's author identity in the manifest. Until a peer
@@ -460,13 +494,10 @@ impl Workspace {
         let control = Arc::clone(&inner);
         let control_task = tokio::spawn(control_loop(control, gossip_rx));
 
-        // Data plane: entries and content arriving over docs and blobs.
-        let data = Arc::clone(&inner);
-        let doc_events = doc
-            .subscribe()
-            .await
-            .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
-        let data_task = tokio::spawn(data_loop(data, doc_events));
+        // Data plane: entries and content arriving over docs and blobs. Held on
+        // `Inner` rather than alongside the others because a rotation replaces
+        // it; see `spawn_data_loop`.
+        spawn_data_loop(&inner).await?;
 
         // Anti-entropy: re-announcements requested by the control loop, run at
         // a bounded rate but never discarded.
@@ -476,10 +507,9 @@ impl Workspace {
         Ok(Self {
             node,
             inner,
-            namespace,
             tree_id,
             topic,
-            tasks: vec![control_task, data_task, republish_task],
+            tasks: vec![control_task, republish_task],
         })
     }
 
@@ -489,8 +519,8 @@ impl Workspace {
     ///
     /// Returns [`WorkspaceError::Storage`] if the sync cannot be started.
     pub async fn sync_with(&self, peer: EndpointId) -> Result<(), WorkspaceError> {
-        self.inner
-            .doc
+        doc(&self.inner)
+            .await
             .start_sync(vec![peer.into()])
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))
@@ -517,10 +547,22 @@ impl Workspace {
         self.node.endpoint().id()
     }
 
-    /// The `iroh-docs` namespace backing this workspace.
-    #[must_use]
-    pub fn namespace(&self) -> NamespaceId {
-        self.namespace
+    /// The `iroh-docs` namespace backing this workspace *right now*.
+    ///
+    /// Not stable for the lifetime of the workspace: a removal abandons the
+    /// namespace for a fresh one, so an application holding this across a
+    /// membership change is holding a stale identifier.
+    pub async fn namespace(&self) -> NamespaceId {
+        doc(&self.inner).await.id()
+    }
+
+    /// Which generation of the replicated index this node is syncing.
+    ///
+    /// Advances on every removal. A device removed at generation *n* never
+    /// receives the capability for *n+1*, so a peer stuck on an older
+    /// generation is one the group has moved on without.
+    pub async fn namespace_epoch(&self) -> NamespaceEpoch {
+        self.inner.state.lock().await.namespace()
     }
 
     /// The CGKA tree id.
@@ -662,9 +704,8 @@ impl Workspace {
         } else {
             ShareMode::Read
         };
-        let doc_ticket = self
-            .inner
-            .doc
+        let doc_ticket = doc(&self.inner)
+            .await
             .share(mode, AddrInfoOptions::RelayAndAddresses)
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
@@ -1015,7 +1056,11 @@ impl Workspace {
         // there and the roster derives from them, which makes a lost manifest
         // chunk cost a peer its place on somebody's roster until the next
         // membership change happens to republish it.
-        self.drive(Event::ResyncManifest).await
+        self.drive(Event::ResyncManifest).await?;
+        // And the rotation, for the same reason one step further out: a
+        // rotation is announced once, so a member that missed it goes on
+        // syncing a replica the group has abandoned.
+        self.drive(Event::ResyncNamespace).await
     }
 
     /// Chunks parked awaiting key material or CRDT dependencies.
@@ -1041,9 +1086,8 @@ impl Workspace {
 
         let (mut total, mut local) = (0, 0);
         for key in keys {
-            let Ok(entries) = self
-                .inner
-                .doc
+            let Ok(entries) = doc(&self.inner)
+                .await
                 .get_many(Query::key_exact(Bytes::copy_from_slice(&key)))
                 .await
             else {
@@ -1156,6 +1200,20 @@ async fn control_loop<E>(
             // us to look sooner.
             ControlMsg::Announce { .. } => {
                 ingest_all(&inner).await;
+            }
+            // The group has abandoned the namespace this node is syncing. The
+            // capability is encrypted under the group key, so a device removed
+            // before the rotation simply cannot read it and stays behind —
+            // which is the whole purpose of rotating rather than asking nicely.
+            ControlMsg::Namespace { epoch, chunk } => {
+                let effects = {
+                    let mut state = inner.state.lock().await;
+                    report_rejection(state.handle(
+                        Event::NamespaceArrived { epoch, chunk },
+                        &mut rand::rngs::OsRng,
+                    ))
+                };
+                apply_effects(&inner, effects).await;
             }
             // Somebody cannot read what we publish. Answering re-keys the
             // group, so the core checks the requester is a member *now* before
@@ -1271,7 +1329,7 @@ async fn send_log(inner: &Inner) {
 
 /// Re-encrypt and re-announce every document this node knows about, and the
 /// manifest that indexes them.
-async fn republish(inner: &Inner) {
+async fn republish(inner: &Arc<Inner>) {
     let docs: Vec<DocumentUuid> = {
         let state = inner.state.lock().await;
         state
@@ -1293,17 +1351,19 @@ async fn republish(inner: &Inner) {
     // See `Workspace::resync`: the manifest needs re-announcing too, and this
     // is the path a neighbour appearing takes, which is exactly when a peer is
     // most likely to be missing it.
-    let effects = {
-        let mut state = inner.state.lock().await;
-        state
-            .handle(Event::ResyncManifest, &mut rand::rngs::OsRng)
-            .unwrap_or_default()
-    };
-    apply_effects(inner, effects).await;
+    for event in [Event::ResyncManifest, Event::ResyncNamespace] {
+        let effects = {
+            let mut state = inner.state.lock().await;
+            state
+                .handle(event, &mut rand::rngs::OsRng)
+                .unwrap_or_default()
+        };
+        apply_effects(inner, effects).await;
+    }
 }
 
 /// Perform the effects the core asked for.
-async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
+async fn apply_effects(inner: &Arc<Inner>, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
             Effect::BroadcastOp(op) => {
@@ -1336,8 +1396,8 @@ async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
                     .lock()
                     .await
                     .retain(|(k, _), _| k != key.as_bytes());
-                if let Err(err) = inner
-                    .doc
+                if let Err(err) = doc(inner)
+                    .await
                     .del(inner.author, Bytes::copy_from_slice(key.as_bytes()))
                     .await
                 {
@@ -1352,9 +1412,107 @@ async fn apply_effects(inner: &Inner, effects: Vec<Effect>) {
             Effect::RequestRepair { target, epoch } => {
                 request_repair(inner, target, epoch).await;
             }
+            // Removal abandons the namespace for a fresh one. Minting is I/O,
+            // so the core asks rather than doing it, and the capability comes
+            // straight back for encryption under the *post-removal* key.
+            // Boxed because minting announces through this same pump: the
+            // capability has to be encrypted and broadcast, and that is an
+            // `apply_effects` call inside an `apply_effects` call.
+            Effect::RotateNamespace { epoch } => Box::pin(mint_namespace(inner, epoch)).await,
+            Effect::PublishNamespace { epoch, chunk } => {
+                if let Ok(bytes) = (ControlMsg::Namespace { epoch, chunk }).encode()
+                    && let Err(err) = inner.gossip_tx.broadcast(Bytes::from(bytes)).await
+                {
+                    // Not fatal: rotations are re-announced on every resync, so
+                    // a lost one costs latency rather than a split group.
+                    tracing::error!(%err, "failed to announce a namespace rotation");
+                }
+            }
+            // Boxed for the same reason as the arm above: adopting re-publishes
+            // every document, which comes straight back through this pump.
+            Effect::AdoptNamespace { ticket, .. } => {
+                let may_write = local_role_may_write(inner).await;
+                let node = inner.node.clone();
+                Box::pin(adopt_namespace(inner, &node, &ticket, may_write)).await;
+            }
             Effect::Applied { .. } => {}
         }
     }
+}
+
+/// Whether this node's own role permits writing to the replica.
+///
+/// A member with no role recorded yet is treated as a writer, matching the
+/// escape hatch the core's `require_write` already uses: a joiner's manifest is
+/// empty until its first sync, and refusing it a write capability then would
+/// leave it unable to publish the very records that establish its role.
+async fn local_role_may_write(inner: &Inner) -> bool {
+    let state = inner.state.lock().await;
+    state
+        .manifest()
+        .role_of_member(&state.member_id().to_bytes())
+        .is_none_or(Role::can_write)
+}
+
+/// Mint a fresh namespace and hand its capability back to the core.
+///
+/// Both tickets are minted here, from one namespace: beekem encrypts to the
+/// whole tree, so the announcement cannot be tailored per recipient and each
+/// node picks the ticket its own role allows. See [`NamespaceCapability`].
+///
+/// This node does not adopt the result — it created the namespace and is
+/// already able to use it — but it does have to *switch* to it, which is what
+/// feeding the reply back through the core arranges: `on_namespace_minted`
+/// records the new generation, and the caller swaps the handle below.
+async fn mint_namespace(inner: &Arc<Inner>, epoch: u32) {
+    let fresh = match inner.node.docs().api().create().await {
+        Ok(fresh) => fresh,
+        Err(err) => {
+            tracing::error!(%err, "failed to mint a namespace for a rotation");
+            return;
+        }
+    };
+    let (Ok(write), Ok(read)) = (
+        fresh
+            .share(ShareMode::Write, AddrInfoOptions::RelayAndAddresses)
+            .await,
+        fresh
+            .share(ShareMode::Read, AddrInfoOptions::RelayAndAddresses)
+            .await,
+    ) else {
+        tracing::error!("failed to mint capabilities for a rotated namespace");
+        return;
+    };
+    let Ok(ticket) = (NamespaceCapability { write, read }).encode() else {
+        tracing::error!("failed to encode a rotated namespace capability");
+        return;
+    };
+
+    // Encrypt and announce. The core emits the key operations that make the
+    // announcement readable *before* the announcement itself; `apply_effects`
+    // preserves that order, and reversing it would leave the group unable to
+    // decrypt the capability and permanently split across two namespaces.
+    let effects = {
+        let mut state = inner.state.lock().await;
+        state
+            .handle(
+                Event::NamespaceMinted {
+                    epoch,
+                    ticket: ticket.clone(),
+                },
+                &mut rand::rngs::OsRng,
+            )
+            .unwrap_or_default()
+    };
+    if effects.is_empty() {
+        // A later rotation overtook this one, so the namespace just minted is
+        // stale. Nothing to undo: it was never announced and nobody holds it.
+        return;
+    }
+    // The batch ends with an `AdoptNamespace` naming what was just minted, so
+    // switching onto it happens by the same path a peer's rotation takes rather
+    // than by a second implementation here.
+    Box::pin(apply_effects(inner, effects)).await;
 }
 
 /// Ask the group to re-encrypt something this node can never decrypt.
@@ -1388,6 +1546,124 @@ async fn request_repair(inner: &Inner, target: RepairTarget, epoch: EpochId) {
     }
 }
 
+/// Start the data-plane pump against the current namespace, replacing any
+/// pump already running.
+///
+/// A subscription is to *one* namespace. After a rotation the old subscription
+/// delivers nothing and the new namespace has nobody listening, so the two must
+/// be swapped together — aborting first, so that two pumps never race to ingest
+/// the same arrival into the same state.
+///
+/// The return type is boxed rather than `impl Future` to break a cycle the
+/// compiler cannot see through: this spawns `data_loop`, whose effect pump can
+/// adopt a rotation, which calls back here. Inferring `Send` for that would
+/// require already knowing it. Asserting it in the signature settles the
+/// question instead.
+///
+/// # Errors
+///
+/// Returns [`WorkspaceError::Storage`] if the namespace cannot be subscribed to.
+fn spawn_data_loop(
+    inner: &Arc<Inner>,
+) -> Pin<Box<dyn Future<Output = Result<(), WorkspaceError>> + Send + '_>> {
+    Box::pin(async move {
+        let events = doc(inner)
+            .await
+            .subscribe()
+            .await
+            .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+        let task = tokio::spawn(data_loop(Arc::clone(inner), events));
+        if let Some(previous) = inner.data_task.lock().await.replace(task) {
+            previous.abort();
+        } else {
+            // First start; there is nothing to replace.
+        }
+        Ok(())
+    })
+}
+
+/// Move this node onto a namespace the group has rotated to.
+///
+/// Four things have to happen together, and the order is not arbitrary:
+///
+/// 1. **Import the capability**, which also starts syncing with the peers named
+///    in the ticket.
+/// 2. **Swap the handle**, so every subsequent read and write addresses the new
+///    namespace.
+/// 3. **Forget the ingestion cache.** It is keyed by blinded key and author,
+///    and those repeat across namespaces — a surviving entry would make the new
+///    namespace's first copy of a document look like one already ingested, and
+///    it would be skipped.
+/// 4. **Re-publish everything.** The new namespace starts empty, so a node that
+///    switched without re-publishing would take its documents out of
+///    circulation entirely.
+///
+/// The old namespace is abandoned rather than dropped: peers that have not yet
+/// seen the rotation are still catching up on it, and reclaiming its storage is
+/// blob GC's problem rather than this function's.
+async fn adopt_namespace(inner: &Arc<Inner>, node: &Node, ticket: &[u8], role_may_write: bool) {
+    let capability = match NamespaceCapability::decode(ticket) {
+        Ok(capability) => capability,
+        Err(err) => {
+            tracing::error!(%err, "a namespace rotation carried an unreadable capability");
+            return;
+        }
+    };
+    // Each node takes the ticket its own role allows. Both travel together
+    // because beekem encrypts to the whole tree and cannot hand writers one
+    // secret and viewers another; see `NamespaceCapability`.
+    let chosen = if role_may_write {
+        capability.write
+    } else {
+        capability.read
+    };
+
+    // Open it if this node already holds it, and only import otherwise. The
+    // minter reaches here for the namespace it just created, and importing a
+    // ticket for a replica you already have means dialling the addresses inside
+    // it — including your own, which `iroh` refuses and logs. Opening is also
+    // simply the correct operation: there is no capability to install.
+    let id = chosen.capability.id();
+    let existing = node.docs().api().open(id).await.ok().flatten();
+    let replacement = match existing {
+        Some(existing) => existing,
+        None => match node.docs().api().import(chosen).await {
+            Ok(imported) => imported,
+            Err(err) => {
+                tracing::error!(%err, "failed to import a rotated namespace");
+                return;
+            }
+        },
+    };
+
+    let previous = std::mem::replace(&mut *inner.doc.write().await, replacement);
+    // Stop reconciling the abandoned namespace. Not dropped: peers that have
+    // not yet seen the rotation may still be catching up on it.
+    if let Err(err) = previous.leave().await {
+        tracing::warn!(%err, "failed to stop syncing the abandoned namespace");
+    } else {
+        // Left cleanly.
+    }
+    inner.seen_entries.lock().await.clear();
+
+    if let Err(err) = spawn_data_loop(inner).await {
+        tracing::error!(%err, "failed to subscribe to a rotated namespace");
+    } else {
+        // The pump is live on the new namespace.
+    }
+    republish(inner).await;
+}
+
+/// The replicated index this node currently syncs.
+///
+/// Clones the handle and releases the lock immediately. Holding the guard
+/// across an await would let a slow sync block a rotation — and a rotation is
+/// what stops a removed device from watching the index, so blocking it is a
+/// security cost, not merely a latency one.
+async fn doc(inner: &Inner) -> Doc {
+    inner.doc.read().await.clone()
+}
+
 /// Recompute the node's admission list from the current workspace state.
 ///
 /// Cheap and idempotent, which is why it runs on every manifest arrival rather
@@ -1416,8 +1692,8 @@ async fn store_chunk(
         .await
         .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
-    inner
-        .doc
+    doc(inner)
+        .await
         .set_hash(inner.author, Bytes::copy_from_slice(key), tag.hash, size)
         .await
         .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
@@ -1433,7 +1709,7 @@ async fn store_chunk(
 ///
 /// Entries whose payload has not been fetched yet are skipped; the next
 /// `ContentReady` event brings us back here.
-async fn ingest_all(inner: &Inner) {
+async fn ingest_all(inner: &Arc<Inner>) {
     // Manifest first. Document entries are accepted based on whether their
     // author holds a writing role, and that mapping lives in the manifest — so
     // ingesting documents first would reject entries purely because the roles
@@ -1501,8 +1777,8 @@ async fn fetch_chunks(
     key: &[u8; 32],
     check_author: bool,
 ) -> Vec<iroh_beekem_core::Chunk> {
-    let Ok(entries) = inner
-        .doc
+    let Ok(entries) = doc(inner)
+        .await
         .get_many(Query::key_exact(Bytes::copy_from_slice(key)))
         .await
     else {

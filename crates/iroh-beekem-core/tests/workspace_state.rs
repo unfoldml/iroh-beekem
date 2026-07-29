@@ -44,6 +44,12 @@ struct Bus {
     bob_id: MemberId,
     /// Repair requests bob has raised and alice has not yet answered.
     repairs_from_bob: Vec<(RepairTarget, EpochId)>,
+    /// Namespace rotations alice has announced but bob has not received.
+    ///
+    /// Queued rather than applied so a test can assert on what alice *put on
+    /// the wire* before bob touches it — which is where the removal-before-
+    /// rotation ordering becomes observable.
+    rotations_to_bob: Vec<(u32, iroh_beekem_core::Chunk)>,
 }
 
 fn two_node_workspace() -> Bus {
@@ -95,6 +101,7 @@ fn two_node_workspace() -> Bus {
         manifests_to_bob: Vec::new(),
         bob_id,
         repairs_from_bob: Vec::new(),
+        rotations_to_bob: Vec::new(),
     }
 }
 
@@ -109,6 +116,7 @@ impl Bus {
             manifests_to_bob: Vec::new(),
             bob_id,
             repairs_from_bob: Vec::new(),
+            rotations_to_bob: Vec::new(),
         }
     }
 
@@ -152,19 +160,61 @@ impl Bus {
     /// that keys the chunk beside it — the ordering rule the whole protocol
     /// rests on.
     fn queue_for_bob(&mut self, effects: Vec<Effect>) {
+        let mut mint: Option<u32> = None;
         for effect in effects {
             match effect {
                 Effect::BroadcastOp(op) => self.to_bob.push(*op),
                 Effect::StoreChunk { chunk, .. } => self.chunks_to_bob.push(*chunk),
                 Effect::StoreManifest { chunk, .. } => self.manifests_to_bob.push(*chunk),
-                // Alice asking bob for a repair is not something these tests
-                // exercise — bob is the joiner — and answering would need a
-                // second bus in the other direction.
-                Effect::RequestRepair { .. }
+                Effect::PublishNamespace { epoch, chunk } => {
+                    self.rotations_to_bob.push((epoch, *chunk));
+                }
+                // Minting is I/O in production. Deferred past this loop because
+                // answering it feeds another event into alice, and the effects
+                // being drained here came from the previous one.
+                Effect::RotateNamespace { epoch } => mint = Some(epoch),
+                // `AdoptNamespace` is a transport action — importing a
+                // capability and re-publishing — with nothing for an in-memory
+                // bus to do; the generation alice moved to is already in her
+                // state. A repair request from alice is likewise out of scope:
+                // bob is the joiner here, and answering would need a second bus
+                // in the other direction.
+                Effect::AdoptNamespace { .. }
+                | Effect::RequestRepair { .. }
                 | Effect::Applied { .. }
                 | Effect::ManifestUpdated
                 | Effect::DeleteEntry { .. } => {}
             }
+        }
+        if let Some(epoch) = mint {
+            // The capability only has to be distinguishable here; what is being
+            // modelled is which generation a node is on.
+            let ticket = format!("namespace-{epoch}").into_bytes();
+            let effects = self
+                .alice
+                .handle(
+                    Event::NamespaceMinted { epoch, ticket },
+                    &mut rng(epoch.into()),
+                )
+                .expect("alice should encrypt the namespace she asked to mint");
+            self.queue_for_bob(effects);
+        } else {
+            // No rotation was requested by the event being drained.
+        }
+    }
+
+    /// Deliver every queued rotation to bob.
+    fn deliver_rotations_to_bob(&mut self) {
+        for (epoch, chunk) in std::mem::take(&mut self.rotations_to_bob) {
+            self.bob
+                .handle(
+                    Event::NamespaceArrived {
+                        epoch,
+                        chunk: Box::new(chunk),
+                    },
+                    &mut rng(0),
+                )
+                .expect("bob should handle a rotation announcement");
         }
     }
 
@@ -358,7 +408,11 @@ fn concurrent_edits_from_both_members_converge() {
                     .handle(Event::ManifestArrived { chunk }, &mut rng(0))
                     .expect("alice handles bob's manifest");
             }
-            Effect::RequestRepair { .. }
+            // Bob is not an admin in this test, so he never rotates.
+            Effect::RotateNamespace { .. }
+            | Effect::PublishNamespace { .. }
+            | Effect::AdoptNamespace { .. }
+            | Effect::RequestRepair { .. }
             | Effect::Applied { .. }
             | Effect::ManifestUpdated
             | Effect::DeleteEntry { .. } => {}
@@ -755,7 +809,6 @@ mod the_pending_queue_is_bounded {
 /// *can* read it re-encrypts under a live epoch. These tests pin down when that
 /// happens, what it costs, and who is allowed to ask for it.
 mod repair_reaches_a_member_admitted_late {
-    use super::{Bus, DOC, MemberId, rng};
     use beekem::id::TreeId;
     use iroh_beekem_core::{
         CgkaController, Chunk, Effect, EpochId, Event, RepairTarget, Role, WorkspaceSecret,
@@ -764,6 +817,8 @@ mod repair_reaches_a_member_admitted_late {
     use keyhive_crypto::{
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
     };
+
+    use super::{Bus, DOC, MemberId, rng};
 
     /// The text alice writes while she is still alone in the workspace.
     const EARLY: &str = "written before bob arrived";
@@ -1624,6 +1679,203 @@ mod the_roster_derives_from_membership {
             bus.bob.roster(),
             "two nodes holding the same membership and the same manifest derived different \
              rosters, so each would accept peers the other refuses"
+        );
+    }
+}
+
+/// Namespace rotation: what a removal does beyond revoking decryption.
+///
+/// The CGKA revokes *reading*. The `iroh-docs` write capability is
+/// all-or-nothing and cannot be withdrawn from one holder, so a removed device
+/// goes on syncing the index — seeing entry existence, size, author and timing
+/// — until the group abandons that index for one whose capability the removed
+/// device never receives. These establish that it never receives it.
+mod removal_rotates_the_namespace {
+    use iroh_beekem_core::NamespaceEpoch;
+
+    use super::*;
+
+    /// Given a two-member workspace, when the admin removes the other member, we
+    /// expect the effects to broadcast the removal *before* asking for a new
+    /// namespace.
+    ///
+    /// **The ordering is the security property, and it is invisible if you only
+    /// check the outcome.** The capability is encrypted under the group key at
+    /// the moment the new namespace is minted. Mint first and the removed device
+    /// can still derive that key, read the capability, and follow the group into
+    /// the very namespace the rotation existed to keep it out of — while every
+    /// test that merely checks "the group rotated" still passes.
+    #[test]
+    fn the_removal_is_broadcast_before_the_rotation_is_requested() {
+        let mut bus = two_node_workspace();
+        let bob_id = bus.bob.member_id();
+
+        let effects = bus
+            .alice
+            .handle(Event::RemoveMember { member: bob_id }, &mut rng(500))
+            .expect("alice should be able to remove bob");
+
+        let removal = effects
+            .iter()
+            .position(|e| matches!(e, Effect::BroadcastOp(_)))
+            .expect("removing a member must broadcast the operation that does it");
+        let rotation = effects
+            .iter()
+            .position(|e| matches!(e, Effect::RotateNamespace { .. }))
+            .expect("removing a member must also abandon the namespace they can still write to");
+
+        assert!(
+            removal < rotation,
+            "the namespace was requested at index {rotation} but the removal only broadcast at \
+             {removal}: minting before the leaf leaves the tree lets the removed device decrypt \
+             the new capability and follow the group"
+        );
+    }
+
+    /// Given a removal, when the new capability is announced, we expect the
+    /// removed member to be unable to adopt it.
+    ///
+    /// The mechanism itself, end to end and from the victim's side. Bob receives
+    /// the announcement — it is broadcast on a topic every past invitee can
+    /// reach, so he cannot be prevented from seeing the bytes — and gets nothing
+    /// from them.
+    #[test]
+    fn a_removed_member_cannot_adopt_the_rotation_it_is_handed() {
+        let mut bus = two_node_workspace();
+        let bob_id = bus.bob.member_id();
+        assert_eq!(
+            bus.bob.namespace(),
+            NamespaceEpoch::INITIAL,
+            "bob must start on the founding namespace for his staying there to mean anything"
+        );
+
+        bus.alice_does(Event::RemoveMember { member: bob_id }, 510);
+        assert!(
+            bus.alice.namespace() > NamespaceEpoch::INITIAL,
+            "alice did not move off the namespace she just abandoned, so bob staying put \
+             would prove nothing"
+        );
+
+        // Everything alice put on the wire, control plane first — exactly the
+        // order a well-behaved transport delivers it in, so this is the *best*
+        // case for bob rather than a contrived one.
+        bus.deliver_all_to_bob();
+        bus.deliver_rotations_to_bob();
+
+        assert_eq!(
+            bus.bob.namespace(),
+            NamespaceEpoch::INITIAL,
+            "a removed member adopted the rotation issued to exclude him, so he would go on \
+             syncing the group's index and seeing every entry they write"
+        );
+    }
+
+    /// Given a member still in the group, when a rotation is announced, we expect
+    /// them to adopt it.
+    ///
+    /// **The counterweight.** Everything above is satisfied by a rotation nobody
+    /// can read, which would destroy the workspace rather than protect it. This
+    /// is what makes the exclusion mean exclusion rather than breakage.
+    ///
+    /// Driven through `NamespaceMinted` rather than through a removal, so that
+    /// adoption is isolated from revocation: the question here is whether a
+    /// member who still holds the group's keys can read a capability, and
+    /// removing bob to find out would remove the only member available to test.
+    #[test]
+    fn a_remaining_member_adopts_the_rotation() {
+        let mut bus = two_node_workspace();
+
+        let effects = bus
+            .alice
+            .handle(
+                Event::NamespaceMinted {
+                    epoch: 0,
+                    ticket: b"a capability alice minted".to_vec(),
+                },
+                &mut rng(520),
+            )
+            .expect("alice should encrypt a capability she minted");
+        bus.queue_for_bob(effects);
+
+        bus.deliver_all_to_bob();
+        bus.deliver_rotations_to_bob();
+
+        assert_eq!(
+            bus.bob.namespace(),
+            bus.alice.namespace(),
+            "a member holding the group's keys did not follow the rotation, which would strand \
+             them on an abandoned replica — removed in effect, without anyone removing them"
+        );
+    }
+
+    /// Given a member id no `Add` ever introduced, when an admin tries to remove
+    /// it, we expect nothing to be rotated.
+    ///
+    /// Rotation is the most expensive thing the protocol does: it re-publishes
+    /// every document and forces every member to re-import. Triggering it on a
+    /// removal that removed nobody would let any admin churn the whole group by
+    /// repeatedly "removing" somebody who already left.
+    #[test]
+    fn removing_a_non_member_rotates_nothing() {
+        let mut bus = two_node_workspace();
+        let stranger =
+            beekem::id::MemberId::from(MemorySigner::generate(&mut rng(530)).verifying_key());
+
+        let effects = bus
+            .alice
+            .handle(Event::RemoveMember { member: stranger }, &mut rng(531))
+            .expect("removing a non-member is not an error");
+
+        assert!(
+            effects.is_empty(),
+            "removing somebody who was never a member produced {} effect(s), so an admin could \
+             force the group through a full re-publish at will",
+            effects.len()
+        );
+    }
+
+    /// Given two admins that rotate concurrently to the same generation, when
+    /// each hears the other's announcement, we expect both to end on the same
+    /// namespace.
+    ///
+    /// A bare counter cannot settle this: both mint *n+1*, and the group would
+    /// split across two replicas with each half convinced it was current.
+    /// Ordering on `(epoch, digest)` is a pure function of the values, so it
+    /// converges without depending on which announcement arrived first — which
+    /// is the property, and why the digest is recomputed from the decrypted
+    /// capability rather than trusted from the wire.
+    #[test]
+    fn concurrent_rotations_to_the_same_generation_converge() {
+        let (a, b) = (
+            NamespaceEpoch::of(1, b"capability-from-alice"),
+            NamespaceEpoch::of(1, b"capability-from-carol"),
+        );
+        assert_ne!(
+            a, b,
+            "two distinct capabilities must produce distinct generations, or there is nothing \
+             to break the tie with"
+        );
+
+        let winner = a.max(b);
+        // Adoption is `announced > current`, applied in either order.
+        let mut alice_side = a;
+        if b > alice_side {
+            alice_side = b;
+        }
+        let mut carol_side = b;
+        if a > carol_side {
+            carol_side = a;
+        }
+
+        assert_eq!(
+            alice_side, carol_side,
+            "two nodes seeing the same pair of concurrent rotations in opposite orders ended on \
+             different namespaces, so the group would split in half permanently"
+        );
+        assert_eq!(
+            alice_side, winner,
+            "the tie-break did not select the larger generation, so the winner depends on \
+             delivery order rather than on the values"
         );
     }
 }

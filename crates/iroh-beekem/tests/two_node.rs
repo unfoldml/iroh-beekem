@@ -801,3 +801,155 @@ mod admission_control_is_wired_to_iroh {
     #[allow(dead_code)]
     fn guard_is_a_protocol_handler<P: ProtocolHandler>() {}
 }
+
+/// Namespace rotation, against live endpoints.
+///
+/// The simulator models the *effect* of abandoning a replica — an entry written
+/// to one namespace is invisible in another — but it cannot show that the
+/// modelled epoch corresponds to anything `iroh-docs` enforces. Only real
+/// namespaces can.
+mod removal_abandons_the_namespace {
+    use iroh_beekem_core::NamespaceEpoch;
+
+    use super::*;
+
+    /// Given a workspace with two members, when one is removed, we expect the
+    /// group to move to a namespace the removed device does not follow.
+    ///
+    /// This is what turns "cannot read" into "cannot see". The `iroh-docs` write
+    /// capability is all-or-nothing and cannot be withdrawn from one holder, so
+    /// a revoked device goes on syncing the replica it was given — observing
+    /// entry existence, size, author and timing for every document — until the
+    /// group abandons that replica for one whose capability it never receives.
+    #[tokio::test]
+    async fn a_removed_member_is_left_on_the_abandoned_namespace() {
+        let Pair {
+            alice,
+            bob,
+            bob_id,
+            doc,
+        } = invited_pair(300).await;
+
+        let original = alice.namespace().await;
+        assert_eq!(
+            bob.namespace().await,
+            original,
+            "the two must share a namespace first, or being left behind means nothing"
+        );
+        assert_eq!(
+            alice.namespace_epoch().await,
+            NamespaceEpoch::INITIAL,
+            "a workspace that has never removed anybody is on its founding namespace"
+        );
+
+        // Establish that bob really was syncing, so the assertions below are
+        // about revocation rather than about a pairing that never worked.
+        alice.append(doc, "before").await.expect("alice writes");
+        eventually(
+            "bob syncs before the removal",
+            Duration::from_secs(30),
+            || async {
+                bob.ingest().await;
+                bob.read(doc).await.contains("before")
+            },
+        )
+        .await;
+
+        alice
+            .remove_device(bob_id)
+            .await
+            .expect("alice removes bob");
+
+        eventually(
+            "alice moves off the namespace bob can still write to",
+            Duration::from_secs(30),
+            || async { alice.namespace().await != original },
+        )
+        .await;
+
+        // Bob keeps the capability he was given, keeps the gossip topic, and
+        // keeps running. What he does not keep is a replica anyone reconciles
+        // with him.
+        never(
+            "the removed member follows the group to the new namespace",
+            Duration::from_secs(10),
+            || async {
+                bob.ingest().await;
+                bob.namespace().await == alice.namespace().await
+            },
+        )
+        .await;
+
+        assert_eq!(
+            bob.namespace_epoch().await,
+            NamespaceEpoch::INITIAL,
+            "the removed member adopted the rotation issued to exclude him"
+        );
+        assert!(
+            alice.namespace_epoch().await > NamespaceEpoch::INITIAL,
+            "alice did not advance her own generation, so nothing was actually abandoned"
+        );
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+
+    /// Given a rotated namespace, when the remaining member writes, we expect
+    /// the content to survive the move.
+    ///
+    /// **The counterweight, and the one that matters most here.** Rotation
+    /// re-publishes every document into a fresh replica and re-subscribes the
+    /// data pump — the single most disruptive thing the protocol does. A
+    /// rotation that lost the workspace would pass every eviction assertion
+    /// above while being strictly worse than not rotating at all.
+    #[tokio::test]
+    async fn the_remaining_member_keeps_its_documents_across_the_rotation() {
+        let Pair {
+            alice,
+            bob,
+            bob_id,
+            doc,
+        } = invited_pair(301).await;
+
+        alice
+            .append(doc, "written before the removal")
+            .await
+            .expect("alice writes");
+        eventually("bob syncs first", Duration::from_secs(30), || async {
+            bob.ingest().await;
+            bob.read(doc).await.contains("written before the removal")
+        })
+        .await;
+
+        alice
+            .remove_device(bob_id)
+            .await
+            .expect("alice removes bob");
+        eventually("alice rotates", Duration::from_secs(30), || async {
+            alice.namespace_epoch().await > NamespaceEpoch::INITIAL
+        })
+        .await;
+
+        // Readable across the move, and still writable after it: the pump has
+        // to be live on the *new* namespace, not the abandoned one.
+        assert!(
+            alice.read(doc).await.contains("written before the removal"),
+            "the rotation lost content that existed before it"
+        );
+        alice
+            .append(doc, "written after the rotation")
+            .await
+            .expect("alice writes into the namespace she rotated to");
+        assert!(
+            alice.read(doc).await.contains("written after the rotation"),
+            "alice cannot write to the namespace she just moved to"
+        );
+        assert!(
+            !alice.files().await.is_empty(),
+            "the file index did not survive the rotation, so the workspace forgot its documents"
+        );
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+}

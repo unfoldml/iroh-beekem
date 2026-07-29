@@ -77,10 +77,84 @@ pub const MAX_PENDING_CHUNKS: usize = 4096;
 /// than merely out of date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum RepairTarget {
+    /// The current namespace capability.
+    ///
+    /// A member that missed a rotation is not merely out of date, it is *gone*:
+    /// it goes on syncing a replica the group has abandoned, so it sees no new
+    /// entry and publishes where nobody reads. And unlike content, a rotation
+    /// is announced once — there is no later write to carry it — so without a
+    /// way to ask, a single lost announcement strands a member permanently.
+    Namespace,
     /// One document, named by the UUID both sides already agree on.
     Document(DocumentUuid),
     /// The workspace manifest.
     Manifest,
+}
+
+/// Which generation of the replicated index a node is syncing.
+///
+/// Removal revokes *reading* through the CGKA, but the `iroh-docs` write
+/// capability is all-or-nothing and cannot be withdrawn from one holder — so a
+/// removed device keeps syncing the index, and goes on observing entry
+/// existence, size, author and timing for every document. The only way to stop
+/// that is to abandon the namespace for a fresh one whose capability the removed
+/// device never receives. This identifies which one the group is on.
+///
+/// # Why a digest as well as a counter
+///
+/// Two admins removing different members concurrently both mint epoch *n+1*,
+/// and a bare counter gives no way to choose between them — the group would
+/// split across two namespaces, each half convinced it was current. Ordering on
+/// `(epoch, digest)` makes the choice total and identical everywhere, so both
+/// sides converge on the same winner without a coordinator.
+///
+/// The losing namespace is not wrong, merely abandoned: it held correctly
+/// encrypted data the whole time. This is a convergence device, not a
+/// correctness argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NamespaceEpoch {
+    /// Generation counter. Ordered first, so a later rotation always wins.
+    pub epoch: u32,
+    /// BLAKE3 of the capability, breaking ties between concurrent rotations.
+    pub digest: [u8; 32],
+}
+
+impl Default for NamespaceEpoch {
+    /// A workspace starts on [`Self::INITIAL`], which every rotation supersedes.
+    fn default() -> Self {
+        Self::INITIAL
+    }
+}
+
+impl NamespaceEpoch {
+    /// The epoch a workspace starts on, before any rotation.
+    ///
+    /// The all-zero digest is not a real capability digest and does not need to
+    /// be: it is only ever the *smallest* value, which is exactly right for a
+    /// founding namespace that any rotation should supersede.
+    pub const INITIAL: Self = Self {
+        epoch: 0,
+        digest: [0u8; 32],
+    };
+
+    /// The epoch a freshly minted capability belongs to.
+    #[must_use]
+    pub fn of(epoch: u32, ticket: &[u8]) -> Self {
+        Self {
+            epoch,
+            digest: blake3::hash(ticket).into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NamespaceEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "e{}/", self.epoch)?;
+        for byte in &self.digest[..4] {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Something that happened to this node.
@@ -257,6 +331,45 @@ pub enum Event {
         /// Which document to re-publish.
         doc: DocumentUuid,
     },
+    /// The caller minted the namespace this node asked for.
+    ///
+    /// The reply to [`Effect::RotateNamespace`]. `ticket` is the capability for
+    /// the new namespace, opaque here: what it *means* is a transport concern,
+    /// and naming `iroh_docs::DocTicket` in this crate would drag iroh into a
+    /// crate that must not depend on it.
+    NamespaceMinted {
+        /// The generation the caller was asked to mint.
+        epoch: u32,
+        /// The capability, in whatever encoding the caller chose.
+        ticket: Vec<u8>,
+    },
+    /// A peer announced a namespace rotation.
+    ///
+    /// The capability is encrypted under the group key, so a device removed
+    /// before the rotation cannot read it — which is the entire mechanism. It
+    /// arrives as an ordinary chunk and is decrypted the same way as any other.
+    NamespaceArrived {
+        /// The generation the sender claims to have minted.
+        ///
+        /// Not trusted on its own: the digest is recomputed from the decrypted
+        /// capability, so a peer cannot win a tie by asserting a large one.
+        epoch: u32,
+        /// The encrypted capability.
+        chunk: Box<Chunk>,
+    },
+    /// Re-announce the current namespace capability without rotating.
+    ///
+    /// Anti-entropy for a rotation. A rotation is announced *once*, so unlike a
+    /// document it has nothing behind it: a member whose copy was lost, or that
+    /// received it before the operation establishing its key, is stranded on an
+    /// abandoned replica — publishing where nobody reads and seeing nothing
+    /// anybody writes.
+    ///
+    /// Keyed under the *current* epoch rather than a fresh one, which is the
+    /// difference between this and answering a repair. This runs on a timer and
+    /// minting an epoch each round would re-key the whole tree for nothing; a
+    /// repair runs once per stuck peer and is worth an epoch.
+    ResyncNamespace,
     /// Re-publish the manifest without changing it.
     ///
     /// Anti-entropy for the manifest, and needed for the same reason
@@ -347,6 +460,45 @@ pub enum Effect {
     },
     /// A remote manifest replica was decrypted and merged.
     ManifestUpdated,
+    /// Mint a fresh replicated index and hand its capability back.
+    ///
+    /// Raised after a removal. The caller creates a new namespace and replies
+    /// with [`Event::NamespaceMinted`]; the core then encrypts the capability
+    /// under the *post-removal* group key and asks for it to be published.
+    ///
+    /// Split into three steps rather than one because minting is I/O and
+    /// encrypting is not, and the split is what keeps the key handling in a
+    /// crate that can be simulated.
+    RotateNamespace {
+        /// The generation to mint.
+        epoch: u32,
+    },
+    /// Broadcast an encrypted namespace capability to the group.
+    ///
+    /// **Ordering matters, and it is a security property.** Any implicit key
+    /// update this encryption produced is emitted immediately before this, and
+    /// reordering the two makes the new namespace undecryptable to everyone.
+    /// The removal that triggered the rotation must likewise already have been
+    /// broadcast — issued first, so that the key protecting this announcement
+    /// is one the removed device can no longer derive.
+    PublishNamespace {
+        /// The generation being announced.
+        epoch: u32,
+        /// The encrypted capability.
+        chunk: Box<Chunk>,
+    },
+    /// Switch to a namespace a peer minted, and re-publish everything into it.
+    ///
+    /// Re-publishing is not optional: the new namespace starts empty, so a node
+    /// that switched without re-publishing would take its documents out of
+    /// circulation. The old namespace is abandoned rather than deleted, because
+    /// peers that have not yet seen the rotation are still catching up on it.
+    AdoptNamespace {
+        /// The generation being adopted.
+        epoch: u32,
+        /// The decrypted capability, in the caller's own encoding.
+        ticket: Vec<u8>,
+    },
     /// Tell the group that this node can never decrypt what it just received.
     ///
     /// Raised when a chunk names an epoch whose establishing operation is in
@@ -445,6 +597,23 @@ pub struct WorkspaceState {
     /// arrives. Without that a joiner never appears on any peer's roster, and
     /// admission control would lock it out of the workspace it just joined.
     endpoint_id: Option<[u8; 32]>,
+    /// Which generation of the replicated index this node is syncing.
+    ///
+    /// Held here rather than in the manifest on purpose. The manifest is a CRDT
+    /// whose conflict resolution is Loro's internal ordering, which is a fact
+    /// about operation ids rather than about the values — so two concurrent
+    /// rotations would converge on an arbitrary winner rather than on the one
+    /// every node can compute for itself. Comparing `(epoch, digest)` is a pure
+    /// function of the values, so it converges without depending on how the
+    /// updates happened to be ordered.
+    namespace: NamespaceEpoch,
+    /// The capability for [`Self::namespace`], kept so it can be re-announced.
+    ///
+    /// A rotation is published once and has nothing behind it, so a peer that
+    /// missed the announcement can only be served by somebody re-encrypting the
+    /// capability they already hold. Empty on the founding namespace, which was
+    /// never announced to anybody.
+    namespace_ticket: Vec<u8>,
 }
 
 impl Clone for WorkspaceState {
@@ -487,6 +656,8 @@ impl Clone for WorkspaceState {
             repairs_answered: self.repairs_answered,
             last_ref: self.last_ref.clone(),
             endpoint_id: self.endpoint_id,
+            namespace: self.namespace,
+            namespace_ticket: self.namespace_ticket.clone(),
         }
     }
 }
@@ -523,6 +694,8 @@ impl WorkspaceState {
             repairs_answered: 0,
             last_ref: HashMap::new(),
             endpoint_id: None,
+            namespace: NamespaceEpoch::INITIAL,
+            namespace_ticket: Vec::new(),
         }
     }
 
@@ -561,6 +734,17 @@ impl WorkspaceState {
     #[must_use]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Which generation of the replicated index this node is syncing.
+    ///
+    /// A device removed at generation *n* never receives the capability for
+    /// *n+1*, so comparing this against a peer's is how "still in the group" is
+    /// observed from the outside — including by a property test, which is why
+    /// it is public rather than internal.
+    #[must_use]
+    pub fn namespace(&self) -> NamespaceEpoch {
+        self.namespace
     }
 
     /// How many members currently hold a leaf.
@@ -768,14 +952,7 @@ impl WorkspaceState {
                 self.manifest.rename(doc, &path)?;
                 self.publish_manifest(Keying::Current, csprng)
             }
-            Event::SetRole { user, role } => {
-                self.require_admin()?;
-                if !role.can_administer() {
-                    self.require_not_last_admin(&user)?;
-                }
-                self.manifest.set_role(&user, role)?;
-                self.publish_manifest(Keying::Current, csprng)
-            }
+            Event::SetRole { user, role } => self.on_set_role(&user, role, csprng),
             Event::SetInfo { info } => {
                 self.require_admin()?;
                 self.manifest.set_info(&info)?;
@@ -793,6 +970,11 @@ impl WorkspaceState {
                 self.publish_manifest(Keying::Current, csprng)
             }
             Event::ResyncManifest => self.publish_manifest(Keying::Current, csprng),
+            Event::ResyncNamespace => self.republish_namespace(Keying::Current, csprng),
+            Event::NamespaceMinted { epoch, ticket } => {
+                self.on_namespace_minted(epoch, &ticket, csprng)
+            }
+            Event::NamespaceArrived { epoch, chunk } => self.on_namespace_arrived(epoch, &chunk),
             Event::RepairRequested {
                 requester,
                 target,
@@ -928,6 +1110,27 @@ impl WorkspaceState {
         Ok(effects)
     }
 
+    /// Assign a role to a user.
+    ///
+    /// Demoting the last admin is refused rather than merely discouraged: a
+    /// workspace with no administrator can never gain one, because granting a
+    /// role is itself an administrative act.
+    fn on_set_role<R: CryptoRng + RngCore>(
+        &mut self,
+        user: &[u8; 32],
+        role: Role,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_admin()?;
+        if role.can_administer() {
+            // Promoting cannot leave the group without an admin.
+        } else {
+            self.require_not_last_admin(user)?;
+        }
+        self.manifest.set_role(user, role)?;
+        self.publish_manifest(Keying::Current, csprng)
+    }
+
     /// Admit a new person along with their first device.
     ///
     /// The caller checks the permission; this writes the records. All three go
@@ -1011,10 +1214,118 @@ impl WorkspaceState {
             self.require_not_last_admin(&owner)?;
         }
         let op = self.cgka.remove_member(member)?;
-        Ok(op
-            .map(|o| Effect::BroadcastOp(Box::new(o)))
+        let Some(op) = op else {
+            // Not a member, so nothing was revoked and nothing needs rotating.
+            // Rotating anyway would let an admin churn the whole group's
+            // namespace by repeatedly "removing" somebody who already left.
+            return Ok(Vec::new());
+        };
+
+        // **Ordering is the security property.** The removal is broadcast
+        // first; only then is a new namespace minted, and its capability is
+        // encrypted after this leaf is out of the tree. Reversed, the removed
+        // device could still derive the key protecting the announcement, read
+        // the new capability, and follow the group into the very namespace the
+        // rotation existed to keep it out of.
+        self.namespace.epoch = self.namespace.epoch.saturating_add(1);
+        Ok(vec![
+            Effect::BroadcastOp(Box::new(op)),
+            Effect::RotateNamespace {
+                epoch: self.namespace.epoch,
+            },
+        ])
+    }
+
+    /// Encrypt a freshly minted namespace capability for the group.
+    ///
+    /// The counter was already advanced by the removal that asked for this, so
+    /// a reply naming a different generation is stale — a second rotation
+    /// overtook it — and is dropped rather than published. Publishing it would
+    /// announce a namespace nobody is moving to.
+    ///
+    /// Uses [`CgkaController::encrypt_fresh`] rather than `encrypt`, and the
+    /// difference matters: `encrypt` reuses the current epoch key whenever
+    /// beekem has one, which a member admitted since the last publish cannot
+    /// derive. That member would be unable to read the capability and would be
+    /// stranded in the abandoned namespace — removed in effect, without anyone
+    /// having removed them.
+    fn on_namespace_minted<R: CryptoRng + RngCore>(
+        &mut self,
+        epoch: u32,
+        ticket: &[u8],
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if epoch != self.namespace.epoch {
+            return Ok(Vec::new());
+        }
+        let minted = NamespaceEpoch::of(epoch, ticket);
+        let (chunk, ops) = self.cgka.encrypt_fresh(ticket, &[], csprng)?;
+        self.namespace = minted;
+        self.namespace_ticket = ticket.to_vec();
+
+        // The key operations strictly first: they are what let the group derive
+        // the key this chunk is under, and a peer receiving them the other way
+        // round would fail to decrypt and never retry.
+        let mut effects: Vec<Effect> = ops
             .into_iter()
-            .collect())
+            .map(|op| Effect::BroadcastOp(Box::new(op)))
+            .collect();
+        effects.push(Effect::PublishNamespace {
+            epoch,
+            chunk: Box::new(chunk),
+        });
+        // The minter moves onto its own namespace by the same effect every
+        // other member uses, rather than by a second path in each backend.
+        // Without this the admin who issued the removal would be the one member
+        // still publishing into the namespace it just abandoned — and since it
+        // is usually the only admin, the group would follow nobody.
+        effects.push(Effect::AdoptNamespace {
+            epoch,
+            ticket: ticket.to_vec(),
+        });
+        Ok(effects)
+    }
+
+    /// Consider a rotation a peer announced.
+    ///
+    /// Adoption is a pure comparison of `(epoch, digest)`, so every node that
+    /// can decrypt the announcement reaches the same verdict however the
+    /// announcements were ordered on the way in. A device removed before the
+    /// rotation cannot decrypt it at all, which is the point.
+    fn on_namespace_arrived(
+        &mut self,
+        epoch: u32,
+        chunk: &Chunk,
+    ) -> Result<Vec<Effect>, CoreError> {
+        let ticket = match self.cgka.decrypt(chunk)? {
+            DecryptOutcome::Plaintext(ticket) => ticket,
+            // The establishing operation has not arrived yet. Deliberately not
+            // parked: rotations are re-announced on every resync, and a queue of
+            // capabilities would be a second unbounded one.
+            DecryptOutcome::AwaitingOp => return Ok(Vec::new()),
+            // Either this node was removed — in which case the request below
+            // is refused, because answering is gated on current membership —
+            // or it is a member that missed the epoch this was keyed under and
+            // genuinely needs it. The two are indistinguishable from here, and
+            // deliberately so: the check belongs with the peer that can see the
+            // current tree, not with the peer asking.
+            DecryptOutcome::Unreachable => {
+                return Ok(vec![Effect::RequestRepair {
+                    target: RepairTarget::Namespace,
+                    epoch: EpochId::of(chunk),
+                }]);
+            }
+        };
+
+        // The digest is recomputed from what was decrypted rather than trusted
+        // from the wire, so a member cannot win a tie by claiming a large one.
+        let announced = NamespaceEpoch::of(epoch, &ticket);
+        if announced <= self.namespace {
+            return Ok(Vec::new());
+        }
+        self.namespace = announced;
+        self.namespace_ticket.clone_from(&ticket);
+        Ok(vec![Effect::AdoptNamespace { epoch, ticket }])
     }
 
     /// Apply a mutation to a document's text and publish the result.
@@ -1198,6 +1509,12 @@ impl WorkspaceState {
             // and a group where only writers can repair the manifest is one
             // where a viewer can be locked off every roster permanently.
             RepairTarget::Manifest => self.publish_manifest(Keying::Fresh, csprng)?,
+            // Ungated for the same reason as the manifest: a viewer stranded on
+            // an abandoned namespace is a viewer removed in all but name, and
+            // requiring a writing role to re-announce would make that
+            // permanent. Re-announcing costs a fresh epoch, which every leaf
+            // currently in the tree can derive and nothing outside it can.
+            RepairTarget::Namespace => self.republish_namespace(Keying::Fresh, csprng)?,
             RepairTarget::Document(doc) => {
                 if self.docs.contains_key(&doc) && self.require_write().is_ok() {
                     self.publish_keyed(doc, Keying::Fresh, csprng)?
@@ -1213,6 +1530,35 @@ impl WorkspaceState {
             self.repairs_answered += 1;
             Ok(effects)
         }
+    }
+
+    /// Re-announce the capability this node holds, under a fresh epoch.
+    ///
+    /// The ticket is kept precisely so this is possible. A rotation is
+    /// published once, and if it is lost there is no later write behind it —
+    /// unlike a document, whose next edit carries the same content again. This
+    /// is the only path by which a member that missed one gets back.
+    fn republish_namespace<R: CryptoRng + RngCore>(
+        &mut self,
+        keying: Keying,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if self.namespace_ticket.is_empty() {
+            // Still on the founding namespace, which nobody was handed and
+            // nobody can therefore have missed.
+            return Ok(Vec::new());
+        }
+        let ticket = self.namespace_ticket.clone();
+        let (chunk, ops) = self.encrypt_keyed(&ticket, &[], keying, csprng)?;
+        let mut effects: Vec<Effect> = ops
+            .into_iter()
+            .map(|op| Effect::BroadcastOp(Box::new(op)))
+            .collect();
+        effects.push(Effect::PublishNamespace {
+            epoch: self.namespace.epoch,
+            chunk: Box::new(chunk),
+        });
+        Ok(effects)
     }
 
     /// Encrypt the manifest and emit it for storage at its well-known key.
