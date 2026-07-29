@@ -2,8 +2,7 @@
 
 ## Context
 
-The near-term goal is **a publishable 0.1 crate**, so the governing question is *"what freezes the
-public API, and what would be embarrassing to ship."*
+The near-term goal is **a publishable 0.1 crate**.
 
 Phases 0–4 are closed. What remains is ordered by one finding from the post-Phase-4 security review,
 which outranks everything else on the list:
