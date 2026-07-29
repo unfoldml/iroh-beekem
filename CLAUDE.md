@@ -85,73 +85,16 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
 - Architecture and designs live in [docs/](docs/) and must be periodically reviewed. Mark or remove assumptions/conventions that no longer hold or are speculative.
 
 
-## Current implementation — revisable
+## Current design
 
-These are today's answers, with the reasoning that produced them and what else moves if they change.
-None of them is settled; if a user story needs a different answer, change it.
-
-- **Three protocols by ALPN on one `iroh::Endpoint`** ([node.rs](crates/iroh-beekem/src/node.rs)):
-  gossip carries `Signed<CgkaOperation>` on a topic derived from the CGKA tree id, docs carries the
-  index of blinded keys → content hashes, blobs carries the encrypted payloads. Spawn order matters
-  as written: blobs and gossip before docs, which is handed both.
-- **Missed control operations are repaired by re-shipping the whole log** on `NeighborUp`
-  (`ControlMsg::Log`, [wire.rs](crates/iroh-beekem/src/wire.rs)). A peer that misses an operation can
-  never derive keys for anything encrypted after it, so *some* repair is needed; whole-log resend is
-  simply the cheapest one to write.
-- **Unreadable content is repaired on demand, by the peer that cannot read it.** A member admitted
-  after content existed can never derive the epoch that content was keyed under, and anti-entropy
-  cannot fix that: `Event::Resync` re-encrypts under the *current* epoch, so for such a peer every
-  repeat reproduces a ciphertext it already failed on. `Effect::RequestRepair` names the
-  `(target, epoch)` it is stuck on, and `Event::RepairRequested` is answered by re-publishing through
-  `Keying::Fresh`, which mints an epoch every leaf in the tree can derive and nothing outside it can
-  ([state.rs](crates/iroh-beekem-core/src/state.rs)). Demand-driven rather than scheduled because
-  answering costs a tree operation: the alternative, re-keying on a timer, charges the whole group
-  for a peer that may not exist.
-- **Content flows through Loro as CRDT updates**, so a chunk applies only when the CGKA can reach the
-  PCS key it names *and* Loro has the operations it depends on — that second condition is what
-  `park_chunk` / `drain_pending` / `try_apply` in [state.rs](crates/iroh-beekem-core/src/state.rs)
-  exist for. Both parking areas are bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`,
-  `MAX_PENDING_CHUNKS`) and evict oldest-first, because unbounded queues are a remote
-  memory-exhaustion vector; a property test asserts an honest run never evicts. A payload path that
-  did not route through the CRDT would not need the second condition at all.
-- **Storage keys are blinded**: `BLAKE3-MAC(workspace_secret, document_uuid)`, fixed 32 bytes, keyed
-  on a stable UUID rather than a path so a rename touches only the encrypted manifest
-  ([blinding.rs](crates/iroh-beekem-core/src/blinding.rs)). Follows from `iroh-docs` reconciling by
-  key with keys in the clear.
-- **Removal rotates to a fresh `iroh-docs` namespace** ([workspace.rs](crates/iroh-beekem/src/workspace.rs)):
-  the `Doc` lives behind an `RwLock` because it is *replaced*, and the data-plane pump is respawned
-  against the new subscription with the ingestion cache cleared. The removed device keeps the write
-  capability it was given — `iroh-docs` has no per-member key to withdraw — so the capability is made
-  worthless rather than revoked. The old namespace is left rather than dropped, since peers may still
-  be catching up on it.
-- **The manifest is where permissions live**
-  ([manifest.rs](crates/iroh-beekem-core/src/manifest.rs)): logical paths, roles, and the `iroh-docs`
-  author → CGKA member mapping. The CGKA decides who *can* decrypt; the manifest decides who is
-  *authorised* to act. `ingest_all` ([workspace.rs](crates/iroh-beekem/src/workspace.rs)) therefore
-  reads the manifest before document entries — `author_may_write` needs the mapping, so the reverse
-  order rejects legitimate entries.
-- **Authentication is ours, not beekem's.** beekem verifies nothing, so `CgkaController::merge`
-  ([keys.rs](crates/iroh-beekem-core/src/keys.rs)) adds the two checks that make a public gossip topic
-  safe: signature against the embedded issuer key, then issuer ∈ `known_members`. Order matters —
-  membership is checked only *after* predecessors are in hand, or a member whose own `Add` is still in
-  flight would be rejected. `known_members` is currently monotone (a `Remove` does not retract) because
-  retracting would make admissibility depend on delivery order and diverge peers.
-- **Removal rotates the namespace, and the order is the security property.** `on_remove_member`
-  ([state.rs](crates/iroh-beekem-core/src/state.rs)) broadcasts the CGKA `Remove` *before* emitting
-  `Effect::RotateNamespace`; the capability for the new namespace is then encrypted under a group
-  key the removed leaf can no longer derive. Reversed, the removed device reads the announcement and
-  follows the group. `NamespaceEpoch` orders on `(epoch, digest)` — a bare counter cannot settle two
-  concurrent rotations, and the digest is recomputed from the decrypted capability so it cannot be
-  claimed. Rotation is skipped entirely when the target was not a member, or any admin could force a
-  full re-publish at will.
-- **Admission control is an authenticated allowlist over endpoint ids.** All three ALPNs are wrapped
-  in `RosterGuard` ([roster.rs](crates/iroh-beekem/src/roster.rs)); an `EndpointId` is the peer's
-  public key, authenticated by the QUIC handshake. The roster is *derived*, never authored —
-  `WorkspaceState::roster` ([state.rs](crates/iroh-beekem-core/src/state.rs)) intersects the
-  manifest's device addresses with `current_members` — so it converges like everything else and
-  inherits the admin gating on `AddUser`/`AddDevice`. Computed in the core so the rule is testable
-  without a socket. Eviction is eventual, and it is an availability boundary, not a confidentiality
-  one.
+Today's answers — the three ALPNs, blinded storage keys, log and demand-driven repair, the two-DAG
+content path, removal-then-rotation, the derived roster — live in
+[docs/IMPLEMENTATION_PLAN_PROGRESS.md](docs/IMPLEMENTATION_PLAN_PROGRESS.md) under *The design as it
+stands*, each with the reasoning that produced it and what else moves if it changes. None is settled;
+if a user story needs a different answer, change it. **Read that section before proposing a design
+change** — three of its entries carry a security-review qualifier that is easy to miss, most notably
+that no receiving node checks an issuer's *role* for anything, so the manifest currently records what
+well-behaved peers agreed to rather than deciding who is authorised to act.
 
 ## Easy to break by accident
 
