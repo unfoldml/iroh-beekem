@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use iroh_beekem_sim::{Honest, Scenario, WorkspaceNode};
+use iroh_beekem_sim::{Honest, Role, Scenario, WorkspaceNode, member_bytes_of};
 use propsim::prelude::*;
 
 const NODES: usize = 3;
@@ -169,6 +169,38 @@ fn no_control_operation_stays_parked_forever() {
         |w: &World<'_, WorkspaceNode<Honest>>| {
             let members = joined(w);
             members.len() == NODES && members.iter().all(|n| n.parked_ops() == 0)
+        },
+    )])
+    .run(deterministic());
+}
+
+/// In an entirely honest run, upon any interleaving, we expect no node's roles or
+/// device bindings ever to move except under a valid capability chain.
+///
+/// Cross-cutting deliberately, and asserted *here* rather than only in the
+/// insider scenario. An authorization property stated only against an attacker
+/// says nothing about whether the honest path quietly accepts uncertified state —
+/// and "the honest path quietly accepted uncertified state" is exactly the shape
+/// of the finding phase 5 closed. A suite that only watches attackers can be
+/// green while every check is dead code.
+#[test]
+fn no_role_or_binding_ever_moves_without_a_valid_chain() {
+    base_plan(vec![property::always(
+        "roles and bindings only ever reflect what was actually granted",
+        |w: &World<'_, WorkspaceNode<Honest>>| {
+            let admitted: Vec<[u8; 32]> = (0..NODES as u64).map(member_bytes_of).collect();
+            w.nodes().filter(|n| n.has_joined()).all(|n| {
+                // Exactly one admin — the founder — because nothing in an honest
+                // run grants another.
+                n.admin_count() <= 1
+                    // No device resolving to a person nobody admitted.
+                    && n.certified_users().iter().all(|u| admitted.contains(u))
+                    // And every member holding exactly what its admission gave it.
+                    && admitted.iter().enumerate().all(|(id, user)| {
+                        let expected = if id == 0 { Role::Admin } else { Role::Editor };
+                        n.role_of(*user).is_none_or(|role| role == expected)
+                    })
+            })
         },
     )])
     .run(deterministic());
@@ -934,6 +966,317 @@ mod an_outsider_observes_nothing {
                 },
             )],
         )
+        .run(deterministic());
+    }
+}
+
+/// A member that joined legitimately and then acts beyond the role it holds.
+///
+/// The distinction from [`a_forging_peer_is_rejected`] is the whole point, and it
+/// is the reason a green suite hid this for four phases. A forging node signs with
+/// a key no `Add` ever introduced, so `known_members` refuses it — that check has
+/// always existed. An insider signs with a key the group itself admitted, holding
+/// a role the group itself granted. Nothing about its identity is wrong. Until the
+/// capability closure existed, no receiver asked what its role permitted, so every
+/// operation it issued was merged.
+///
+/// Every attack here uses certificates the insider genuinely signed. That is what
+/// makes the scenario worth having: a check that only rejected malformed input
+/// would pass it while changing nothing.
+mod an_insider_cannot_exceed_its_role {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{Insider, Role, WorkspaceNode, member_bytes_of};
+    use propsim::prelude::*;
+
+    use super::{NODES, plan};
+
+    /// In a workspace where only the founder was granted an administrative role,
+    /// upon a member issuing grants promoting itself, we expect no node ever to
+    /// see more than one administrator.
+    ///
+    /// Confirmed to fail before phase 5, in its manifest form: the insider wrote
+    /// its own role into the manifest and every replica merged it.
+    #[test]
+    fn no_node_ever_sees_more_administrators_than_were_granted() {
+        plan::<Insider>(vec![property::always(
+            "the workspace never has more than its one granted admin",
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                w.nodes()
+                    .filter(|n| n.has_joined())
+                    .all(|n| n.admin_count() <= 1)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace where every member was granted the editor role, upon the
+    /// insider issuing an administrative grant for itself, we expect every node to
+    /// go on resolving that member to the role it was actually granted.
+    ///
+    /// Distinct from the count above: a self-promotion that also demoted somebody
+    /// else would keep the count at one while still being an escalation.
+    #[test]
+    fn no_member_ever_holds_a_role_it_was_not_granted() {
+        plan::<Insider>(vec![property::always(
+            "every member resolves to the role its admission granted",
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
+                members.iter().all(|observer| {
+                    members.iter().all(|subject| {
+                        // The founder is an admin by axiom; every other node was
+                        // admitted as an editor by `on_hello`, and nothing in this
+                        // scenario legitimately changes that.
+                        let expected = if subject.id() == 0 {
+                            Role::Admin
+                        } else {
+                            Role::Editor
+                        };
+                        observer
+                            .role_of(subject.member_bytes())
+                            .is_none_or(|role| role == expected)
+                    })
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace where the insider splices leaves it controls into the tree,
+    /// upon those bindings reaching every peer, we expect every certified device
+    /// to resolve to a user that was legitimately admitted.
+    ///
+    /// **Not** stated as "the group never grows", and the difference is a real
+    /// design property rather than a weakened assertion. A member may enrol
+    /// further devices of its *own* user without an administrative role —
+    /// enrolling your own phone is not an act of administration, and requiring an
+    /// admin for it would make multi-device support an admin-only operation. So
+    /// the tree legitimately grows under this attack, and the leaf count says
+    /// nothing about whether anything went wrong.
+    ///
+    /// What must never happen is a device resolving to a user nobody admitted, or
+    /// to somebody else's user — which is the escalation, since a device inherits
+    /// its user's role. That is what this counts.
+    #[test]
+    fn every_certified_device_resolves_to_a_legitimately_admitted_user() {
+        plan::<Insider>(vec![property::always(
+            "no device is bound to a user the group never admitted",
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                // Computed from the cluster rather than from the nodes that have
+                // joined: the founder certifies a node before that node has
+                // replayed its own `Welcome`, so a set derived from `has_joined`
+                // would report a failure during ordinary onboarding.
+                let admitted: Vec<[u8; 32]> = (0..NODES as u64).map(member_bytes_of).collect();
+                w.nodes().filter(|n| n.has_joined()).all(|observer| {
+                    observer
+                        .certified_users()
+                        .iter()
+                        .all(|user| admitted.contains(user))
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace where the insider enrols devices for itself, we expect the
+    /// number of distinct users to stay at the number of people admitted.
+    ///
+    /// The sharper form of the property above: self-enrolment may add leaves, but
+    /// it must never add *people*, because a person is what a role attaches to.
+    #[test]
+    fn the_insider_never_creates_a_new_user() {
+        plan::<Insider>(vec![property::always(
+            "no attack introduces a person the group did not admit",
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                w.nodes()
+                    .filter(|n| n.has_joined())
+                    .all(|n| n.certified_users().len() <= NODES)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace under attack from one of its own members, upon the network
+    /// settling, we expect the honest nodes still to converge on identical
+    /// documents.
+    ///
+    /// This is what stops the fix from being "reject more aggressively". A check
+    /// that diverged the group or stalled legitimate traffic would satisfy every
+    /// property above and be strictly worse than the defect it replaced.
+    #[test]
+    fn honest_nodes_still_converge_while_under_attack() {
+        plan::<Insider>(vec![property::eventually_within(
+            "every node converges on the same document despite the insider",
+            Duration::from_secs(15),
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
+                if members.len() != NODES {
+                    return false;
+                }
+                let mut sorted: Vec<Vec<char>> = members
+                    .iter()
+                    .map(|n| {
+                        let mut cs: Vec<char> = n.document_text().chars().collect();
+                        cs.sort_unstable();
+                        cs
+                    })
+                    .collect();
+                sorted.dedup();
+                sorted.len() == 1 && !sorted[0].is_empty()
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace under attack from one of its own members, upon the network
+    /// settling, we expect no chunk and no control operation to remain parked.
+    ///
+    /// The other half of the same concern, and the sharper one. Rejecting an
+    /// operation must not strand the legitimate operations queued behind it, and a
+    /// rejected insider must not be able to spin the repair path — both are
+    /// reachable failure modes of a check applied carelessly, and neither shows up
+    /// in a convergence property.
+    #[test]
+    fn rejection_never_strands_the_queues() {
+        plan::<Insider>(vec![property::eventually_within(
+            "nothing stays parked once the network settles",
+            Duration::from_secs(15),
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                w.nodes()
+                    .filter(|n| n.has_joined())
+                    .all(|n| n.pending_chunks() == 0 && n.parked_ops() == 0)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace under attack from one of its own members, upon the run
+    /// completing, we expect the insider's own view to stay usable.
+    ///
+    /// A node whose operations everyone rejects must not diverge into a permanent
+    /// repair loop. It is still a member in good standing for reading, and a fix
+    /// that made the attacker's own replica unusable would be punishing the wrong
+    /// thing — and would show up in production as a member that mysteriously
+    /// stopped syncing.
+    #[test]
+    fn the_insiders_own_view_stays_self_consistent() {
+        plan::<Insider>(vec![property::eventually_within(
+            "the insider still reads what the group wrote",
+            Duration::from_secs(15),
+            |w: &World<'_, WorkspaceNode<Insider>>| {
+                w.nodes()
+                    .filter(|n| n.has_joined() && n.id() == 2)
+                    .all(|n| !n.document_text().is_empty() && n.pending_chunks() == 0)
+            },
+        )])
+        .run(deterministic());
+    }
+}
+
+/// A member that keeps acting after it has been removed.
+///
+/// The one attacker the merge-time capability check deliberately does **not**
+/// refuse, and the reason is worth restating because it looks like a gap: a
+/// removed member keeps whatever capability it held, since the certificate store
+/// is grow-only, and its signature stays admissible, since `known_members` is
+/// monotone. The only thing distinguishing its operations is `current_members`,
+/// which is order-sensitive — so refusing on it would make two peers that saw the
+/// removal and the operation in opposite orders drop *different* operations, and
+/// the group would diverge permanently. That is a worse failure than the one being
+/// fixed.
+///
+/// So the splice is accepted and then undone. These properties are therefore
+/// `eventually_within` where the insider's are `always`, and that difference is
+/// the honest statement of what removal buys: a bounded window, not zero.
+mod a_removed_member_is_evicted_again {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{Revenant, WorkspaceNode};
+    use propsim::prelude::*;
+
+    use super::{NODES, plan};
+
+    /// The nodes still in the group after the scenario's revocation.
+    fn remaining<'a>(
+        w: &'a World<'a, WorkspaceNode<Revenant>>,
+    ) -> Vec<&'a WorkspaceNode<Revenant>> {
+        w.nodes()
+            .filter(|n| n.has_joined() && n.id() != 2)
+            .collect()
+    }
+
+    /// In a workspace where a removed member splices leaves it controls back into
+    /// the tree, upon the network settling, we expect every remaining member's
+    /// group to be back down to the members that belong in it.
+    ///
+    /// Eviction, stated as the observable it produces. Each honest admin reaches
+    /// this conclusion independently from the same operation, and duplicate
+    /// removals merge as `MergeOutcome::Duplicate`, so no coordination is needed.
+    #[test]
+    fn every_spliced_leaf_is_eventually_removed_again() {
+        plan::<Revenant>(vec![property::eventually_within(
+            "the group returns to its legitimate size after the splices",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<Revenant>>| {
+                let members = remaining(w);
+                !members.is_empty()
+                    // The victim is gone, so the legitimate size is below the
+                    // cluster; anything at or above it is a leaf still spliced in.
+                    && members.iter().all(|n| (n.group_size() as usize) < NODES)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace where a removed member splices leaves back in, we expect
+    /// no remaining member ever to see more administrators than were granted.
+    ///
+    /// The `always` half, and the one that must hold *throughout* the eviction
+    /// window rather than after it. A splice buys the revenant a leaf for a while;
+    /// what it must never buy is authority, because the closure is rooted and a
+    /// revenant can pass on only what it already had.
+    #[test]
+    fn a_splice_never_confers_authority_the_splicer_lacked() {
+        plan::<Revenant>(vec![property::always(
+            "the admin count never rises, splice or no splice",
+            |w: &World<'_, WorkspaceNode<Revenant>>| {
+                remaining(w).iter().all(|n| n.admin_count() <= 1)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace where a removed member keeps issuing, upon the network
+    /// settling, we expect the remaining members still to converge.
+    ///
+    /// Eviction costs a removal *and* a namespace rotation each time, so an
+    /// eviction path that fired without bound would keep the group rotating
+    /// forever and nothing would ever converge. This is the property that would
+    /// catch that.
+    #[test]
+    fn the_remaining_members_still_converge_through_the_evictions() {
+        plan::<Revenant>(vec![property::eventually_within(
+            "the remaining members agree on one namespace and one document",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<Revenant>>| {
+                let members = remaining(w);
+                if members.len() < 2 {
+                    return false;
+                }
+                let mut namespaces: Vec<_> = members.iter().map(|n| n.namespace()).collect();
+                namespaces.dedup();
+                let mut sorted: Vec<Vec<char>> = members
+                    .iter()
+                    .map(|n| {
+                        let mut cs: Vec<char> = n.document_text().chars().collect();
+                        cs.sort_unstable();
+                        cs
+                    })
+                    .collect();
+                sorted.dedup();
+                namespaces.len() == 1 && sorted.len() == 1
+            },
+        )])
         .run(deterministic());
     }
 }

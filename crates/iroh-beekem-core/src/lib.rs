@@ -26,6 +26,7 @@
 #![warn(missing_docs)]
 
 pub mod blinding;
+pub mod capability;
 pub mod content;
 pub mod error;
 pub mod keys;
@@ -34,8 +35,9 @@ pub mod state;
 pub mod sync_poll;
 
 pub use blinding::{DocumentUuid, StorageKey, WorkspaceSecret};
+pub use capability::{CapabilityStore, Certificate, DeviceBinding, Grant, Role};
 pub use content::{Chunk, ChunkRef};
 pub use error::CoreError;
-pub use keys::{CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome};
-pub use manifest::{DeviceRecord, FileEntry, Manifest, Role, UserRecord, WorkspaceInfo};
+pub use keys::{AuthorizedOp, CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome};
+pub use manifest::{DeviceDisplay, DeviceRecord, FileEntry, Manifest, UserRecord, WorkspaceInfo};
 pub use state::{Effect, Event, NamespaceEpoch, RepairTarget, WorkspaceState};

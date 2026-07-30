@@ -37,6 +37,34 @@ pub enum CoreError {
         issuer: [u8; 32],
     },
 
+    /// A correctly-signed operation was issued by a member the capability
+    /// closure does not permit to issue it.
+    ///
+    /// Distinct from [`Self::Unauthorized`], and the distinction is the whole of
+    /// phase 5: `Unauthorized` means "no `Add` ever named this key", which an
+    /// outsider triggers; this means "this key belongs to a member who is not
+    /// allowed to do *that*", which only an insider can trigger. Conflating them
+    /// would make it impossible to tell an attack on the group from an attack by
+    /// the group.
+    ///
+    /// Raw issuer bytes for the same reason as [`Self::Unauthorized`].
+    #[error(
+        "operation not permitted by the issuer's capabilities: {}",
+        hex(issuer)
+    )]
+    Uncertified {
+        /// The issuing device, which holds no capability admitting the operation.
+        issuer: [u8; 32],
+    },
+
+    /// Signing a capability certificate failed.
+    ///
+    /// Unreachable with an in-memory signer, which is the only kind the core
+    /// accepts; kept as a branch rather than a panic because the signer is
+    /// supplied by the caller.
+    #[error("signing a capability certificate failed: {0}")]
+    Signing(String),
+
     /// Authenticated decryption or encryption failed.
     #[error("AEAD operation failed")]
     Aead(chacha20poly1305::Error),

@@ -9,8 +9,10 @@ follows is a current choice rather than a settled one.
 ## Commands
 
 ```bash
-cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, forgery rejection
-cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer, outsiders
+cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, capability closure,
+                                 # forgery rejection, insider falsification tests
+cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer,
+                                 # outsiders, insiders, revenants
                                  # ~5 min: runs under swarm faults (partitions, latency, reorder)
 cargo test -p iroh-beekem        # two real endpoints over real QUIC
 
@@ -92,9 +94,13 @@ content path, removal-then-rotation, the derived roster — live in
 [docs/IMPLEMENTATION_PLAN_PROGRESS.md](docs/IMPLEMENTATION_PLAN_PROGRESS.md) under *The design as it
 stands*, each with the reasoning that produced it and what else moves if it changes. None is settled;
 if a user story needs a different answer, change it. **Read that section before proposing a design
-change** — three of its entries carry a security-review qualifier that is easy to miss, most notably
-that no receiving node checks an issuer's *role* for anything, so the manifest currently records what
-well-behaved peers agreed to rather than deciding who is authorised to act.
+change** — read it before proposing a design change.
+
+Phase 5 has since landed: authorization is now carried by signed certificates and checked by every
+receiver ([capability.rs](crates/iroh-beekem-core/src/capability.rs)), and the manifest no longer
+holds roles or device bindings. The standing phrasing is **"the capability closure decides who is
+authorised to act; the manifest records what that produced"** — if you find the older "the manifest
+decides who is authorised to act" anywhere, it is stale.
 
 ## Easy to break by accident
 
@@ -121,6 +127,30 @@ them *without* noticing will not fail loudly.
   underneath it. The impl round-trips through a Loro snapshot.
 - **`WorkspaceState::found` vs `joined`.** The founder records itself as the first admin; a joiner
   must not, or Loro converges on a workspace with an administrator nobody appointed.
+- **A capability certificate must travel *with* the operation it authorises.** `Effect::BroadcastOp`
+  carries a `proof`, and `ControlMsg::Log` ships the whole certificate store beside the operation
+  log. A receiver checks the issuer's capability *before* merging, so an operation that arrives
+  without its certificates is **refused, not parked** — no later certificate brings it back. Shipping
+  the log without the store reinstates the exact hole phase 5 closed, on every `NeighborUp`. A role
+  change is worse still: it mints a grant and no operation, so the log exchange is its *only*
+  anti-entropy.
+
+- **`ever_admin` and `role_of` are two predicates on purpose**, and it is the same split as
+  `known_members`/`current_members` for the same reason. `ever_admin` is monotone and decides whether
+  a *certificate* is admitted, which is what makes the closure an order-independent function of the
+  set — two peers holding the same certificates must always agree, or a receiver-side check diverges
+  the group permanently. `role_of` is non-monotone, resolved by `(seq, digest)`, and decides whether
+  an *action* is permitted, where disagreeing costs a refused action the next exchange repairs.
+  Making admission consult `role_of` would let a demotion retract an earlier admission and the
+  fixpoint would no longer be well defined.
+
+- **Authority never goes back into the manifest.** `Manifest::import` is an unconditional CRDT merge,
+  so anything recorded there is writable by any member — that is what the whole of phase 5 was about.
+  The manifest holds claims whose forgery grants nothing (paths, labels, display names, the
+  self-attested author and endpoint maps); roles and device bindings live in `capability.rs`. There is
+  no way to filter a Loro import, so "record it in the manifest and validate on the way in" is not an
+  available design, only an available bug.
+
 - **`known_members` and `current_members` are two sets on purpose.** The first is the
   *authorisation* predicate and must stay monotone, because disagreeing costs a dropped operation and
   permanent divergence. The second is the *enumeration and connection-policy* predicate and is allowed

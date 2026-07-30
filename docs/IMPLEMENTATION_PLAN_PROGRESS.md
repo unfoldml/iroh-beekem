@@ -4,8 +4,8 @@
 
 The near-term goal is **a publishable 0.1 crate**.
 
-Phases 0–4 are closed. What remains is ordered by one finding from the post-Phase-4 security review,
-which outranks everything else on the list:
+Phases 0–5 are closed. Phase 5 answered the post-Phase-4 security review finding that outranked
+everything else on the list:
 
 > **Authorization is enforced only on the node that issues an action.** Every role check —
 > `require_admin`, `require_write`, `require_may_add_device_to`, `require_not_last_admin` — runs
@@ -15,9 +15,18 @@ which outranks everything else on the list:
 > member holding the *lowest* role can add members, remove the admin, and promote itself, and every
 > peer will merge all three.
 
-That makes Phase 5 a 0.1 blocker: the admission control of Phase 3 and the removal machinery of
-Phase 4 are both downstream of predicates any member can rewrite, so until a receiver can check *who
-was allowed to issue this*, they constrain well-behaved peers and nothing else.
+That made Phase 5 the 0.1 blocker: the admission control of Phase 3 and the removal machinery of
+Phase 4 were both downstream of predicates any member could rewrite.
+
+**It is closed.** Authorization is now carried by signed certificates
+([capability.rs](crates/iroh-beekem-core/src/capability.rs)) rooted at the founder's key, checked by
+every receiver in `CgkaController::merge`, and roles and device bindings no longer live in the
+manifest at all. Three corrections to this document's own Phase 5 plan came out of building it, and
+each is recorded in place below: the manifest filter of §5.3 was not implementable, property 3.7 as
+drafted was unachievable, and a grow-only certificate set cannot express demotion without an explicit
+`(seq, digest)` order.
+
+What remains is Phases 6–9.
 
 NB: Where this document and the code disagree on detail, the
 code wins.
@@ -33,6 +42,7 @@ code wins.
 | 2 | `Identity`; `users`/`devices`/`meta` containers with roles per *user*; multi-document facade; `drive()`; `WsOp` + `crud_workload` + `ClientCodec`; `Msg::Entry` with per-node `index` and `roster` | [identity.rs](crates/iroh-beekem/src/identity.rs), [manifest.rs](crates/iroh-beekem-core/src/manifest.rs), [sim/lib.rs](crates/iroh-beekem-sim/src/lib.rs) |
 | 3 | `RosterGuard` on all three ALPNs, roster derived from manifest devices ∩ `current_members`, bootstrap admission for cold joiners | [roster.rs](crates/iroh-beekem/src/roster.rs), `WorkspaceState::roster` |
 | 4 | `Remove`-before-rotate ordering, `NamespaceEpoch` on `(epoch, digest)`, `Effect::AdoptNamespace`, demand-driven repair via `Keying::Fresh`, read-only invite tickets for Viewers | [state.rs](crates/iroh-beekem-core/src/state.rs), [workspace.rs](crates/iroh-beekem/src/workspace.rs) |
+| 5 | `Grant`/`DeviceBinding`/`CapabilityStore` with a monotone `ever_admin` and `(seq, digest)`-ordered `role_of`; the third check in `merge`; `AuthorizedOp` proof bundles on `BroadcastOp`/`ControlMsg::Op`/`Msg::Op`; `ControlMsg::Log` ships the whole store; `Effect::BroadcastCerts` and `Effect::EvictUncertified`; roles and bindings removed from the manifest; `Insider` and `Revenant` scenarios | [capability.rs](crates/iroh-beekem-core/src/capability.rs), [keys.rs](crates/iroh-beekem-core/src/keys.rs), [state.rs](crates/iroh-beekem-core/src/state.rs) |
 
 ### Residuals from the landed phases
 
@@ -46,18 +56,21 @@ Small, verified, and homeless — each is picked up by a phase below.
   this** — re-export both types, or wrap them → **Phase 6**, with the rest of the invite surface.
 - **`Workspace::delete()` was specified and never built.** `open`/`list` land in Phase 7 and `leave`
   in Phase 8; `delete` joins the latter.
-- **CLAUDE.md's coverage workflow is dangling.** It cites `make coverage`, `make coverage-check`,
-  `make check` and `COVERAGE.md`; there is no `Makefile` and no `COVERAGE.md` in the repo. Either
-  build the target or correct the reference — it is the "standing to-do surface" contributors are
-  pointed at.
+- ~~**CLAUDE.md's coverage workflow is dangling.**~~ **Done in Phase 5.** [Makefile](Makefile) and
+  [scripts/coverage_report.py](scripts/coverage_report.py) now back `make coverage`,
+  `make coverage-check`, `make check` and `COVERAGE.md`. Coverage is merged across every test
+  manifest — a per-crate report understates the core badly, since most of its coverage comes from
+  propsim driving it. Baseline at the close of Phase 5: **88.6% lines**, with `capability.rs` at
+  95.2%.
 
 ---
 
 ## The design as it stands
 
 Today's answers, with the reasoning that produced them and what else moves if they change. None is
-settled; if a user story needs a different answer, change it. Three of them carry a qualifier the
-security review added, marked **⚠**.
+settled; if a user story needs a different answer, change it. Three entries carried a qualifier the
+post-Phase-4 security review added; all three are now marked **Resolved in Phase 5** with a note on
+what the resolution was, because the reasoning is worth keeping even though the defect is gone.
 
 - **Three protocols by ALPN on one `iroh::Endpoint`** ([node.rs](crates/iroh-beekem/src/node.rs)):
   gossip carries `Signed<CgkaOperation>` on a topic derived from the CGKA tree id, docs carries the
@@ -104,15 +117,20 @@ security review added, marked **⚠**.
   capability so it cannot be claimed. Rotation is skipped when the target was not a member, or any
   admin could force a full re-publish at will.
 
-- **The manifest is where permissions are recorded** ([manifest.rs](crates/iroh-beekem-core/src/manifest.rs)):
-  logical paths, roles, and the `iroh-docs` author → CGKA member mapping. `ingest_all` therefore
-  reads the manifest before document entries — `author_may_write` needs the mapping, so the reverse
-  order rejects legitimate entries.
-  **⚠** The standing phrasing, *"the CGKA decides who can decrypt; the manifest decides who is
-  authorised to act"*, reads as a settled separation of concerns while assuming the manifest is
-  trustworthy. It is not: `on_manifest_arrived` gates only on *decryptability*, so any member can
-  write any `roles`/`devices` record and every replica merges it. Until Phase 5, the honest statement
-  is "the manifest *records* what well-behaved peers agreed to."
+- **Permissions are certificates; the manifest holds display data**
+  ([capability.rs](crates/iroh-beekem-core/src/capability.rs),
+  [manifest.rs](crates/iroh-beekem-core/src/manifest.rs)). The manifest keeps logical paths, display
+  names, labels and the `iroh-docs` author → CGKA member mapping. `ingest_all` still reads the
+  manifest before document entries — `author_may_write` needs that mapping, so the reverse order
+  rejects legitimate entries — but the *role* half of that check now comes from the closure.
+
+  **Resolved in Phase 5.** Roles and device bindings used to live here, and the standing phrasing was
+  *"the CGKA decides who can decrypt; the manifest decides who is authorised to act"* — which read as
+  a settled separation of concerns while assuming the manifest was trustworthy. It was not:
+  `on_manifest_arrived` gated only on *decryptability*. The fix was not to filter the import, which is
+  impossible (`LoroDoc::import` merges an update atomically, so there is nowhere to hook), but to move
+  the authority out. The split is now by **what a lie costs**: a forged display name grants nothing, a
+  forged role grants everything.
 
 - **Authentication is ours, not beekem's.** beekem verifies nothing, so `CgkaController::merge`
   ([keys.rs](crates/iroh-beekem-core/src/keys.rs)) adds the two checks that make a public gossip topic
@@ -120,13 +138,11 @@ security review added, marked **⚠**.
   membership is checked only *after* predecessors are in hand, or a member whose own `Add` is still in
   flight would be rejected. `known_members` is monotone (a `Remove` does not retract) because
   retracting would make admissibility depend on delivery order and diverge peers.
-  **⚠** Two checks are all there are; there is no third check on what the issuer's role permits.
-  Monotonicity is also defended in the field docs on the grounds that a removed member's operations
-  "cannot reach the root key anyway" — true for `Update`, which must re-key a path the issuer can
-  derive, and **false for `Add`**, which needs no root key: the injected leaf receives key material
-  from the next honest re-key, because that re-key encrypts the path to every resolution including
-  the new leaf. Monotonicity remains the right call for the divergence reason it was chosen for; it
-  is simply not, on its own, a containment argument.
+  **Resolved in Phase 5.** There is now a third check: the issuer must hold a certificate admitting
+  *this* operation. The monotonicity qualifier stands and has been written into the README — "cannot
+  reach the root key anyway" is true for `Update` and **false for `Add`**, so monotonicity is a
+  divergence argument and never was a containment one. What contains a removed member is eviction
+  (`Effect::EvictUncertified`), not admissibility.
 
 - **Admission control is an authenticated allowlist over endpoint ids.** All three ALPNs are wrapped
   in `RosterGuard` ([roster.rs](crates/iroh-beekem/src/roster.rs)); an `EndpointId` is the peer's
@@ -135,11 +151,9 @@ security review added, marked **⚠**.
   converges like everything else and inherits the admin gating on `AddUser`/`AddDevice`. Computed in
   the core so the rule is testable without a socket. Eviction is eventual, and it is an availability
   boundary, not a confidentiality one.
-  **⚠** "Derived, never authored" is the security argument for the whole phase, and it holds only as
-  far as the inputs it derives *from* are trustworthy. Both are member-writable today:
-  `current_members` moves on any member's `Remove`, and the `devices` container merges whatever any
-  member writes. The guarantee is real against an outsider and vacuous against a member. Phase 5 is
-  what makes the sentence true as written.
+  **Resolved in Phase 5.** `roster` now intersects *certified* devices with `current_members` and
+  announced endpoints, so a device with no signed binding contributes nothing whatever it writes.
+  "Derived, never authored" is true as written.
 
 ---
 
@@ -151,7 +165,27 @@ Belongs in the README as well; its absence is what let the findings above go unn
 |---|---|---|
 | **Blob payloads** | Per-chunk AEAD keys from the CGKA, bound to content ref + predecessor refs | Ciphertext only. **This part genuinely delivers.** |
 | **Data-plane index** (`iroh-docs`) | `RosterGuard`, then knowledge of the `NamespaceId` | Nothing, unless admitted. Once admitted: blinded keys (document count, which changed, when), entry sizes, author ids, timestamps |
-| **Control plane** (`iroh-gossip`) | `RosterGuard`, then knowledge of the `TopicId` | Nothing, unless admitted. Once admitted: **everything, in plaintext** — every `Signed<CgkaOperation>`, so every member key added or removed, every rotation, the full log replayed on each `NeighborUp`, plus `ControlMsg::Announce { key }`, which is real-time telemetry for every write |
+| **Control plane** (`iroh-gossip`) | `RosterGuard`, then knowledge of the `TopicId` | Nothing, unless admitted. Once admitted: **four of the five `ControlMsg` variants in plaintext** — `Op` and `Log`, so every `Signed<CgkaOperation>`, every member key added or removed, every rotation, and the whole log replayed on each `NeighborUp`; `Announce { key }`, which is real-time telemetry for every write; and `Repair { member }`, which names who is stuck. The fifth, `Namespace`, is **not** plaintext: its capability travels as a `Chunk` encrypted under the group key, which is the entire reason a removed device cannot follow a rotation |
+
+"Plaintext" here means *readable by an admitted overlay participant*, not *readable on the wire*.
+Gossip runs over iroh's QUIC/TLS and every ALPN sits behind `RosterGuard`
+([node.rs](crates/iroh-beekem/src/node.rs)), which fails closed.
+
+**Encrypting the four is not an available fix**, and the reasoning is the module doc on
+[wire.rs](crates/iroh-beekem/src/wire.rs) plus one case it does not cover:
+
+- `Op`/`Log` are what a peer consumes in order to *derive* the group key, so encrypting them under
+  that key is circular. `Invite.log` is documented as public, signed data for the same reason.
+- They carry no secrets to protect. An `Update`'s `PathChange` holds inner-node secrets already
+  encrypted to sibling resolutions, as TreeKEM requires; broadcasting the operation exposes the
+  membership graph, not key material. What makes a public topic safe is authentication on receipt in
+  `CgkaController::merge`, not confidentiality in transit.
+- Encrypting `Announce`/`Repair` under the current group key — the only two where it is even
+  possible — buys nothing against the one adversary it would target. A member in good standing holds
+  that key already; and the sole peer still relaying to a *removed* device is one that has not merged
+  the removal, so it is broadcasting under an epoch that device can still derive. The residual there
+  is eventual eviction (README, "Not yet implemented" #4), a membership-convergence problem that an
+  encryption layer does not touch.
 
 Two structural points survive the roster:
 

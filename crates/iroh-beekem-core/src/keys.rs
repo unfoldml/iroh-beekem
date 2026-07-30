@@ -56,6 +56,7 @@ use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    capability::{CapabilityStore, Certificate, DeviceBinding, Grant, Role},
     content::{Chunk, ChunkRef},
     error::CoreError,
     sync_poll::now_or_never,
@@ -63,6 +64,55 @@ use crate::{
 
 /// A signed CGKA operation as it travels over the control plane.
 pub type ControlOp = Arc<Signed<CgkaOperation>>;
+
+/// A control operation together with the certificates that authorise it.
+///
+/// `CgkaOperation` is beekem's type and cannot carry a field, so the proof rides
+/// beside the operation rather than inside it.
+///
+/// # Why the proof is bundled rather than shipped separately
+///
+/// It makes admissibility decidable **on receipt**. If certificates travelled on
+/// their own, an operation arriving before them could not be judged yet, so it
+/// would have to be parked — and an insider could then flood the parking area
+/// with operations that will never be certified, evicting honest ones under
+/// [`MAX_PARKED_OPS`]. Bundling means this phase adds no new parking and no new
+/// eviction path: the only reason to park is still a missing causal predecessor.
+///
+/// The bundle need not be minimal or ordered. Certificates are individually
+/// signed and the closure that consumes them reaches a fixpoint, so a receiver
+/// may be sent more than it needs, in any order, and still reach the same verdict
+/// as everyone else.
+#[derive(Debug, Clone)]
+pub struct AuthorizedOp {
+    /// The operation itself.
+    pub op: ControlOp,
+    /// Certificates the receiver may not hold yet.
+    pub proof: Vec<Certificate>,
+}
+
+impl AuthorizedOp {
+    /// An operation with a proof bundle.
+    #[must_use]
+    pub fn new(op: Signed<CgkaOperation>, proof: Vec<Certificate>) -> Self {
+        Self {
+            op: Arc::new(op),
+            proof,
+        }
+    }
+
+    /// An operation carrying no certificates.
+    ///
+    /// Correct for an `Update`, which needs no capability beyond membership, and
+    /// for any operation whose proof the receiver is known to hold already.
+    #[must_use]
+    pub fn bare(op: ControlOp) -> Self {
+        Self {
+            op,
+            proof: Vec::new(),
+        }
+    }
+}
 
 /// How many out-of-order operations may wait for their predecessors at once.
 ///
@@ -217,11 +267,23 @@ pub struct CgkaController {
     /// operations on an order-dependent predicate and peers diverge. This field
     /// is consequently never read from [`Self::merge_verified`].
     current_members: HashSet<MemberId>,
+    /// Who is permitted to do what, rooted at the founder's key.
+    ///
+    /// The third check `merge_verified` applies, after the signature and
+    /// `known_members`. Held here rather than on `WorkspaceState` because this is
+    /// where operations are admitted, and a check that lived a layer up would be
+    /// one an operation could reach the tree without passing.
+    certs: CapabilityStore,
     /// Operations received out of causal order, awaiting their predecessors.
     ///
     /// A queue rather than a stack: eviction takes the oldest, which is the one
     /// least likely to still be waiting on something in flight.
-    parked: VecDeque<ControlOp>,
+    ///
+    /// Holds the whole [`AuthorizedOp`], proof included: a parked operation must
+    /// still be judgeable when it is drained, and re-deriving its proof from the
+    /// store would fail for exactly the operation that arrived before its own
+    /// certificates.
+    parked: VecDeque<AuthorizedOp>,
     /// Operations dropped because [`MAX_PARKED_OPS`] was reached.
     evicted_ops: u64,
 }
@@ -274,6 +336,10 @@ impl CgkaController {
             // self-issued and has no predecessors to authorise it against.
             known_members: HashSet::from([member_id]),
             current_members: HashSet::from([member_id]),
+            // The founder is the root of the capability closure for the same
+            // reason: `tree_id` *is* their key, so their authority is axiomatic
+            // rather than granted.
+            certs: CapabilityStore::new(member_id.to_bytes()),
             parked: VecDeque::new(),
             evicted_ops: 0,
         })
@@ -290,6 +356,12 @@ impl CgkaController {
     /// used in the `Add`, which is why an invite is a two-step exchange: the
     /// invitee publishes a `ShareKey`, the inviter names it in an `Add`.
     ///
+    /// `certs` are the capability certificates for the workspace. They are
+    /// inserted **before** the log is replayed, because replay goes through
+    /// [`Self::merge`] and every `Add` in the log must be authorised against
+    /// them; a joiner handed the log without the certificates would reject the
+    /// history it is trying to adopt, including its own admission.
+    ///
     /// # Errors
     ///
     /// Returns [`CoreError::MissingInitAdd`] if the log does not begin with a
@@ -300,6 +372,7 @@ impl CgkaController {
         signer: MemorySigner,
         share_secret: ShareSecretKey,
         ops: &[Signed<CgkaOperation>],
+        certs: &[Certificate],
     ) -> Result<Self, CoreError> {
         let member_id = MemberId::from(signer.verifying_key());
         let share_key = share_secret.share_key();
@@ -344,9 +417,13 @@ impl CgkaController {
             share_key,
             known_members: HashSet::from([founder_id]),
             current_members: HashSet::from([founder_id]),
+            // Rooted at the founder named by the init `Add` verified just above,
+            // which is what makes this a trust root and not a claim.
+            certs: CapabilityStore::new(founder_id.to_bytes()),
             parked: VecDeque::new(),
             evicted_ops: 0,
         };
+        this.certs.extend(certs.iter().cloned());
 
         let mut invited = founder_id == member_id;
         for op in rest {
@@ -361,7 +438,9 @@ impl CgkaController {
                 this.cgka = this.cgka.with_new_owner(member_id, owner_sks)?;
                 invited = true;
             }
-            this.merge(Arc::new(op.clone()))?;
+            // The proof is already in the store, inserted above, so the log
+            // itself carries no bundles.
+            this.merge(AuthorizedOp::bare(Arc::new(op.clone())))?;
         }
 
         if !invited {
@@ -438,7 +517,7 @@ impl CgkaController {
     }
 
     /// Park an out-of-order operation, evicting the oldest if the queue is full.
-    fn park(&mut self, op: ControlOp) {
+    fn park(&mut self, op: AuthorizedOp) {
         if self.parked.len() >= MAX_PARKED_OPS {
             self.parked.pop_front();
             self.evicted_ops += 1;
@@ -474,6 +553,71 @@ impl CgkaController {
     /// simulation that did would be asserting on hash iteration order.
     pub fn current_members(&self) -> impl Iterator<Item = MemberId> + '_ {
         self.current_members.iter().copied()
+    }
+
+    /// Who is permitted to do what in this workspace.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilityStore {
+        &self.certs
+    }
+
+    /// Accept certificates a peer sent, returning how many were new.
+    ///
+    /// Invalid ones are dropped rather than reported; see
+    /// [`CapabilityStore::extend`].
+    pub fn absorb_certificates<I: IntoIterator<Item = Certificate>>(&mut self, certs: I) -> usize {
+        self.certs.extend(certs)
+    }
+
+    /// Mint a signed binding of `device` to `user`, and record it locally.
+    ///
+    /// The returned certificate must be broadcast, or peers will refuse the
+    /// operations the bound device goes on to issue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn certify_device(
+        &mut self,
+        device: [u8; 32],
+        user: [u8; 32],
+        nonce: [u8; 16],
+    ) -> Result<Certificate, CoreError> {
+        let cert = DeviceBinding {
+            device,
+            user,
+            nonce,
+        }
+        .sign(&self.signer)?;
+        self.certs.insert(cert.clone())?;
+        Ok(cert)
+    }
+
+    /// Mint a signed grant of `capability` to `user`, and record it locally.
+    ///
+    /// The generation is chosen by [`CapabilityStore::next_seq`], so a grant
+    /// always supersedes every grant for that subject this node has seen —
+    /// including one a member minted for itself with an inflated `seq`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn certify_role(
+        &mut self,
+        user: [u8; 32],
+        capability: Role,
+        nonce: [u8; 16],
+    ) -> Result<Certificate, CoreError> {
+        let cert = Grant {
+            subject: user,
+            capability,
+            seq: self.certs.next_seq(&user),
+            not_after: None,
+            nonce,
+        }
+        .sign(&self.signer)?;
+        self.certs.insert(cert.clone())?;
+        Ok(cert)
     }
 
     /// Admit a new member who has published `share_key`.
@@ -669,22 +813,31 @@ impl CgkaController {
     /// tampered with, [`CoreError::Unauthorized`] if it is validly signed by a
     /// non-member, and [`CoreError::Cgka`] for genuine tree failures. An
     /// out-of-order operation is *not* an error.
-    pub fn merge(&mut self, op: ControlOp) -> Result<MergeOutcome, CoreError> {
+    pub fn merge(&mut self, authorized: AuthorizedOp) -> Result<MergeOutcome, CoreError> {
         // Cheapest meaningful check, and the only context-free one: do it
         // before the operation is allowed to occupy a slot in `parked`, so
         // unverifiable traffic cannot accumulate.
-        op.try_verify().map_err(|_| CoreError::BadSignature)?;
-        self.merge_verified(op)
+        authorized
+            .op
+            .try_verify()
+            .map_err(|_| CoreError::BadSignature)?;
+        // Absorb the proof before judging the operation, and before parking it:
+        // the certificates are what make the verdict decidable now rather than
+        // later, and they are individually signed so absorbing them commits to
+        // nothing about the operation carrying them.
+        self.certs.extend(authorized.proof.iter().cloned());
+        self.merge_verified(authorized)
     }
 
     /// Merge an operation whose signature has already been checked.
     ///
     /// Parked operations were verified on the way in, so re-verifying them on
     /// every drain would repeat an Ed25519 check per operation per round.
-    fn merge_verified(&mut self, op: ControlOp) -> Result<MergeOutcome, CoreError> {
+    fn merge_verified(&mut self, authorized: AuthorizedOp) -> Result<MergeOutcome, CoreError> {
+        let op = Arc::clone(&authorized.op);
         let preds: HashSet<_> = op.payload.predecessors().into_iter().collect();
         if !self.cgka.contains_predecessors(&preds) {
-            self.park(op);
+            self.park(authorized);
             return Ok(MergeOutcome::Deferred);
         }
 
@@ -700,6 +853,12 @@ impl CgkaController {
                 issuer: issuer.to_bytes(),
             });
         }
+
+        // Third check, and the one phase 5 exists for: is this issuer permitted
+        // to make *this* change? Strictly after `known_members`, so that the
+        // error a caller sees distinguishes "not of this group" from "not
+        // allowed to do that" — see `CoreError::Uncertified`.
+        self.authorize(&op, issuer)?;
 
         // Read this before the merge consumes the operation.
         let membership_change = match op.payload {
@@ -733,6 +892,60 @@ impl CgkaController {
             // same way we treat the check above rather than failing the peer.
             Err(CgkaError::OutOfOrderOperation) => Ok(MergeOutcome::Deferred),
             Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Decide whether `issuer` holds a capability admitting this operation.
+    ///
+    /// A pure function of the operation and the certificate closure, which is
+    /// what makes it safe to apply at merge time: two peers holding the same
+    /// certificates reach the same verdict whatever order anything arrived in.
+    /// Nothing here reads `current_members`, and that omission is deliberate —
+    /// a non-monotone input would make one peer drop an operation another keeps,
+    /// and the group would diverge permanently. The cost of that choice is the
+    /// revenant case, which `WorkspaceState` handles by eviction rather than by
+    /// rejection.
+    fn authorize(&self, op: &Signed<CgkaOperation>, issuer: MemberId) -> Result<(), CoreError> {
+        let issuer = issuer.to_bytes();
+        let refuse = || CoreError::Uncertified { issuer };
+        match op.payload {
+            CgkaOperation::Add { added_id, .. } => {
+                // The added leaf must itself be certified, and the binding must
+                // name *this* operation's `added_id`. Without that second
+                // condition an insider could lift a legitimate bundle off the
+                // wire and reattach it to an `Add` of its own keypair.
+                let added = added_id.to_bytes();
+                let Some(added_user) = self.certs.user_of(&added) else {
+                    return Err(refuse());
+                };
+                // Either the issuer may administer, or it is enrolling a further
+                // device of its own user — which is not an administrative act.
+                if self.certs.may_bind_device_to(&issuer, &added_user) {
+                    Ok(())
+                } else {
+                    Err(refuse())
+                }
+            }
+            CgkaOperation::Remove { id, .. } => {
+                // An admin may remove anyone; anyone may remove their own
+                // devices, which is what `Workspace::leave` is built on.
+                let target = id.to_bytes();
+                let same_user = self
+                    .certs
+                    .user_of(&target)
+                    .is_some_and(|owner| self.certs.user_of(&issuer) == Some(owner));
+                if same_user || self.certs.may_administer(&issuer) {
+                    Ok(())
+                } else {
+                    Err(refuse())
+                }
+            }
+            // An `Update` re-keys only the issuer's own path, so membership is
+            // the whole of the authority it needs and `known_members` already
+            // established that. Requiring a certificate here would strand a
+            // member whose binding had not yet reached this peer, and would gain
+            // nothing: an update cannot introduce or remove anybody.
+            CgkaOperation::Update { .. } => Ok(()),
         }
     }
 
@@ -771,7 +984,11 @@ impl CgkaController {
                     Ok(MergeOutcome::Duplicate | MergeOutcome::Deferred) => {}
                     // Hostile: drop it, and specifically do not let it abort the
                     // round and strand the legitimate operations behind it.
-                    Err(CoreError::Unauthorized { .. }) => {}
+                    // `Uncertified` joins `Unauthorized` here for the same
+                    // reason — an operation its issuer was never permitted to
+                    // make does not become permitted by waiting, and the honest
+                    // operations queued behind it must still be drained.
+                    Err(CoreError::Unauthorized { .. } | CoreError::Uncertified { .. }) => {}
                     Err(err) => first_error = first_error.or(Some(err)),
                 }
             }

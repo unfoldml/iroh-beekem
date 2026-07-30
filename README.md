@@ -95,18 +95,30 @@ ever looking at the issuer. Since the gossip topic is derived from the tree id, 
 every past invitee knows, an unchecked `merge` would let anyone broadcast a self-issued
 `Add` and read everything written afterwards.
 
-`CgkaController::merge` therefore applies two checks beekem does not, and neither
-substitutes for the other:
+`CgkaController::merge` therefore applies three checks beekem does not, and none
+substitutes for another:
 
 * **Signature** — the operation must verify against its own embedded issuer key.
   Catches a payload spliced onto an observed signature.
 * **Membership** — that issuer must be someone an accepted `Add` introduced.
   Catches the freshly minted keypair, which can sign its own messages perfectly well.
+* **Capability** — that issuer must hold a certificate permitting *this* operation.
+  Catches the member in good standing doing something its role does not allow, which
+  the first two checks pass without comment. See
+  [Authorization is verifiable offline](#authorization-is-verifiable-offline).
 
 The membership set is deliberately monotone: a `Remove` does not retract it. Two peers
 seeing a removal and a concurrent operation by the removed member in opposite orders
-would otherwise disagree about admissibility and diverge. A removed member's operations
-cannot reach the root key anyway, so beekem's tree semantics already neutralise them.
+would otherwise disagree about admissibility and diverge.
+
+It is worth being precise about *why* that is safe, because the obvious justification is
+half wrong. A removed member's `Update` cannot reach the root key — it must re-key a path
+the issuer can derive — so beekem's tree semantics do neutralise it. An `Add` needs no root
+key at all: the injected leaf receives key material from the next honest re-key, because
+that re-key encrypts the path to every resolution including the new one. Monotonicity
+remains the right call for the divergence reason it was chosen for, and it is not on its
+own a containment argument. What contains the removed member is
+[eviction](#a-removed-member-is-evicted-again), not admissibility.
 
 A *second*, non-monotone set (`current_members`) tracks who is a member **now**. The two
 cannot be one set, and the difference is which failure you are willing to pay for.
@@ -116,6 +128,66 @@ answers "may this peer connect" and "who do I list", where disagreeing costs a r
 connection that the next merge repairs. Merging them in either direction breaks something:
 made monotone, a revoked device stays admitted forever; made non-monotone, `merge` starts
 rejecting operations on a delivery-order-dependent predicate.
+
+### Authorization is verifiable offline
+
+Every role check used to run on the node *issuing* an action, against a manifest that is a
+CRDT — so a member holding the lowest role could write `roles[me] = Admin`, bind a device of
+theirs to an admin's user, add members, or remove the admin, and every peer merged all of it.
+The checks constrained well-behaved peers and nothing else.
+
+The tempting fix — have the receiver look up the issuer's role in the manifest — is worse
+than no fix. The manifest is replicated and converges at different times on different peers,
+so two peers evaluating the same operation against different views reach different verdicts,
+one drops an operation the other keeps, and the group diverges *permanently*. Any
+authorization predicate over mutable replicated state has that shape.
+
+So authorization is carried by the thing being authorised and verified offline. `tree_id` is
+the founder's verifying key and the founding `Add` is self-issued and checked before anything
+else replays, so the founder is an identity every peer already agreed on by joining. Rooted
+there, two certificate types close the loop:
+
+* `Grant { subject, capability, seq, .. }` — an admin's statement that a user holds a role.
+* `DeviceBinding { device, user, .. }` — a statement that a leaf belongs to a user, issued by
+  an admin or by an existing device of that same user.
+
+Both travel as `Signed<..>` in a bundle beside the operation they authorise, so admissibility
+is decidable on receipt rather than requiring the operation to be parked — which matters,
+because a parked operation is one an insider could flood the queue with.
+
+Validity is a pure function of the certificate set, computed as a fixpoint. That is what makes
+it safe at merge time: two peers holding the same certificates reach the same verdict however
+they arrived. It rests on the same two-predicate split as `known_members`/`current_members`:
+`ever_admin` is monotone and decides whether a *certificate* is admitted, keeping the closure
+order-independent; `role_of` is non-monotone, resolved by `(seq, digest)` so a later grant
+supersedes an earlier one, and decides whether an *action* is permitted.
+
+The manifest keeps logical paths, display names, labels, and the self-attested author and
+endpoint claims — everything whose forgery grants nothing. **The capability closure decides who
+is authorised to act; the manifest records what that produced.**
+
+`require_admin` and `require_write` still run on the issuing node. They are a fail-fast local
+courtesy — a clear error instead of an operation every peer will drop — and are documented as
+such. They are not the enforcement.
+
+### A removed member is evicted again
+
+A removed member keeps whatever capability it held, because the certificate store is grow-only,
+and its signature stays admissible, because `known_members` is monotone. So it can still mint a
+binding for a keypair it controls and issue a valid `Add`. This is the one attack the merge-time
+check deliberately does not refuse — the only thing distinguishing it is `current_members`, and
+refusing on an order-sensitive predicate is the divergence the whole design avoids.
+
+The splice is accepted and then undone. On merging an `Add` whose issuer is no longer a current
+member, an honest admin raises `Effect::EvictUncertified` and removes the injected leaf; every
+admin reaches that conclusion independently, duplicate removals merge as `MergeOutcome::Duplicate`,
+and the response is rate-limited per spliced leaf because each one costs a removal and a namespace
+rotation.
+
+What this buys is a bounded window, not zero. During it the injected leaf can read what the group
+publishes. What it never buys the attacker is *escalation*: the closure is rooted, so a revenant can
+pass on only what it already held. Both halves are property-tested — `always` for the no-escalation
+claim, `eventually_within` for the eviction.
 
 ### Admission control is an authenticated allowlist
 
@@ -187,6 +259,39 @@ key **and** Loro has the CRDT operations it depends on. Neither ordering is guar
 so chunks failing either test are parked and retried. This pairing is the most likely source of silent
 data loss in the system, and it is what the property tests are aimed at.
 
+## Threat model
+
+What is confidential, and from whom. Its absence is what let the authorization finding above go
+unnoticed for four phases: every row of the first table asks *"what does an outsider see"*, and
+nothing asked *"what can a member do"*.
+
+| Layer | Protected by | An outsider holding the identifiers sees |
+|---|---|---|
+| **Blob payloads** | Per-chunk AEAD keys from the CGKA, bound to content ref + predecessor refs | Ciphertext only |
+| **Data-plane index** (`iroh-docs`) | `RosterGuard`, then knowledge of the `NamespaceId` | Nothing, unless admitted. Once admitted: blinded keys (document count, which changed, when), entry sizes, author ids, timestamps |
+| **Control plane** (`iroh-gossip`) | `RosterGuard`, then knowledge of the `TopicId` | Nothing, unless admitted. Once admitted: four of the six `ControlMsg` variants in plaintext — `Op`, `Log` and `Certs`, so every operation, certificate and membership change; and `Announce { key }`, which is real-time telemetry for every write. `Namespace` is **not** plaintext: its capability travels encrypted under the group key, which is the whole reason a removed device cannot follow a rotation |
+
+"Plaintext" means *readable by an admitted overlay participant*, not *readable on the wire*: gossip
+runs over iroh's QUIC/TLS and every ALPN sits behind `RosterGuard`, which fails closed.
+
+Encrypting the first four is not an available fix. `Op`/`Log`/`Certs` are what a peer consumes in
+order to *derive* the group key, so encrypting them under that key is circular — and they carry no
+secrets: an `Update`'s `PathChange` holds inner-node secrets already encrypted to sibling
+resolutions, as TreeKEM requires. What makes a public topic safe is authentication on receipt, not
+confidentiality in transit. Encrypting `Announce` buys nothing against the only adversary it would
+target, since a member in good standing holds that key already.
+
+### What a member can do
+
+| Actor | Constrained by | Can actually do |
+|---|---|---|
+| **Outsider** (never admitted) | `known_members` on merge, `RosterGuard` on connect | Nothing. The `Outsider` and `Forging` scenarios prove it |
+| **Member, any role** | The capability closure, checked by **every receiver** | Read everything (that is forward secrecy, not a defect); enrol further devices of *its own* user; nothing else. Its `Add` of a new user, its `Remove` of an admin, and any grant it writes itself are all dropped by every peer |
+| **Removed member** | The same, plus eviction | Splice a leaf it controls into the tree, and read what is published during the window before an admin evicts it. It cannot escalate: the leaf inherits only what the revenant itself held |
+
+**Out of scope, and stated so:** traffic analysis by a member in good standing, and connection
+metadata visible to relay servers. Neither is fixable at this layer.
+
 ## Verification
 
 ```bash
@@ -194,6 +299,13 @@ cargo test -p iroh-beekem-core     # unit + handshake spike + state machine + fo
 cargo test -p iroh-beekem-sim      # propsim: convergence, concurrent rotation/revocation, forging peer
 cargo test -p iroh-beekem          # two real endpoints over real QUIC: revocation, roles, rotation
 cargo clippy --workspace --all-targets -- -D warnings
+cargo +nightly-2025-11-21 fmt --all --check   # rustfmt.toml uses nightly-only options, so the
+                                              # toolchain is pinned: an unpinned nightly changes
+                                              # the expected formatting
+
+# Workspace mode, not two per-crate runs: `iroh-beekem` depends on `iroh-beekem-core` by version as
+# well as by path, so a per-crate dry run cannot resolve it until core is actually released.
+cargo publish --dry-run --workspace
 
 # The core's purity is enforced mechanically; this must match nothing:
 cargo tree -p iroh-beekem-core -e normal --prefix none \
@@ -221,7 +333,7 @@ reason enough to revisit the choice underneath.
 3. **Viewers hold a write capability after a rotation, though not after an invite.** The
    announcement carries both tickets and each node takes the one its role allows, because beekem
    encrypts to the whole tree and cannot hand writers one secret and viewers another. A viewer who
-   ignores their role gains write capability on the replica; `Manifest::author_may_write` still
+   ignores their role gains write capability on the replica; `WorkspaceState::author_may_write` still
    rejects their entries, which is the same guarantee trade-off 9 describes. `build_invite` does
    better — a viewer is handed only a read ticket — and closing the gap needs per-role key material
    the CGKA does not provide.
@@ -248,9 +360,29 @@ reason enough to revisit the choice underneath.
    one secret keying every entry — would force every peer to rewrite every entry, which is why it is
    not done. They learn nothing about documents created after their removal, and can read no content
    either way.
-9. **Roles are advisory against a cryptographically capable member.** Anyone holding a leaf can
-   decrypt, whatever the manifest says. Roles constrain what a well-behaved peer accepts, not what a
-   malicious one can read. Genuine read revocation is a CGKA removal.
+9. **Roles do not constrain what a member can *read*.** Anyone holding a leaf can decrypt, whatever
+   any certificate says. That is forward secrecy working as designed, and genuine read revocation is
+   a CGKA removal. This is deliberately stated as a claim about *reading only*: roles do now
+   constrain what a member can **do**, and every receiver enforces it — see
+   [Authorization is verifiable offline](#authorization-is-verifiable-offline). Conflating the two
+   is what made a defect look like a documented trade.
+11. **Demotion is a courtesy; removal is the enforcement.** A user who has ever held an admin grant
+   stays `ever_admin`, so certificates it issues are still admitted and it can grant itself a higher
+   `seq`. Demoting a *cooperative* admin works and needs no key rotation; stripping a *malicious* one
+   means CGKA-removing every device of that user. This mirrors monotone `known_members` exactly, and
+   for the same reason: the alternative is an order-dependent predicate that diverges the group.
+12. **A member may enrol unlimited devices for its own user.** Enrolling your own phone is not an act
+   of administration, so it needs no role — which means a member can also grow the tree without bound.
+   Every such leaf inherits only that member's own role, so it is not an escalation; it is a resource
+   cost, and bounding it needs a policy the group has no way to express yet.
+13. **A removed member can splice a leaf in, and read for one eviction window.** It cannot escalate.
+   See [A removed member is evicted again](#a-removed-member-is-evicted-again) for why refusing the
+   operation outright is not available.
+14. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
+   certificates remain valid documents; what stops them mattering is CGKA removal. There is no
+   expiry either: `Grant::not_after` is carried on the wire but deliberately **not** evaluated,
+   because an expiry inside an authorization predicate makes admissibility depend on clock skew and
+   two peers disagreeing would drop different operations.
 10. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
    bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`) and evict oldest-first, because an unbounded
    queue is a remote memory-exhaustion vector. Evicted operations return with the next neighbour log

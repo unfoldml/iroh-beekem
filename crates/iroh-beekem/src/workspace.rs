@@ -19,8 +19,8 @@ use beekem::{
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry, NamespaceEpoch,
-    RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
+    AuthorizedOp, Certificate, CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event,
+    FileEntry, NamespaceEpoch, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{
@@ -78,6 +78,14 @@ pub struct Invite {
     pub workspace_secret: [u8; 32],
     /// The full CGKA operation log, in causal order.
     pub log: Vec<Signed<CgkaOperation>>,
+    /// The capability certificates for the workspace.
+    ///
+    /// Public, signed data like the log, and not optional: they authorise every
+    /// `Add` the log contains, so a joiner handed the log without them would
+    /// refuse the whole history including its own admission. They also carry the
+    /// joiner's own binding and grant, which is what lets it arrive certified
+    /// rather than needing a second round trip.
+    pub certs: Vec<Certificate>,
     /// The inviter's endpoint, so the joiner can also gossip with them.
     pub inviter: EndpointId,
 }
@@ -163,6 +171,12 @@ struct Inner {
     /// rotating its own leaf; this keeps the repair path from being a cheaper
     /// way to do the same thing.
     repair_answer_cooldown: Mutex<Cooldown<[u8; 32]>>,
+    /// Rate limiter for evicting a leaf spliced in by a former member.
+    ///
+    /// Keyed on the spliced leaf rather than on the splicer: an attacker mints a
+    /// fresh keypair per attempt, so limiting per *attempt* is the only bound that
+    /// holds, and each distinct leaf genuinely does need removing once.
+    eviction_cooldown: Mutex<Cooldown<[u8; 32]>>,
     /// Raised when the current document state should be re-announced.
     ///
     /// A [`Notify`] rather than a timestamp check because the republish must be
@@ -230,6 +244,26 @@ impl Drop for Workspace {
 /// limit is well above any realistic workspace history and exists purely to
 /// bound that cost.
 const MAX_LOG_OPS: usize = 100_000;
+
+/// How many certificates a peer's log-repair or certificate broadcast may carry.
+///
+/// The same amplification argument as [`MAX_LOG_OPS`], and a tighter bound
+/// because the realistic count is far smaller: one binding per device plus a few
+/// grants per user. Each certificate costs the receiver a signature check, and a
+/// batch that is all new costs a closure recompute as well.
+const MAX_LOG_CERTS: usize = 10_000;
+
+/// How long the eviction of one spliced leaf is suppressed after the last.
+///
+/// `Effect::EvictUncertified` answers a removed member re-entering the tree, and
+/// answering costs a `Remove` *and* a namespace rotation — the most expensive
+/// thing the group does. An attacker re-adding in a loop would otherwise churn
+/// every member's replica, so the response is rate-limited per spliced leaf.
+///
+/// Longer than [`REPAIR_COOLDOWN`] because the work is heavier and the trigger is
+/// adversarial rather than ordinary: a peer legitimately stuck on an epoch needs a
+/// prompt answer, whereas a revenant needs a bounded one.
+const EVICTION_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// How long one peer's neighbour-up repair is suppressed after the last.
 ///
@@ -380,7 +414,7 @@ impl Workspace {
             ed25519_verifying_key(&invite.tree_id)
                 .ok_or_else(|| WorkspaceError::Invite("malformed tree id".into()))?,
         );
-        let cgka = CgkaController::join(tree_id, signer, share_secret, &invite.log)?;
+        let cgka = CgkaController::join(tree_id, signer, share_secret, &invite.log, &invite.certs)?;
         let secret = WorkspaceSecret::new(invite.workspace_secret);
 
         // `import` installs the capability *and* starts syncing with the peers
@@ -453,6 +487,7 @@ impl Workspace {
             neighbor_cooldown: Mutex::new(Cooldown::new(NEIGHBOR_COOLDOWN)),
             repair_cooldown: Mutex::new(Cooldown::new(REPAIR_COOLDOWN)),
             repair_answer_cooldown: Mutex::new(Cooldown::new(REPAIR_COOLDOWN)),
+            eviction_cooldown: Mutex::new(Cooldown::new(EVICTION_COOLDOWN)),
             republish_wanted: Notify::new(),
             roster: node.roster().clone(),
             node: node.clone(),
@@ -683,7 +718,7 @@ impl Workspace {
         .await?;
         let role = {
             let state = self.inner.state.lock().await;
-            state.manifest().role_of(&user).unwrap_or(Role::Viewer)
+            state.capabilities().role_of(&user).unwrap_or(Role::Viewer)
         };
         self.build_invite(role).await
     }
@@ -695,9 +730,9 @@ impl Workspace {
     /// namespace — handing one to somebody who is not supposed to write is a
     /// capability given away for nothing.
     async fn build_invite(&self, role: Role) -> Result<Invite, WorkspaceError> {
-        let log = {
+        let (log, certs) = {
             let state = self.inner.state.lock().await;
-            state.op_log()?
+            (state.op_log()?, state.capabilities().certificates())
         };
         let mode = if role.can_write() {
             ShareMode::Write
@@ -715,6 +750,7 @@ impl Workspace {
             doc_ticket,
             workspace_secret: self.inner.secret.to_bytes(),
             log,
+            certs,
             inviter: self.endpoint_id(),
         })
     }
@@ -741,7 +777,6 @@ impl Workspace {
         let devices: Vec<MemberId> = {
             let state = self.inner.state.lock().await;
             state
-                .manifest()
                 .devices_of(&user)
                 .iter()
                 .filter_map(|d| member_id_from_bytes(&d.member))
@@ -773,13 +808,17 @@ impl Workspace {
     /// Every person in the workspace, with their devices and role.
     pub async fn users(&self) -> Vec<User> {
         let state = self.inner.state.lock().await;
-        let manifest = state.manifest();
-        manifest
+        // Display names come from the manifest; roles and devices from the
+        // capability closure. The join is deliberate rather than incidental —
+        // it is what keeps the attacker-writable half separate from the half
+        // that grants something.
+        state
+            .manifest()
             .users()
             .into_iter()
             .map(|record| User {
-                role: manifest.role_of(&record.id),
-                devices: manifest.devices_of(&record.id),
+                role: state.capabilities().role_of(&record.id),
+                devices: state.devices_of(&record.id),
                 id: record.id,
                 display_name: record.display_name,
             })
@@ -802,7 +841,7 @@ impl Workspace {
         };
         let user = {
             let state = self.inner.state.lock().await;
-            state.manifest().user_of(&member)?
+            state.capabilities().user_of(&member)?
         };
         self.user(user).await
     }
@@ -824,9 +863,9 @@ impl Workspace {
         .await
     }
 
-    /// Every role assignment the manifest records, keyed by user.
+    /// Every role the capability closure grants, keyed by user.
     pub async fn roles(&self) -> Vec<([u8; 32], Role)> {
-        self.inner.state.lock().await.manifest().roles()
+        self.inner.state.lock().await.capabilities().roles()
     }
 
     // ---- workspace ---------------------------------------------------------
@@ -1166,94 +1205,133 @@ async fn control_loop<E>(
         let Ok(decoded) = ControlMsg::decode(&msg.content) else {
             continue;
         };
-        match decoded {
-            ControlMsg::Op(op) => {
-                let effects = {
-                    let mut state = inner.state.lock().await;
-                    report_rejection(
-                        state.handle(Event::ControlOp(Arc::new(*op)), &mut rand::rngs::OsRng),
-                    )
-                };
-                apply_effects(&inner, effects).await;
-                ingest_all(&inner).await;
+        handle_control_msg(&inner, decoded).await;
+    }
+}
+
+/// Handle one decoded control-plane message.
+///
+/// Split out of [`control_loop`] so the loop stays about *stream lifecycle* —
+/// neighbour arrivals, decode failures — and this stays about protocol. They grew
+/// together and the seam is the natural one: everything here takes the state lock,
+/// nothing here touches the gossip stream.
+async fn handle_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
+    match decoded {
+        ControlMsg::Op { op, proof } => {
+            let effects = {
+                let mut state = inner.state.lock().await;
+                report_rejection(state.handle(
+                    Event::ControlOp(AuthorizedOp::new(*op, proof)),
+                    &mut rand::rngs::OsRng,
+                ))
+            };
+            apply_effects(inner, effects).await;
+            ingest_all(inner).await;
+        }
+        ControlMsg::Certs(certs) => {
+            if certs.len() > MAX_LOG_CERTS {
+                tracing::warn!(
+                    len = certs.len(),
+                    "discarding an oversized certificate batch"
+                );
+                return;
             }
-            ControlMsg::Log(ops) => {
-                if ops.len() > MAX_LOG_OPS {
-                    tracing::warn!(len = ops.len(), "discarding an oversized operation log");
-                    continue;
-                }
-                let mut effects = Vec::new();
-                {
-                    let mut state = inner.state.lock().await;
-                    for op in ops {
-                        let outcome =
-                            state.handle(Event::ControlOp(Arc::new(op)), &mut rand::rngs::OsRng);
-                        effects.append(&mut report_rejection(outcome));
-                    }
-                }
-                apply_effects(&inner, effects).await;
-                // Newly recovered key material may unlock chunks that have been
-                // parked since before this peer caught up.
-                ingest_all(&inner).await;
+            let effects = {
+                let mut state = inner.state.lock().await;
+                report_rejection(state.handle(Event::CertsArrived(certs), &mut rand::rngs::OsRng))
+            };
+            apply_effects(inner, effects).await;
+            ingest_all(inner).await;
+        }
+        ControlMsg::Log { ops, certs } => {
+            if ops.len() > MAX_LOG_OPS || certs.len() > MAX_LOG_CERTS {
+                tracing::warn!(
+                    ops = ops.len(),
+                    certs = certs.len(),
+                    "discarding an oversized operation log"
+                );
+                return;
             }
-            // The index sync will surface the entry; the announce only prompts
-            // us to look sooner.
-            ControlMsg::Announce { .. } => {
-                ingest_all(&inner).await;
-            }
-            // The group has abandoned the namespace this node is syncing. The
-            // capability is encrypted under the group key, so a device removed
-            // before the rotation simply cannot read it and stays behind —
-            // which is the whole purpose of rotating rather than asking nicely.
-            ControlMsg::Namespace { epoch, chunk } => {
-                let effects = {
-                    let mut state = inner.state.lock().await;
-                    report_rejection(state.handle(
-                        Event::NamespaceArrived { epoch, chunk },
+            let mut effects = Vec::new();
+            {
+                let mut state = inner.state.lock().await;
+                // Certificates strictly first: they authorise the `Add`s in
+                // the log, so replaying the operations against an empty
+                // closure would refuse the history this exchange exists to
+                // hand over.
+                effects.append(&mut report_rejection(
+                    state.handle(Event::CertsArrived(certs), &mut rand::rngs::OsRng),
+                ));
+                for op in ops {
+                    let outcome = state.handle(
+                        Event::ControlOp(AuthorizedOp::bare(Arc::new(op))),
                         &mut rand::rngs::OsRng,
-                    ))
-                };
-                apply_effects(&inner, effects).await;
-            }
-            // Somebody cannot read what we publish. Answering re-keys the
-            // group, so the core checks the requester is a member *now* before
-            // any of that happens; a refusal is logged rather than fatal, since
-            // a revoked device asking is an expected thing to see on a topic
-            // every past invitee can reach.
-            ControlMsg::Repair {
-                member,
-                target,
-                epoch,
-            } => {
-                let Some(requester) = member_id_from_bytes(&member) else {
-                    tracing::warn!("discarding a repair request naming an unparseable member");
-                    continue;
-                };
-                // Checked before the core is asked to do anything, because what
-                // is being limited is the *work*: a member ignoring its own
-                // sending cooldown must not be able to buy more re-keys by
-                // shouting.
-                let allowed = {
-                    let mut cooldown = inner.repair_answer_cooldown.lock().await;
-                    cooldown.claim(member, Instant::now())
-                };
-                if !allowed {
-                    tracing::debug!("suppressing a repeat repair answer for one peer");
-                    continue;
+                    );
+                    effects.append(&mut report_rejection(outcome));
                 }
-                let effects = {
-                    let mut state = inner.state.lock().await;
-                    report_rejection(state.handle(
-                        Event::RepairRequested {
-                            requester,
-                            target,
-                            epoch,
-                        },
-                        &mut rand::rngs::OsRng,
-                    ))
-                };
-                apply_effects(&inner, effects).await;
             }
+            apply_effects(inner, effects).await;
+            // Newly recovered key material may unlock chunks that have been
+            // parked since before this peer caught up.
+            ingest_all(inner).await;
+        }
+        // The index sync will surface the entry; the announce only prompts
+        // us to look sooner.
+        ControlMsg::Announce { .. } => {
+            ingest_all(inner).await;
+        }
+        // The group has abandoned the namespace this node is syncing. The
+        // capability is encrypted under the group key, so a device removed
+        // before the rotation simply cannot read it and stays behind —
+        // which is the whole purpose of rotating rather than asking nicely.
+        ControlMsg::Namespace { epoch, chunk } => {
+            let effects = {
+                let mut state = inner.state.lock().await;
+                report_rejection(state.handle(
+                    Event::NamespaceArrived { epoch, chunk },
+                    &mut rand::rngs::OsRng,
+                ))
+            };
+            apply_effects(inner, effects).await;
+        }
+        // Somebody cannot read what we publish. Answering re-keys the
+        // group, so the core checks the requester is a member *now* before
+        // any of that happens; a refusal is logged rather than fatal, since
+        // a revoked device asking is an expected thing to see on a topic
+        // every past invitee can reach.
+        ControlMsg::Repair {
+            member,
+            target,
+            epoch,
+        } => {
+            let Some(requester) = member_id_from_bytes(&member) else {
+                tracing::warn!("discarding a repair request naming an unparseable member");
+                return;
+            };
+            // Checked before the core is asked to do anything, because what
+            // is being limited is the *work*: a member ignoring its own
+            // sending cooldown must not be able to buy more re-keys by
+            // shouting.
+            let allowed = {
+                let mut cooldown = inner.repair_answer_cooldown.lock().await;
+                cooldown.claim(member, Instant::now())
+            };
+            if !allowed {
+                tracing::debug!("suppressing a repeat repair answer for one peer");
+                return;
+            }
+            let effects = {
+                let mut state = inner.state.lock().await;
+                report_rejection(state.handle(
+                    Event::RepairRequested {
+                        requester,
+                        target,
+                        epoch,
+                    },
+                    &mut rand::rngs::OsRng,
+                ))
+            };
+            apply_effects(inner, effects).await;
         }
     }
 }
@@ -1315,16 +1393,53 @@ async fn republish_loop(inner: Arc<Inner>) {
 /// Broadcast our full CGKA operation log, so a peer that missed anything can
 /// repair its own state.
 async fn send_log(inner: &Inner) {
-    let log = {
+    let (log, certs) = {
         let state = inner.state.lock().await;
-        state.op_log()
+        (state.op_log(), state.capabilities().certificates())
     };
-    let Ok(log) = log else { return };
-    if let Ok(bytes) = (ControlMsg::Log(log)).encode()
+    let Ok(ops) = log else { return };
+    // The certificates go with the log, not after it. They authorise every `Add`
+    // it contains, so a receiver replaying the operations without them refuses
+    // the history — including, for a joiner, its own admission. They are also the
+    // only anti-entropy a role change gets, since a grant mints no operation.
+    if let Ok(bytes) = (ControlMsg::Log { ops, certs }).encode()
         && let Err(err) = inner.gossip_tx.broadcast(Bytes::from(bytes)).await
     {
         tracing::error!(%err, "failed to broadcast the operation log");
     }
+}
+
+/// Remove a leaf that a member outside the group spliced into the tree.
+///
+/// The other half of [`Effect::EvictUncertified`]. Rate-limited per spliced leaf,
+/// because answering costs a `Remove` and a namespace rotation and the trigger is
+/// adversarial: without the limiter, a revenant re-adding in a loop would make the
+/// group rotate its replica indefinitely.
+///
+/// Feeding the removal back as an ordinary [`Event::RemoveMember`] rather than
+/// calling into the CGKA directly is what keeps the ordering guarantee intact —
+/// the `Remove` is broadcast before the rotation is minted, exactly as for a
+/// deliberate removal.
+async fn evict_uncertified(inner: &Arc<Inner>, member: MemberId) {
+    if !inner
+        .eviction_cooldown
+        .lock()
+        .await
+        .claim(member.to_bytes(), Instant::now())
+    {
+        return;
+    }
+    tracing::warn!(
+        %member,
+        "removing a leaf introduced by a member no longer in the group"
+    );
+    let effects = {
+        let mut state = inner.state.lock().await;
+        state
+            .handle(Event::RemoveMember { member }, &mut rand::rngs::OsRng)
+            .unwrap_or_default()
+    };
+    apply_effects(inner, effects).await;
 }
 
 /// Re-encrypt and re-announce every document this node knows about, and the
@@ -1366,14 +1481,28 @@ async fn republish(inner: &Arc<Inner>) {
 async fn apply_effects(inner: &Arc<Inner>, effects: Vec<Effect>) {
     for effect in effects {
         match effect {
-            Effect::BroadcastOp(op) => {
+            Effect::BroadcastOp { op, proof } => {
                 // A dropped control operation is unrecoverable for peers, so
                 // failures here are logged loudly rather than swallowed.
-                if let Ok(bytes) = ControlMsg::Op(op).encode()
+                if let Ok(bytes) = (ControlMsg::Op { op, proof }).encode()
                     && let Err(err) = inner.gossip_tx.broadcast(Bytes::from(bytes)).await
                 {
                     tracing::error!(%err, "failed to broadcast a CGKA operation");
                 }
+            }
+            Effect::BroadcastCerts(certs) => {
+                // Lost certificates are recoverable — the next log exchange
+                // re-ships the whole store — but a lost one costs its subject
+                // their role until then, so this is still logged rather than
+                // ignored.
+                if let Ok(bytes) = ControlMsg::Certs(certs).encode()
+                    && let Err(err) = inner.gossip_tx.broadcast(Bytes::from(bytes)).await
+                {
+                    tracing::error!(%err, "failed to broadcast capability certificates");
+                }
+            }
+            Effect::EvictUncertified { member } => {
+                Box::pin(evict_uncertified(inner, member)).await;
             }
             Effect::StoreChunk { key, chunk, .. } => {
                 if let Err(err) = store_chunk(inner, key.as_bytes(), &chunk).await {
@@ -1443,13 +1572,13 @@ async fn apply_effects(inner: &Arc<Inner>, effects: Vec<Effect>) {
 /// Whether this node's own role permits writing to the replica.
 ///
 /// A member with no role recorded yet is treated as a writer, matching the
-/// escape hatch the core's `require_write` already uses: a joiner's manifest is
-/// empty until its first sync, and refusing it a write capability then would
-/// leave it unable to publish the very records that establish its role.
+/// escape hatch the core's `require_write` already uses: a joiner holds no
+/// certificates until its first exchange, and refusing it a write capability
+/// then would leave it unable to publish the very records that establish it.
 async fn local_role_may_write(inner: &Inner) -> bool {
     let state = inner.state.lock().await;
     state
-        .manifest()
+        .capabilities()
         .role_of_member(&state.member_id().to_bytes())
         .is_none_or(Role::can_write)
 }
@@ -1795,7 +1924,7 @@ async fn fetch_chunks(
             // writes would be a startup deadlock.
             let accepted = author == inner.author.to_bytes() || {
                 let state = inner.state.lock().await;
-                state.manifest().author_may_write(&author)
+                state.author_may_write(&author)
             };
             if !accepted {
                 // Routine during catch-up, not necessarily an attack: until the

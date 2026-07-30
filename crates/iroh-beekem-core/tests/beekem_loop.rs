@@ -9,7 +9,9 @@
 use std::sync::Arc;
 
 use beekem::{id::TreeId, operation::CgkaOperation};
-use iroh_beekem_core::{CgkaController, DecryptOutcome, MergeOutcome};
+use iroh_beekem_core::{
+    AuthorizedOp, Certificate, CgkaController, DecryptOutcome, MergeOutcome, Role,
+};
 use keyhive_crypto::{
     share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
 };
@@ -32,6 +34,12 @@ struct Invited {
     bob_id: beekem::id::MemberId,
     /// The full causal log, as a joiner would receive it.
     log: Vec<Signed<CgkaOperation>>,
+    /// The certificates authorising that log, as a joiner would receive them.
+    ///
+    /// Not decoration: since phase 5 a receiver checks that the added leaf holds
+    /// a signed binding before merging an `Add`, so a log replayed without these
+    /// is refused operation by operation.
+    certs: Vec<Certificate>,
 }
 
 fn invite_bob() -> Invited {
@@ -47,6 +55,15 @@ fn invite_bob() -> Invited {
     let bob_secret = ShareSecretKey::generate(&mut rng(20));
     let bob_share_key = bob_secret.share_key();
 
+    // Certify bob before admitting him: the `Add` is only admissible to a
+    // receiver once a binding attributes the added leaf to a user.
+    alice
+        .certify_device(bob_id.to_bytes(), bob_id.to_bytes(), [1u8; 16])
+        .expect("the founder may bind any device");
+    alice
+        .certify_role(bob_id.to_bytes(), Role::Editor, [2u8; 16])
+        .expect("the founder may grant any role");
+
     alice
         .add_member(bob_id, bob_share_key)
         .expect("adding bob should succeed")
@@ -55,8 +72,9 @@ fn invite_bob() -> Invited {
     let log = alice
         .op_log()
         .expect("alice should be able to export her log");
+    let certs = alice.capabilities().certificates();
 
-    let bob = CgkaController::join(doc, bob_signer, bob_secret, &log)
+    let bob = CgkaController::join(doc, bob_signer, bob_secret, &log, &certs)
         .expect("bob should be able to join by replaying the log");
 
     Invited {
@@ -64,6 +82,7 @@ fn invite_bob() -> Invited {
         bob,
         bob_id,
         log,
+        certs,
     }
 }
 
@@ -104,7 +123,9 @@ fn invited_member_joins_by_replaying_the_operation_log() {
 
 #[test]
 fn join_rejects_a_log_with_a_causal_hole() {
-    let Invited { mut alice, .. } = invite_bob();
+    let Invited {
+        mut alice, certs, ..
+    } = invite_bob();
 
     let carol_signer = MemorySigner::generate(&mut rng(3));
     let carol_secret = ShareSecretKey::generate(&mut rng(21));
@@ -129,7 +150,7 @@ fn join_rejects_a_log_with_a_causal_hole() {
         "the test must actually remove an operation to be meaningful"
     );
 
-    let result = CgkaController::join(workspace_id(0), carol_signer, carol_secret, &holed);
+    let result = CgkaController::join(workspace_id(0), carol_signer, carol_secret, &holed, &certs);
 
     assert!(
         matches!(
@@ -142,12 +163,18 @@ fn join_rejects_a_log_with_a_causal_hole() {
 
 #[test]
 fn join_fails_for_a_member_who_was_never_added() {
-    let Invited { log, .. } = invite_bob();
+    let Invited { log, certs, .. } = invite_bob();
 
     let mallory_signer = MemorySigner::generate(&mut rng(99));
     let mallory_secret = ShareSecretKey::generate(&mut rng(98));
 
-    let result = CgkaController::join(workspace_id(0), mallory_signer, mallory_secret, &log);
+    let result = CgkaController::join(
+        workspace_id(0),
+        mallory_signer,
+        mallory_secret,
+        &log,
+        &certs,
+    );
 
     assert!(
         matches!(result, Err(iroh_beekem_core::CoreError::NotInvited)),
@@ -170,7 +197,8 @@ fn member_decrypts_content_written_by_another_member() {
     // is load-bearing: without it bob cannot reach the key.
     if let Some(op) = implicit_op {
         assert_eq!(
-            bob.merge(Arc::new(op)).expect("merging alice's update"),
+            bob.merge(AuthorizedOp::bare(Arc::new(op)))
+                .expect("merging alice's update"),
             MergeOutcome::Applied,
             "bob should apply alice's implicit PCS update"
         );
@@ -198,7 +226,8 @@ fn revoked_member_cannot_decrypt_later_content() {
         .encrypt(b"readable by bob", &[], &mut rng(30))
         .expect("encrypting before revocation");
     if let Some(op) = before_op {
-        bob.merge(Arc::new(op)).expect("merging pre-revocation op");
+        bob.merge(AuthorizedOp::bare(Arc::new(op)))
+            .expect("merging pre-revocation op");
     }
     assert!(
         matches!(bob.decrypt(&before), Ok(DecryptOutcome::Plaintext(_))),
@@ -213,14 +242,14 @@ fn revoked_member_cannot_decrypt_later_content() {
 
     // Bob observes his own removal — he cannot be prevented from seeing the
     // public control plane.
-    bob.merge(Arc::new(remove_op))
+    bob.merge(AuthorizedOp::bare(Arc::new(remove_op)))
         .expect("bob merges his own removal");
 
     let (after, after_op) = alice
         .encrypt(b"not readable by bob", &[], &mut rng(31))
         .expect("encrypting after revocation");
     if let Some(op) = after_op {
-        let _ = bob.merge(Arc::new(op));
+        let _ = bob.merge(AuthorizedOp::bare(Arc::new(op)));
     }
 
     // `Unreachable` rather than merely "an error": bob holds the operation that
@@ -242,7 +271,7 @@ fn revoked_member_cannot_decrypt_later_content() {
 mod control_plane_is_authenticated {
     use std::sync::Arc;
 
-    use iroh_beekem_core::{CgkaController, CoreError};
+    use iroh_beekem_core::{AuthorizedOp, CgkaController, CoreError};
     use keyhive_crypto::{
         share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner,
         verifiable::Verifiable,
@@ -271,7 +300,7 @@ mod control_plane_is_authenticated {
             ))
             .expect("mallory can sign her own message");
 
-        let result = alice.merge(Arc::new(forged));
+        let result = alice.merge(AuthorizedOp::bare(Arc::new(forged)));
 
         assert!(
             matches!(result, Err(CoreError::Unauthorized { .. })),
@@ -316,7 +345,7 @@ mod control_plane_is_authenticated {
             *genuine.signature(),
         );
 
-        let result = bob.merge(Arc::new(tampered));
+        let result = bob.merge(AuthorizedOp::bare(Arc::new(tampered)));
 
         assert!(
             matches!(result, Err(CoreError::BadSignature)),
@@ -326,7 +355,7 @@ mod control_plane_is_authenticated {
 
     #[test]
     fn join_rejects_a_log_whose_founding_add_was_not_self_issued() {
-        let Invited { log, .. } = invite_bob();
+        let Invited { log, certs, .. } = invite_bob();
 
         let mallory_signer = MemorySigner::generate(&mut rng(99));
         let carol_signer = MemorySigner::generate(&mut rng(3));
@@ -341,7 +370,13 @@ mod control_plane_is_authenticated {
             .try_sign_sync(log[0].payload().clone())
             .expect("mallory can sign");
 
-        let result = CgkaController::join(workspace_id(0), carol_signer, carol_secret, &forged_log);
+        let result = CgkaController::join(
+            workspace_id(0),
+            carol_signer,
+            carol_secret,
+            &forged_log,
+            &certs,
+        );
 
         assert!(
             matches!(result, Err(CoreError::Unauthorized { .. })),
@@ -387,7 +422,7 @@ fn the_parking_area_is_bounded_against_a_flood() {
             .expect("alice's signer works");
 
         assert_eq!(
-            bob.merge(Arc::new(signed))
+            bob.merge(AuthorizedOp::bare(Arc::new(signed)))
                 .expect("an unresolvable operation is deferred, not an error"),
             MergeOutcome::Deferred,
             "operation {i} should have been parked"
@@ -415,13 +450,17 @@ fn out_of_order_operations_are_parked_then_applied() {
     let carol_secret = ShareSecretKey::generate(&mut rng(21));
     let carol_id = beekem::id::MemberId::from(carol_signer.verifying_key());
     alice
+        .certify_device(carol_id.to_bytes(), carol_id.to_bytes(), [3u8; 16])
+        .expect("the founder binds carol's device");
+    alice
         .add_member(carol_id, carol_secret.share_key())
         .expect("adding carol")
         .expect("carol is new");
 
     let log = alice.op_log().expect("exporting alice's log");
+    let certs = alice.capabilities().certificates();
     let mut carol =
-        CgkaController::join(doc, carol_signer, carol_secret, &log).expect("carol joins");
+        CgkaController::join(doc, carol_signer, carol_secret, &log, &certs).expect("carol joins");
 
     // Two chained operations produced *after* carol's snapshot, so she has
     // neither of them yet and their order of arrival is observable.
@@ -431,7 +470,7 @@ fn out_of_order_operations_are_parked_then_applied() {
     // Deliver out of causal order: the later rotation arrives first.
     assert_eq!(
         carol
-            .merge(Arc::new(second))
+            .merge(AuthorizedOp::bare(Arc::new(second)))
             .expect("merging the later op first"),
         MergeOutcome::Deferred,
         "an operation whose predecessors are missing should be parked, not rejected"
@@ -439,7 +478,7 @@ fn out_of_order_operations_are_parked_then_applied() {
     assert_eq!(carol.parked_len(), 1, "the early arrival should be parked");
 
     carol
-        .merge(Arc::new(first))
+        .merge(AuthorizedOp::bare(Arc::new(first)))
         .expect("merging the earlier op unblocks the parked one");
     carol.merge_pending().expect("draining parked operations");
 

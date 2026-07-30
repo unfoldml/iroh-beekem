@@ -13,7 +13,7 @@
 //! beekem itself verifies neither. This module only frames bytes.
 
 use beekem::operation::CgkaOperation;
-use iroh_beekem_core::{EpochId, RepairTarget};
+use iroh_beekem_core::{Certificate, EpochId, RepairTarget};
 use iroh_docs::DocTicket;
 use keyhive_crypto::signed::Signed;
 use serde::{Deserialize, Serialize};
@@ -23,9 +23,19 @@ use crate::error::WorkspaceError;
 /// A message on the workspace control-plane gossip topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlMsg {
-    /// A CGKA membership or key-rotation operation.
-    Op(Box<Signed<CgkaOperation>>),
-    /// A peer's complete operation log, in causal order.
+    /// A CGKA membership or key-rotation operation, with its proof.
+    ///
+    /// The receiver checks the issuer's capability before merging, so the
+    /// certificates must travel *with* the operation: one shipped without them is
+    /// refused rather than parked, and no later certificate brings it back. See
+    /// [`AuthorizedOp`](iroh_beekem_core::AuthorizedOp).
+    Op {
+        /// The operation.
+        op: Box<Signed<CgkaOperation>>,
+        /// Certificates authorising it that the receiver may not hold.
+        proof: Vec<Certificate>,
+    },
+    /// A peer's complete operation log and certificate store.
     ///
     /// Gossip is best-effort and does not retransmit to a peer that joins the
     /// overlay later, but a missed CGKA operation is *unrecoverable*: every
@@ -33,7 +43,24 @@ pub enum ControlMsg {
     /// full logs whenever a neighbour appears. Merging is idempotent, which is
     /// what makes re-sending the whole log a safe repair rather than a
     /// disruption.
-    Log(Vec<Signed<CgkaOperation>>),
+    ///
+    /// **The certificates are not optional.** They are what authorises every
+    /// `Add` in the log, so a log shipped without them would be rejected
+    /// operation by operation — and a role change, which mints a grant and no
+    /// operation at all, has no other anti-entropy path. This exchange is what
+    /// repairs a lost [`ControlMsg::Certs`].
+    Log {
+        /// The operation log, in causal order.
+        ops: Vec<Signed<CgkaOperation>>,
+        /// The sender's whole certificate store.
+        certs: Vec<Certificate>,
+    },
+    /// Capability certificates with no operation behind them.
+    ///
+    /// A role change produces a grant and nothing else, so it needs a carrier of
+    /// its own. Announced once, like a namespace rotation, and repaired by the
+    /// certificate half of [`ControlMsg::Log`].
+    Certs(Vec<Certificate>),
     /// A peer announcing that it has content available under a blinded key.
     ///
     /// `iroh-docs` reconciles entries on its own schedule; this nudge lets a

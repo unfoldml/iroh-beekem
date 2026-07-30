@@ -46,10 +46,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
+    capability::{CapabilityStore, Certificate, Role},
     content::{Chunk, ChunkRef},
     error::CoreError,
-    keys::{CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome},
-    manifest::{FileEntry, Manifest, Role, WorkspaceInfo},
+    keys::{AuthorizedOp, CgkaController, DecryptOutcome, EpochId, MergeOutcome},
+    manifest::{DeviceRecord, FileEntry, Manifest, WorkspaceInfo},
 };
 
 /// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
@@ -160,8 +161,17 @@ impl std::fmt::Display for NamespaceEpoch {
 /// Something that happened to this node.
 #[derive(Debug, Clone)]
 pub enum Event {
-    /// A signed CGKA operation arrived on the control plane.
-    ControlOp(ControlOp),
+    /// A signed CGKA operation arrived on the control plane, with its proof.
+    ///
+    /// The certificates travel with the operation rather than separately so that
+    /// admissibility is decidable on receipt; see [`AuthorizedOp`].
+    ControlOp(AuthorizedOp),
+    /// Capability certificates arrived on the control plane with no operation.
+    ///
+    /// A role change mints a grant but no CGKA operation, so it needs a way to
+    /// travel on its own. Absorbing them can unblock operations already parked,
+    /// which is why this returns effects like any other arrival.
+    CertsArrived(Vec<Certificate>),
     /// An encrypted chunk arrived on the data plane.
     ChunkArrived {
         /// Which document the chunk belongs to.
@@ -415,11 +425,47 @@ pub enum Event {
 /// Something the caller must do on this node's behalf.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    /// Broadcast a CGKA operation to every peer.
+    /// Broadcast a CGKA operation, with the certificates that authorise it.
     ///
     /// Dropping one of these is not a recoverable performance choice: peers
     /// that miss it cannot derive the keys for anything encrypted afterwards.
-    BroadcastOp(Box<Signed<CgkaOperation>>),
+    ///
+    /// **The proof must travel with the operation.** A receiver checks the
+    /// issuer's capability before merging, so an operation shipped without its
+    /// certificates is refused — not parked — and the membership change it
+    /// carries is lost.
+    BroadcastOp {
+        /// The operation to broadcast.
+        op: Box<Signed<CgkaOperation>>,
+        /// Certificates the receiver may not hold yet. Empty is correct for an
+        /// `Update`, which needs no capability beyond membership.
+        proof: Vec<Certificate>,
+    },
+    /// Broadcast capability certificates that authorise no particular operation.
+    ///
+    /// A role change produces a grant and nothing else. Like a namespace
+    /// rotation, it is announced *once* and has no later write behind it, so it
+    /// also needs anti-entropy — which is why a log exchange ships the whole
+    /// certificate store rather than just the operations.
+    BroadcastCerts(Vec<Certificate>),
+    /// Ask the caller to remove a leaf that a non-member spliced into the tree.
+    ///
+    /// Raised when an `Add` is merged whose issuer is validly certified but is no
+    /// longer a current member — a removed admin re-entering. The operation
+    /// cannot simply be refused: admissibility must not depend on
+    /// `current_members`, or two peers that observe the removal and the `Add` in
+    /// opposite orders drop different operations and diverge permanently. So the
+    /// splice is accepted and then undone.
+    ///
+    /// **The caller must rate-limit this**, and feed it back as
+    /// [`Event::RemoveMember`]. Answering costs a removal and a namespace
+    /// rotation, so an attacker re-adding in a loop would otherwise churn the
+    /// whole group. The core has no clock to limit with; both backends already
+    /// keep a `Cooldown` for the repair path and this reuses the pattern.
+    EvictUncertified {
+        /// The leaf to remove.
+        member: MemberId,
+    },
     /// Persist a chunk and announce it under its blinded storage key.
     StoreChunk {
         /// The blinded `iroh-docs` key to write under.
@@ -519,6 +565,22 @@ pub enum Effect {
         /// The epoch it cannot derive.
         epoch: EpochId,
     },
+}
+
+impl Effect {
+    /// Broadcast an operation that needs no certificate of its own.
+    ///
+    /// Correct for an `Update` and for the implicit re-keys `encrypt` performs:
+    /// neither introduces nor removes a member, so membership is the whole of the
+    /// authority they need and the receiver already established that. An `Add` or
+    /// a `Remove` must **not** use this — it would ship without the binding that
+    /// authorises it and be refused.
+    fn broadcast(op: Signed<CgkaOperation>) -> Self {
+        Self::BroadcastOp {
+            op: Box::new(op),
+            proof: Vec::new(),
+        }
+    }
 }
 
 /// What the local node could do with one parked chunk.
@@ -711,16 +773,24 @@ impl WorkspaceState {
     ///
     /// Returns [`CoreError::Manifest`] if the initial role cannot be recorded.
     pub fn found(cgka: CgkaController, secret: WorkspaceSecret) -> Result<Self, CoreError> {
-        let this = Self::joined(cgka, secret);
+        let mut this = Self::joined(cgka, secret);
         // The founder is their own user, and this device is that user's first —
         // which makes the user id and the member id the same bytes here, and
-        // only here. All three records are needed: without the device record
-        // the founder's own leaf resolves to no user, hence to no role, and the
-        // workspace would begin with an admin nobody can look up.
+        // only here.
         let me = this.member_id().to_bytes();
         this.manifest.set_user(&me, "")?;
-        this.manifest.set_device(&me, &me, "first device")?;
-        this.manifest.set_role(&me, Role::Admin)?;
+        this.manifest.set_device(&me, "first device")?;
+        // Both certificates are self-signed, and both verify, because the store
+        // is rooted at this key: `tree_id` *is* the founder's verifying key, so
+        // "the founder says so" is the axiom rather than a claim needing support.
+        //
+        // Minted explicitly even though `CapabilityStore::new` already seeds the
+        // founder as an admin, because the seed is local and these are what
+        // travel. A joiner reconstructs the closure from certificates alone, and
+        // one that never received the founder's own pair would hold a store whose
+        // root granted nothing.
+        this.cgka.certify_device(me, me, [0u8; 16])?;
+        this.cgka.certify_role(me, Role::Admin, [0u8; 16])?;
         Ok(this)
     }
 
@@ -730,10 +800,95 @@ impl WorkspaceState {
         self.cgka.member_id()
     }
 
-    /// The workspace manifest.
+    /// The workspace manifest: the directory index and display data.
+    ///
+    /// Deliberately holds no authority. Roles and device bindings live in
+    /// [`Self::capabilities`]; see the [manifest module documentation](crate::manifest)
+    /// for why a CRDT cannot hold either.
     #[must_use]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Who is permitted to do what, rooted at the founder's key.
+    ///
+    /// This is the authority. Every role question — may this member administer,
+    /// may it write, which user does this leaf act for — is answered here, and
+    /// the answer is a pure function of a set of signed certificates rather than
+    /// of replicated mutable state.
+    #[must_use]
+    pub fn capabilities(&self) -> &CapabilityStore {
+        self.cgka.capabilities()
+    }
+
+    /// Every device the workspace knows of, display data joined to its binding.
+    ///
+    /// Only *certified* devices appear: a leaf with no admitted binding speaks
+    /// for nobody, so it has no user to report and no role to inherit. That
+    /// filter is what makes a leaf spliced in by a revenant inert rather than
+    /// merely unwelcome.
+    #[must_use]
+    pub fn devices(&self) -> Vec<DeviceRecord> {
+        self.capabilities()
+            .certified_devices()
+            .filter_map(|member| {
+                let user = self.capabilities().user_of(&member)?;
+                let display = self.manifest.device(&member);
+                Some(DeviceRecord {
+                    member,
+                    user,
+                    endpoint_id: display.as_ref().and_then(|d| d.endpoint_id),
+                    label: display.map(|d| d.label).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Direct access to the CGKA controller, bypassing every local role check.
+    ///
+    /// **This exists to model a malicious member, and nothing else.** The
+    /// `require_*` checks in this type are a fail-fast local courtesy — a clear
+    /// error instead of an operation every peer will drop — and an attacker
+    /// simply does not run them. A scenario that drove an attack through
+    /// [`Self::handle`] would be testing that courtesy rather than the receiver's
+    /// enforcement, which is precisely the mistake that let authorization be
+    /// issuer-side for four phases.
+    ///
+    /// Gated behind a feature so it cannot be reached by accident: an application
+    /// that finds itself wanting this wants [`Self::handle`].
+    #[cfg(feature = "adversarial-testing")]
+    #[must_use]
+    pub fn controller_mut(&mut self) -> &mut CgkaController {
+        &mut self.cgka
+    }
+
+    /// Every certified device belonging to one user.
+    #[must_use]
+    pub fn devices_of(&self, user: &[u8; 32]) -> Vec<DeviceRecord> {
+        self.devices()
+            .into_iter()
+            .filter(|device| device.user == *user)
+            .collect()
+    }
+
+    /// Whether an entry signed by `author` should be accepted.
+    ///
+    /// Requires all three links, and the middle one is now the certificate rather
+    /// than a map entry: a member must have claimed the author id (self-attested,
+    /// in the manifest), a *signed binding* must attribute that member's device to
+    /// a user, and a *signed grant* must give that user a role that can write. An
+    /// unclaimed author, an uncertified device, or a viewer's device all fail.
+    ///
+    /// Still advisory in one specific sense — it constrains what a well-behaved
+    /// peer accepts, not what a peer holding the namespace write capability can
+    /// push into the replica — but no longer advisory in the sense that mattered:
+    /// the role it consults cannot be rewritten by the member being checked.
+    #[must_use]
+    pub fn author_may_write(&self, author: &[u8; 32]) -> bool {
+        self.manifest
+            .member_for_author(author)
+            .and_then(|member| self.capabilities().role_of_member(&member))
+            .is_some_and(Role::can_write)
     }
 
     /// Which generation of the replicated index this node is syncing.
@@ -789,6 +944,11 @@ impl WorkspaceState {
             .manifest
             .devices()
             .into_iter()
+            // Certified: a signed binding attributes this leaf to a user. This is
+            // the clause that makes the phrase "derived, never authored" true —
+            // without it the set derives from a map any member can write.
+            .filter(|device| self.capabilities().is_certified_device(&device.member))
+            // Still a member: the CGKA has not removed the leaf.
             .filter(|device| members.contains(&device.member))
             .filter_map(|device| device.endpoint_id)
             .collect();
@@ -889,6 +1049,7 @@ impl WorkspaceState {
     ) -> Result<Vec<Effect>, CoreError> {
         match event {
             Event::ControlOp(op) => self.on_control_op(op),
+            Event::CertsArrived(certs) => self.on_certs_arrived(certs),
             Event::ChunkArrived { doc, chunk } => self.on_chunk_arrived(doc, *chunk),
             Event::LocalEdit { doc, text } => self.on_text_edit(doc, csprng, |content| {
                 let at = content.len_unicode();
@@ -939,7 +1100,7 @@ impl WorkspaceState {
             Event::RemoveMember { member } => self.on_remove_member(member),
             Event::Rotate => {
                 let op = self.cgka.rotate(csprng)?;
-                Ok(vec![Effect::BroadcastOp(Box::new(op))])
+                Ok(vec![Effect::broadcast(op)])
             }
             Event::ManifestArrived { chunk } => self.on_manifest_arrived(&chunk, csprng),
             Event::UpsertFile { entry } => {
@@ -960,7 +1121,10 @@ impl WorkspaceState {
             }
             Event::SetDisplayName { display_name } => {
                 let me = self.cgka.member_id().to_bytes();
-                let user = self.manifest.user_of(&me).ok_or(CoreError::UnknownDevice)?;
+                let user = self
+                    .capabilities()
+                    .user_of(&me)
+                    .ok_or(CoreError::UnknownDevice)?;
                 self.manifest.set_user(&user, &display_name)?;
                 self.publish_manifest(Keying::Current, csprng)
             }
@@ -1027,11 +1191,7 @@ impl WorkspaceState {
     /// whatever the manifest says. Genuine read revocation is a CGKA removal.
     fn require_admin(&self) -> Result<(), CoreError> {
         let me = self.cgka.member_id().to_bytes();
-        if self
-            .manifest
-            .role_of_member(&me)
-            .is_some_and(Role::can_administer)
-        {
+        if self.capabilities().may_administer(&me) {
             return Ok(());
         }
         Err(CoreError::NotAnAdmin)
@@ -1050,14 +1210,7 @@ impl WorkspaceState {
     /// close that properly.
     fn require_may_add_device_to(&self, user: &[u8; 32]) -> Result<(), CoreError> {
         let me = self.cgka.member_id().to_bytes();
-        if self.manifest.user_of(&me) == Some(*user) {
-            return Ok(());
-        }
-        if self
-            .manifest
-            .role_of_member(&me)
-            .is_some_and(Role::can_administer)
-        {
+        if self.capabilities().may_bind_device_to(&me, user) {
             return Ok(());
         }
         Err(CoreError::NotThisUsersDevice)
@@ -1127,17 +1280,22 @@ impl WorkspaceState {
         } else {
             self.require_not_last_admin(user)?;
         }
-        self.manifest.set_role(user, role)?;
-        self.publish_manifest(Keying::Current, csprng)
+        // A grant supersedes every earlier grant for this subject by carrying a
+        // higher `seq`; `certify_role` chooses it. Nothing is written to the
+        // manifest — a role is a capability, not document metadata.
+        let cert = self.cgka.certify_role(*user, role, random_nonce(csprng))?;
+        // Broadcast on its own, because a role change mints no CGKA operation to
+        // ride along with. Like a rotation it is announced once, so the log
+        // exchange that ships the whole certificate store is what repairs a loss.
+        Ok(vec![Effect::BroadcastCerts(vec![cert])])
     }
 
     /// Admit a new person along with their first device.
     ///
-    /// The caller checks the permission; this writes the records. All three go
-    /// in together because a leaf with no device record has no user, so it has
-    /// no role, so every peer's `author_may_write` rejects its entries — the
-    /// new member would appear to join and then silently fail to publish
-    /// anything.
+    /// Both certificates are minted here and both travel with the `Add`: without
+    /// the binding, every peer refuses the `Add` itself, and without the grant the
+    /// new member holds a certified leaf that may do nothing. The display record
+    /// goes in the manifest, where it grants nothing.
     fn on_add_user<R: CryptoRng + RngCore>(
         &mut self,
         member: MemberId,
@@ -1147,15 +1305,23 @@ impl WorkspaceState {
         endpoint: Option<[u8; 32]>,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.admit(member, share_key, csprng, |manifest, member| {
+        // A new user's id is their first device's member id; see the manifest
+        // module documentation for why that identifier rather than a fresh one.
+        let user = member.to_bytes();
+        let certs = vec![
+            self.cgka
+                .certify_device(member.to_bytes(), user, random_nonce(csprng))?,
+            self.cgka.certify_role(user, role, random_nonce(csprng))?,
+        ];
+        self.admit(member, share_key, certs, csprng, |manifest, member| {
             manifest.set_user(member, display_name)?;
-            manifest.set_device(member, member, "first device")?;
+            manifest.set_device(member, "first device")?;
             // Strictly after `set_device`, which creates the record this
             // attaches to; reversed, it returns `UnknownDevice`.
             if let Some(endpoint) = endpoint {
                 manifest.set_device_endpoint(member, &endpoint)?;
             }
-            manifest.set_role(member, role)
+            Ok(())
         })
     }
 
@@ -1172,8 +1338,13 @@ impl WorkspaceState {
         endpoint: Option<[u8; 32]>,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.admit(member, share_key, csprng, |manifest, member| {
-            manifest.set_device(member, user, label)?;
+        let certs =
+            vec![
+                self.cgka
+                    .certify_device(member.to_bytes(), *user, random_nonce(csprng))?,
+            ];
+        self.admit(member, share_key, certs, csprng, |manifest, member| {
+            manifest.set_device(member, label)?;
             if let Some(endpoint) = endpoint {
                 manifest.set_device_endpoint(member, &endpoint)?;
             }
@@ -1207,10 +1378,10 @@ impl WorkspaceState {
         // is invisible if you look at the leaf alone. A device with no record
         // stands in for its own user, which is the pre-sync case.
         let owner = self
-            .manifest
+            .capabilities()
             .user_of(&member.to_bytes())
             .unwrap_or_else(|| member.to_bytes());
-        if self.manifest.devices_of(&owner).len() <= 1 {
+        if self.capabilities().devices_of(&owner).len() <= 1 {
             self.require_not_last_admin(&owner)?;
         }
         let op = self.cgka.remove_member(member)?;
@@ -1229,7 +1400,7 @@ impl WorkspaceState {
         // rotation existed to keep it out of.
         self.namespace.epoch = self.namespace.epoch.saturating_add(1);
         Ok(vec![
-            Effect::BroadcastOp(Box::new(op)),
+            Effect::broadcast(op),
             Effect::RotateNamespace {
                 epoch: self.namespace.epoch,
             },
@@ -1266,10 +1437,7 @@ impl WorkspaceState {
         // The key operations strictly first: they are what let the group derive
         // the key this chunk is under, and a peer receiving them the other way
         // round would fail to decrypt and never retry.
-        let mut effects: Vec<Effect> = ops
-            .into_iter()
-            .map(|op| Effect::BroadcastOp(Box::new(op)))
-            .collect();
+        let mut effects: Vec<Effect> = ops.into_iter().map(Effect::broadcast).collect();
         effects.push(Effect::PublishNamespace {
             epoch,
             chunk: Box::new(chunk),
@@ -1390,6 +1558,7 @@ impl WorkspaceState {
         &mut self,
         member: MemberId,
         share_key: ShareKey,
+        certs: Vec<Certificate>,
         csprng: &mut R,
         record: F,
     ) -> Result<Vec<Effect>, CoreError>
@@ -1401,10 +1570,25 @@ impl WorkspaceState {
         if op.is_some() {
             record(&self.manifest, &member.to_bytes())?;
         }
+        // The certificates ride *with* the `Add` rather than before it. A peer
+        // checks the issuer's capability and the added leaf's binding before
+        // merging, so an `Add` that arrived first would be refused outright —
+        // not parked — and no later certificate would bring it back.
         let mut effects: Vec<Effect> = op
-            .map(|o| Effect::BroadcastOp(Box::new(o)))
+            .map(|op| Effect::BroadcastOp {
+                op: Box::new(op),
+                proof: certs.clone(),
+            })
             .into_iter()
             .collect();
+        if effects.is_empty() {
+            // A duplicate admission: no operation was minted, so the
+            // certificates have no carrier. Ship them anyway — the peer that
+            // missed the original may still be missing them.
+            effects.push(Effect::BroadcastCerts(certs));
+        } else {
+            // Already attached as the operation's proof.
+        }
         effects.extend(self.publish_manifest(Keying::Current, csprng)?);
         Ok(effects)
     }
@@ -1432,7 +1616,7 @@ impl WorkspaceState {
     /// entire group to encrypt them.
     fn require_write(&self) -> Result<(), CoreError> {
         let me = self.cgka.member_id().to_bytes();
-        match self.manifest.role_of_member(&me) {
+        match self.capabilities().role_of_member(&me) {
             Some(role) if !role.can_write() => Err(CoreError::NotAWriter),
             _ => Ok(()),
         }
@@ -1446,10 +1630,10 @@ impl WorkspaceState {
     /// before there was a caller to enforce it.
     fn require_not_last_admin(&self, member: &[u8; 32]) -> Result<(), CoreError> {
         let is_admin = self
-            .manifest
+            .capabilities()
             .role_of(member)
             .is_some_and(Role::can_administer);
-        if is_admin && self.manifest.admin_count() <= 1 {
+        if is_admin && self.capabilities().admin_count() <= 1 {
             return Err(CoreError::LastAdmin);
         }
         Ok(())
@@ -1550,10 +1734,7 @@ impl WorkspaceState {
         }
         let ticket = self.namespace_ticket.clone();
         let (chunk, ops) = self.encrypt_keyed(&ticket, &[], keying, csprng)?;
-        let mut effects: Vec<Effect> = ops
-            .into_iter()
-            .map(|op| Effect::BroadcastOp(Box::new(op)))
-            .collect();
+        let mut effects: Vec<Effect> = ops.into_iter().map(Effect::broadcast).collect();
         effects.push(Effect::PublishNamespace {
             epoch: self.namespace.epoch,
             chunk: Box::new(chunk),
@@ -1572,10 +1753,7 @@ impl WorkspaceState {
 
         // As in `publish`: an implicit PCS update has to reach peers before the
         // ciphertext it keys, or nobody can read what follows.
-        let mut effects: Vec<Effect> = ops
-            .into_iter()
-            .map(|op| Effect::BroadcastOp(Box::new(op)))
-            .collect();
+        let mut effects: Vec<Effect> = ops.into_iter().map(Effect::broadcast).collect();
         effects.push(Effect::StoreManifest {
             key: self.secret.manifest_key(),
             chunk: Box::new(chunk),
@@ -1604,15 +1782,78 @@ impl WorkspaceState {
         }
     }
 
-    fn on_control_op(&mut self, op: ControlOp) -> Result<Vec<Effect>, CoreError> {
-        let outcome = self.cgka.merge(op)?;
+    fn on_control_op(&mut self, authorized: AuthorizedOp) -> Result<Vec<Effect>, CoreError> {
+        // Read before the merge consumes it: an `Add` that turns out to have been
+        // issued by a member no longer in the group has to be undone, and after
+        // the merge the issuer looks like any other.
+        let splice = match authorized.op.payload {
+            CgkaOperation::Add { added_id, .. } => {
+                let issuer = MemberId::from(*authorized.op.issuer());
+                Some((issuer, added_id))
+            }
+            CgkaOperation::Remove { .. } | CgkaOperation::Update { .. } => None,
+        };
+
+        let outcome = self.cgka.merge(authorized)?;
         if outcome == MergeOutcome::Applied {
             self.cgka.merge_pending()?;
             // New key material may have unblocked chunks that previously had
             // no reachable PCS key.
-            return self.drain_pending();
+            let mut effects = self.drain_pending()?;
+            effects.extend(self.evict_if_spliced(splice.as_ref()));
+            return Ok(effects);
         }
         Ok(Vec::new())
+    }
+
+    /// Absorb certificates that arrived without an operation.
+    ///
+    /// Draining both queues afterwards is not merely tidy: a parked operation may
+    /// have been waiting on a predecessor that is now admissible, and a parked
+    /// chunk may be keyed under an epoch established by such an operation. Only
+    /// bothering when something was new keeps a re-sent store from costing a full
+    /// drain on every log exchange.
+    fn on_certs_arrived(&mut self, certs: Vec<Certificate>) -> Result<Vec<Effect>, CoreError> {
+        if self.cgka.absorb_certificates(certs) > 0 {
+            self.cgka.merge_pending()?;
+            self.drain_pending()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Ask for the removal of a leaf a non-member introduced.
+    ///
+    /// The revenant case. A removed member keeps whatever capability it held —
+    /// the certificate store is grow-only, so `ever_admin` never retracts — and
+    /// its signature stays admissible because `known_members` is monotone. It can
+    /// therefore mint a binding for a keypair it controls and issue a valid `Add`.
+    ///
+    /// Refusing that `Add` is not available: the only thing distinguishing it is
+    /// `current_members`, which is order-sensitive, so one peer would drop an
+    /// operation another kept and the group would diverge permanently — the
+    /// failure mode the whole design is built to avoid. The splice is accepted and
+    /// then *undone* instead, which converges because every honest admin reaches
+    /// the same conclusion independently and duplicate removals merge as
+    /// [`MergeOutcome::Duplicate`].
+    ///
+    /// Only an admin can act, since only an admin's `Remove` will be honoured.
+    /// Non-admins raise nothing and wait; there is nothing useful they could do.
+    fn evict_if_spliced(&self, splice: Option<&(MemberId, MemberId)>) -> Vec<Effect> {
+        let Some(&(issuer, added)) = splice else {
+            return Vec::new();
+        };
+        if self.cgka.is_current_member(issuer) {
+            // The ordinary case: an admission by a member in good standing.
+            return Vec::new();
+        }
+        let me = self.cgka.member_id().to_bytes();
+        if self.capabilities().may_administer(&me) {
+            vec![Effect::EvictUncertified { member: added }]
+        } else {
+            // Not ours to fix. An admin will see the same operation and act.
+            Vec::new()
+        }
     }
 
     /// Encrypt and emit the current state of a document under the current epoch.
@@ -1650,10 +1891,7 @@ impl WorkspaceState {
         // Key material must go out *before* anything else can read the chunk,
         // so it is emitted first — whether it is an implicit update beekem
         // performed for us or the deliberate re-key of a repair.
-        let mut effects: Vec<Effect> = ops
-            .into_iter()
-            .map(|op| Effect::BroadcastOp(Box::new(op)))
-            .collect();
+        let mut effects: Vec<Effect> = ops.into_iter().map(Effect::broadcast).collect();
         effects.push(Effect::StoreChunk {
             key: self.secret.storage_key(doc),
             doc,
@@ -1757,6 +1995,17 @@ impl WorkspaceState {
             ChunkVerdict::AwaitingDeps
         }
     }
+}
+
+/// A fresh nonce, so two otherwise identical certificates have distinct digests.
+///
+/// Certificates are keyed by digest and ordered by it when a tie must be broken,
+/// so two grants that agreed in every field would collapse into one entry and a
+/// re-grant would silently do nothing.
+fn random_nonce<R: CryptoRng + RngCore>(csprng: &mut R) -> [u8; 16] {
+    let mut nonce = [0u8; 16];
+    csprng.fill_bytes(&mut nonce);
+    nonce
 }
 
 /// Whether a publish reuses the group's current epoch key or mints a new one.

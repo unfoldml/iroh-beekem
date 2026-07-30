@@ -37,9 +37,14 @@ use beekem::{
     id::{MemberId, TreeId},
     operation::CgkaOperation,
 };
+// Re-exported rather than merely used: a property asserting "this member holds
+// exactly the role it was granted" needs to name a role, and making the test
+// depend on `iroh-beekem-core` directly for one enum would obscure that the
+// simulator is the thing under test.
+pub use iroh_beekem_core::Role;
 use iroh_beekem_core::{
-    CgkaController, Chunk, DocumentUuid, Effect, EpochId, Event, NamespaceEpoch, RepairTarget,
-    Role, StorageKey, WorkspaceSecret, WorkspaceState,
+    AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect, EpochId, Event,
+    NamespaceEpoch, RepairTarget, StorageKey, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -175,6 +180,18 @@ const FORGE_INTERVAL: Duration = Duration::from_millis(300);
 /// How many forgeries an attacking node attempts.
 const MAX_FORGERIES: u32 = 10;
 
+/// How often an insider tries to act beyond the role it was granted.
+const OVERREACH_INTERVAL: Duration = Duration::from_millis(400);
+
+/// How many times an insider tries.
+///
+/// Bounded like [`MAX_FORGERIES`], and for a sharper reason in the revenant
+/// case: each splice that lands costs the honest group a removal and a namespace
+/// rotation, so an unbounded attacker would keep the group rotating for the whole
+/// run and the convergence properties would be measuring the attack rather than
+/// the protocol.
+const MAX_OVERREACHES: u32 = 6;
+
 /// What a simulated run exercises beyond the honest base protocol.
 ///
 /// A compile-time parameter rather than a runtime field because `propsim`
@@ -202,6 +219,23 @@ pub trait Scenario: Clone + Default + 'static {
     /// nothing has touched, so the entry it produces is one that exists only in
     /// the post-rotation namespace.
     const WRITE_AFTER_REVOKE: bool = false;
+    /// Which node acts beyond the role it was granted, if any.
+    ///
+    /// Distinct from both [`Self::FORGE`] and [`Self::OUTSIDER`], and the
+    /// distinction is the whole point. A forging node signs with a key no `Add`
+    /// ever introduced, so `known_members` refuses it; an outsider never joins at
+    /// all, so the roster refuses it. An **insider** signs with a key the group
+    /// itself admitted, holding a role the group itself granted — nothing about
+    /// its identity is wrong, only what it is trying to do. Until the capability
+    /// closure existed there was nothing that could tell the difference.
+    const INSIDER: Option<u64> = None;
+    /// Whether the insider keeps acting *after* it has been removed.
+    ///
+    /// The revenant. Its capability is not retracted by removal — the certificate
+    /// store is grow-only — and its signature stays admissible because
+    /// `known_members` is monotone, so it is the one attacker the capability check
+    /// deliberately does not refuse. What must happen instead is eviction.
+    const REVENANT: bool = false;
     /// Which node never asks to be admitted, if any.
     ///
     /// Distinct from [`Self::FORGE`]: a forging node attacks the control plane
@@ -258,6 +292,37 @@ impl Scenario for Outsider {
     const OUTSIDER: Option<u64> = Some(3);
 }
 
+/// A member that joins legitimately, then acts beyond the role it was granted.
+///
+/// The scenario for the finding that phase 5 closed: every role check ran on the
+/// node *issuing* an action, so a member holding the lowest role could add
+/// members, remove the admin, and promote itself, and every peer merged all
+/// three. Node 2 is the insider, and it attacks with the strongest proof it can
+/// actually produce — certificates it signs itself, which are genuinely signed by
+/// a genuine member and still admit nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Insider;
+impl Scenario for Insider {
+    const INSIDER: Option<u64> = Some(2);
+}
+
+/// An insider that keeps acting after it has been removed.
+///
+/// The one attacker the merge-time check deliberately lets through, because
+/// refusing it would mean consulting `current_members` — an order-sensitive
+/// predicate, so two peers seeing the removal and the operation in opposite
+/// orders would drop different operations and diverge permanently. The splice is
+/// accepted and then undone, so what this scenario asserts is *eviction* rather
+/// than rejection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Revenant;
+impl Scenario for Revenant {
+    const INSIDER: Option<u64> = Some(2);
+    const REVENANT: bool = true;
+    const REVOKE: Option<u64> = Some(2);
+    const WRITE_AFTER_REVOKE: bool = true;
+}
+
 /// Content driven entirely by generated CRUD operations.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Crud;
@@ -294,11 +359,35 @@ pub enum Msg {
     Welcome {
         /// The full CGKA operation log, in causal order.
         log: Vec<Signed<CgkaOperation>>,
+        /// The capability certificates for the workspace.
+        ///
+        /// Public, signed data like the log, and not optional: they authorise
+        /// every `Add` the log contains, so a joiner replaying it without them
+        /// would refuse the whole history including its own admission. The
+        /// counterpart of `Invite.certs`.
+        certs: Vec<Certificate>,
         /// The blinding secret for storage keys.
         secret: [u8; 32],
     },
-    /// Control plane: a signed CGKA operation.
-    Op(Box<Signed<CgkaOperation>>),
+    /// Control plane: a signed CGKA operation, with the certificates that
+    /// authorise it.
+    ///
+    /// The proof travels *with* the operation because the receiver checks the
+    /// issuer's capability before merging: one shipped without it is refused
+    /// rather than parked, and no later certificate brings it back. Modelling
+    /// them as separate messages would make the simulator strictly more fragile
+    /// than production, which is the mistake `Msg::Log` exists to avoid.
+    Op {
+        /// The operation.
+        op: Box<Signed<CgkaOperation>>,
+        /// Certificates authorising it.
+        proof: Vec<Certificate>,
+    },
+    /// Control plane: capability certificates with no operation behind them.
+    ///
+    /// A role change mints a grant and no CGKA operation, so it needs its own
+    /// carrier. The counterpart of `ControlMsg::Certs`.
+    Certs(Vec<Certificate>),
     /// Control plane repair: the sender's whole operation log.
     ///
     /// The counterpart of `ControlMsg::Log`, which the real `Workspace` ships
@@ -313,7 +402,17 @@ pub enum Msg {
     /// Modelling the data plane's repair but not the control plane's would have
     /// made the simulator strictly more fragile than production, and every
     /// resulting failure an artefact of the harness.
-    Log(Vec<Signed<CgkaOperation>>),
+    Log {
+        /// The operation log, in causal order.
+        ops: Vec<Signed<CgkaOperation>>,
+        /// The sender's whole certificate store.
+        ///
+        /// Not optional, for the same reason the log itself is not: the
+        /// certificates authorise every `Add` it contains, and they are the only
+        /// anti-entropy a role change gets. Shipping the log without them would
+        /// make log repair reinstate the very hole phase 5 closed.
+        certs: Vec<Certificate>,
+    },
     /// Control plane repair: "I can never decrypt what you are publishing."
     ///
     /// The counterpart of `ControlMsg::Repair`. A peer admitted after content
@@ -476,6 +575,8 @@ pub enum Tick {
     LateEdit,
     /// Time for an attacking node to emit a forged operation.
     Forge,
+    /// Time for a member to act beyond the role it was granted.
+    Overreach,
 }
 
 /// One simulated workspace participant.
@@ -493,6 +594,8 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     resyncs_done: u32,
     rotations_done: u32,
     forgeries_made: u32,
+    /// How many times this node has acted beyond its role.
+    overreaches_made: u32,
     /// This node's own id, recorded at start so properties can identify it.
     me: u64,
     /// Text this node has contributed locally, for convergence assertions.
@@ -632,6 +735,20 @@ fn node_of_endpoint(bytes: &[u8; 32]) -> Option<NodeId> {
     let mut id = [0u8; 8];
     id.copy_from_slice(&bytes[8..16]);
     Some(NodeId(u64::from_le_bytes(id)))
+}
+
+/// The CGKA identity node `id` will hold, as raw bytes.
+///
+/// Every node's key material is a pure function of its simulator id, which is
+/// what lets the founder name a revocation victim without a lookup. Exposed so a
+/// property can compute the set of legitimate identities **without depending on
+/// which nodes have finished joining** — a set derived from `has_joined()` shrinks
+/// during onboarding, and a property built on it reports a failure the moment the
+/// founder certifies a node that has not yet replayed its own `Welcome`.
+#[must_use]
+pub fn member_bytes_of(id: u64) -> [u8; 32] {
+    MemberId::from(MemorySigner::generate(&mut node_rng(NodeId(id), 0xA1)).verifying_key())
+        .to_bytes()
 }
 
 impl<S: Scenario> WorkspaceNode<S> {
@@ -785,6 +902,75 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.namespace
     }
 
+    /// The role this node believes `user` holds, per its capability closure.
+    ///
+    /// `None` means no valid chain grants that user anything — which is the
+    /// answer for a user whose certificates have not arrived *and* for one whose
+    /// only certificate was self-issued. The two are indistinguishable from
+    /// outside and should be: neither grants anything.
+    #[must_use]
+    pub fn role_of(&self, user: [u8; 32]) -> Option<Role> {
+        self.state
+            .as_ref()
+            .and_then(|state| state.capabilities().role_of(&user))
+    }
+
+    /// How many users this node believes hold an administrative role.
+    ///
+    /// The single number a self-promotion would move, which is what makes it the
+    /// right thing for a cross-cutting property to watch: it needs no knowledge of
+    /// who the attacker is.
+    #[must_use]
+    pub fn admin_count(&self) -> usize {
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.capabilities().admin_count())
+    }
+
+    /// How many devices this node believes hold a valid binding.
+    ///
+    /// Grows only when somebody authorised to bind a device did so — which
+    /// includes a member enrolling further devices of its *own* user, so this is
+    /// not by itself a measure of whether an attack landed. See
+    /// [`Self::certified_users`] for the question that is.
+    #[must_use]
+    pub fn certified_device_count(&self) -> usize {
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.capabilities().certified_devices().count())
+    }
+
+    /// Every user that some certified device resolves to, in ascending order.
+    ///
+    /// The right observable for "did an unauthorised binding land". A member may
+    /// legitimately enrol further devices of its own user, so the device *count*
+    /// grows under attack without anything being wrong; what must never happen is
+    /// a device resolving to a user nobody admitted, or to somebody else's.
+    #[must_use]
+    pub fn certified_users(&self) -> Vec<[u8; 32]> {
+        let Some(state) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<[u8; 32]> = state
+            .capabilities()
+            .certified_devices()
+            .filter_map(|device| state.capabilities().user_of(&device))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// This node's own member id, as raw bytes.
+    ///
+    /// Zero before the node has joined, which no property should be reading.
+    #[must_use]
+    pub fn member_bytes(&self) -> [u8; 32] {
+        self.state
+            .as_ref()
+            .map_or([0u8; 32], |state| state.member_id().to_bytes())
+    }
+
     /// Whether this node has moved off the founding namespace.
     ///
     /// A device removed before a rotation never receives the capability for it,
@@ -845,11 +1031,12 @@ impl<S: Scenario> WorkspaceNode<S> {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let Ok(log) = state.op_log() else {
+        let Ok(ops) = state.op_log() else {
             return;
         };
-        if !log.is_empty() {
-            cx.broadcast(Msg::Log(log));
+        let certs = state.capabilities().certificates();
+        if !ops.is_empty() {
+            cx.broadcast(Msg::Log { ops, certs });
         }
     }
 
@@ -858,10 +1045,19 @@ impl<S: Scenario> WorkspaceNode<S> {
     /// Counted as observed one operation at a time, exactly like [`Msg::Op`]:
     /// what a node saw on the control plane is the question the revocation
     /// properties ask, and a repair carrying ten operations is ten things seen.
-    fn on_log(&mut self, log: Vec<Signed<CgkaOperation>>, cx: &mut dyn Ctx<Self>) {
-        for op in log {
+    fn on_log(
+        &mut self,
+        ops: Vec<Signed<CgkaOperation>>,
+        certs: Vec<Certificate>,
+        cx: &mut dyn Ctx<Self>,
+    ) {
+        // Certificates strictly first: they authorise the `Add`s in the log, so
+        // replaying the operations against an empty closure would refuse the
+        // history this message exists to hand over.
+        self.drive(Event::CertsArrived(certs), cx, 5);
+        for op in ops {
             self.observed_ops += 1;
-            self.drive(Event::ControlOp(Arc::new(op)), cx, 4);
+            self.drive(Event::ControlOp(AuthorizedOp::bare(Arc::new(op))), cx, 4);
         }
         self.flush_deferred_ops(cx);
     }
@@ -917,8 +1113,9 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn admits(&self, from: NodeId, msg: &Msg) -> bool {
         match msg {
             Msg::Hello { .. } | Msg::Welcome { .. } => true,
-            Msg::Op(_)
-            | Msg::Log(_)
+            Msg::Op { .. }
+            | Msg::Log { .. }
+            | Msg::Certs(_)
             | Msg::Entry { .. }
             | Msg::Repair { .. }
             | Msg::Namespace { .. } => {
@@ -1064,9 +1261,19 @@ impl<S: Scenario> WorkspaceNode<S> {
         // more events into `drive` and the borrow of `state` is still live here.
         let mut pending_mint: Option<(u32, Vec<u8>)> = None;
         let mut pending_republish = false;
+        let mut pending_eviction: Option<MemberId> = None;
         for effect in effects {
             match effect {
-                Effect::BroadcastOp(op) => cx.broadcast(Msg::Op(op)),
+                Effect::BroadcastOp { op, proof } => cx.broadcast(Msg::Op { op, proof }),
+                Effect::BroadcastCerts(certs) => cx.broadcast(Msg::Certs(certs)),
+                // A removed member spliced a leaf back into the tree. Undoing it
+                // is a `Remove`, fed back as an ordinary event so the
+                // removal-before-rotation ordering is the same one a deliberate
+                // removal takes. Unlike production this is not rate-limited: the
+                // simulated attacker splices a bounded number of times, and a
+                // cooldown would need a clock the harness deliberately controls
+                // rather than the node.
+                Effect::EvictUncertified { member } => pending_eviction = Some(member),
                 Effect::StoreChunk { key, chunk, .. } | Effect::StoreManifest { key, chunk } => {
                     // Recorded locally as well as broadcast: a node sees its own
                     // writes in its own index, exactly as it would after writing
@@ -1123,6 +1330,11 @@ impl<S: Scenario> WorkspaceNode<S> {
         } else {
             // Still on the same namespace; nothing to re-announce.
         }
+        if let Some(member) = pending_eviction {
+            self.drive(Event::RemoveMember { member }, cx, salt ^ 0xE71C);
+        } else {
+            // No leaf was spliced in by a former member.
+        }
     }
 
     /// Broadcast a repair request, at most once per window per `(target, epoch)`.
@@ -1159,12 +1371,13 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn flush_inbox(&mut self, cx: &mut dyn Ctx<Self>) {
         for msg in std::mem::take(&mut self.inbox) {
             match msg {
-                Msg::Op(op) => {
+                Msg::Op { op, proof } => {
                     self.observed_ops += 1;
-                    self.drive(Event::ControlOp(Arc::new(*op)), cx, 0);
+                    self.drive(Event::ControlOp(AuthorizedOp::new(*op, proof)), cx, 0);
                     self.flush_deferred_ops(cx);
                 }
-                Msg::Log(log) => self.on_log(log, cx),
+                Msg::Certs(certs) => self.drive(Event::CertsArrived(certs), cx, 0),
+                Msg::Log { ops, certs } => self.on_log(ops, certs, cx),
                 Msg::Entry {
                     namespace,
                     key,
@@ -1200,7 +1413,72 @@ impl<S: Scenario> WorkspaceNode<S> {
             rogue_secret.share_key(),
         );
         if let Ok(signed) = rogue.try_sign_sync(op) {
-            cx.broadcast(Msg::Op(Box::new(signed)));
+            // No proof: the attacker holds no certificate, which is the point.
+            // It is refused by the membership check before the capability check
+            // is even reached.
+            cx.broadcast(Msg::Op {
+                op: Box::new(signed),
+                proof: Vec::new(),
+            });
+        }
+    }
+
+    /// Act beyond the role this node was granted.
+    ///
+    /// Three attacks in one, because they share a victim and a shape: splice a
+    /// keypair we control into the group, bind it to our own account, and grant
+    /// ourselves an administrative role. Every certificate here is *genuinely
+    /// signed by this node*, which is exactly what makes the scenario worth
+    /// having — nothing about the identity is forged, only the authority.
+    ///
+    /// Issued through the `CgkaController` directly rather than through
+    /// `Event::AddUser`, because the local `require_admin` would refuse it. That
+    /// refusal is the fail-fast courtesy, not the enforcement; an attacker simply
+    /// does not run it, and modelling the attack through the guarded path would
+    /// test the guard instead of the receiver.
+    fn overreach(&mut self, cx: &mut dyn Ctx<Self>) {
+        let me = cx.me();
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let my_user = state.member_id().to_bytes();
+        let salt = u64::from(self.overreaches_made);
+        let victim = MemorySigner::generate(&mut node_rng(me, 0x1_5DE0 ^ salt));
+        let victim_secret = ShareSecretKey::generate(&mut node_rng(me, 0x1_5DE1 ^ salt));
+        let victim_id = MemberId::from(victim.verifying_key());
+
+        // A binding we sign ourselves, claiming the new leaf for our own user.
+        // The most an insider can honestly claim, and deliberately the *strongest*
+        // form of the attack: a binding naming somebody else's user is refused by
+        // the closure outright, so this is the variant that gets furthest.
+        let nonce = |tag: u8| {
+            let mut bytes = [0u8; 16];
+            bytes[0] = tag;
+            bytes[1] = u8::try_from(salt & 0xFF).unwrap_or(0);
+            bytes
+        };
+        let cgka = state.controller_mut();
+        let mut proof = Vec::new();
+        if let Ok(cert) = cgka.certify_device(victim_id.to_bytes(), my_user, nonce(1)) {
+            proof.push(cert);
+        }
+        // And a grant promoting ourselves. `certify_role` picks the highest
+        // generation this node has seen, which is the most an attacker could
+        // compute anyway — so a refusal here cannot be mistaken for merely losing
+        // a `(seq, digest)` tie-break.
+        if let Ok(cert) = cgka.certify_role(my_user, Role::Admin, nonce(2)) {
+            proof.push(cert);
+        }
+
+        if let Ok(Some(op)) = cgka.add_member(victim_id, victim_secret.share_key()) {
+            cx.broadcast(Msg::Op {
+                op: Box::new(op),
+                proof,
+            });
+        } else {
+            // Nothing minted; the certificates still go out on their own, since
+            // the self-promotion does not depend on the splice landing.
+            cx.broadcast(Msg::Certs(proof));
         }
     }
 
@@ -1234,10 +1512,15 @@ impl<S: Scenario> WorkspaceNode<S> {
             return;
         };
         let Ok(log) = state.op_log() else { return };
+        // Taken after the admission above, so the bundle already contains the
+        // joiner's own binding and grant — which is what lets it arrive certified
+        // rather than needing a second exchange.
+        let certs = state.capabilities().certificates();
         cx.send(
             from,
             Msg::Welcome {
                 log,
+                certs,
                 secret: workspace_secret_bytes(),
             },
         );
@@ -1258,6 +1541,7 @@ impl<S: Scenario> WorkspaceNode<S> {
         &mut self,
         from: NodeId,
         log: &[Signed<CgkaOperation>],
+        certs: &[Certificate],
         secret: [u8; 32],
         cx: &mut dyn Ctx<Self>,
     ) {
@@ -1269,7 +1553,7 @@ impl<S: Scenario> WorkspaceNode<S> {
         };
         // A `Welcome` that lost a race against a later membership change may not
         // yet name us; that is an early arrival, not a failure.
-        let Ok(cgka) = CgkaController::join(tree_id(), signer, share_secret, log) else {
+        let Ok(cgka) = CgkaController::join(tree_id(), signer, share_secret, log, certs) else {
             return;
         };
         self.state = Some(WorkspaceState::joined(cgka, WorkspaceSecret::new(secret)));
@@ -1369,6 +1653,16 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         if me.0 == FOUNDER && S::WRITE_AFTER_REVOKE {
             cx.set_timer(Tick::LateEdit, WRITE_AFTER_REVOKE_AT);
         }
+        if S::INSIDER == Some(me.0) {
+            // Deliberately *after* the first edits, so the insider is a settled
+            // member of a working group before it misbehaves. An attack that ran
+            // during onboarding would be indistinguishable from a joiner whose
+            // certificates had not arrived, and the properties would not be able
+            // to say which they had caught.
+            cx.set_timer(Tick::Overreach, OVERREACH_INTERVAL * 3);
+        } else {
+            // Not the insider, or no insider in this scenario.
+        }
         if S::FORGE && me.0 != FOUNDER {
             cx.set_timer(Tick::Forge, FORGE_INTERVAL);
         }
@@ -1385,22 +1679,25 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         }
         match msg {
             Msg::Hello { member, share_key } => self.on_hello(from, member, share_key, cx),
-            Msg::Welcome { log, secret } => self.on_welcome(from, &log, secret, cx),
+            Msg::Welcome { log, certs, secret } => {
+                self.on_welcome(from, &log, &certs, secret, cx);
+            }
             other if self.state.is_none() => {
                 // Not joined yet: hold this rather than dropping it. A dropped
                 // control operation is unrecoverable — every later chunk becomes
                 // permanently undecryptable.
                 self.inbox.push(other);
             }
-            Msg::Op(op) => {
+            Msg::Op { op, proof } => {
                 // Counted before merging, and regardless of the outcome: this is
                 // what the node *saw* on the control plane, which is the
                 // question the revocation properties ask.
                 self.observed_ops += 1;
-                self.drive(Event::ControlOp(Arc::new(*op)), cx, 2);
+                self.drive(Event::ControlOp(AuthorizedOp::new(*op, proof)), cx, 2);
                 self.flush_deferred_ops(cx);
             }
-            Msg::Log(log) => self.on_log(log, cx),
+            Msg::Certs(certs) => self.drive(Event::CertsArrived(certs), cx, 2),
+            Msg::Log { ops, certs } => self.on_log(ops, certs, cx),
             Msg::Entry {
                 namespace,
                 key,
@@ -1509,6 +1806,24 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                 }
                 if self.rotations_done < MAX_ROTATIONS {
                     cx.set_timer(Tick::Rotate, ROTATE_INTERVAL);
+                }
+            }
+            Tick::Overreach => {
+                // A removed insider keeps going only in the revenant scenario.
+                // Elsewhere, an attacker that carried on after its own removal
+                // would fold two distinct questions — what a member may do, and
+                // what a *former* member may do — into one run, and a failure
+                // would not say which had been caught.
+                if self.is_revocation_target() && !S::REVENANT {
+                    return;
+                }
+                self.overreach(cx);
+                self.overreaches_made += 1;
+                if self.overreaches_made < MAX_OVERREACHES {
+                    cx.set_timer(Tick::Overreach, OVERREACH_INTERVAL);
+                } else {
+                    // Bounded, so the honest group's convergence is measured
+                    // rather than the attacker's persistence.
                 }
             }
             Tick::Revoke => {

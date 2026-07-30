@@ -33,6 +33,13 @@ postcard.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
+[features]
+# Exposes `WorkspaceState::controller_mut`, which bypasses every local role
+# check. It exists so `iroh-beekem-sim` can model a member that acts beyond its
+# role; driving such an attack through the guarded path would test the guard
+# rather than the receiver's enforcement. Never enable it in an application.
+adversarial-testing = []
+
 [dev-dependencies]
 rand_chacha = "0.3"
 

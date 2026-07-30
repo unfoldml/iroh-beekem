@@ -7,16 +7,13 @@
 
 use std::sync::Arc;
 
-use beekem::{
-    id::{MemberId, TreeId},
-    operation::CgkaOperation,
-};
+use beekem::id::{MemberId, TreeId};
 use iroh_beekem_core::{
-    CgkaController, DocumentUuid, Effect, EpochId, Event, RepairTarget, Role, WorkspaceSecret,
-    WorkspaceState,
+    AuthorizedOp, Certificate, CgkaController, DocumentUuid, Effect, EpochId, Event, RepairTarget,
+    Role, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
-    share_key::ShareSecretKey, signed::Signed, signer::memory::MemorySigner, verifiable::Verifiable,
+    share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -32,7 +29,15 @@ struct Bus {
     alice: WorkspaceState,
     bob: WorkspaceState,
     /// Control-plane messages alice has emitted but bob has not yet received.
-    to_bob: Vec<Signed<CgkaOperation>>,
+    to_bob: Vec<AuthorizedOp>,
+    /// Certificates alice has emitted with no operation behind them.
+    certs_to_bob: Vec<Certificate>,
+    /// Control-plane messages bob has emitted but alice has not yet received.
+    to_alice: Vec<AuthorizedOp>,
+    /// Certificates bob has emitted with no operation behind them.
+    certs_to_alice: Vec<Certificate>,
+    /// Encrypted manifest replicas bob has emitted but alice has not received.
+    manifests_to_alice: Vec<iroh_beekem_core::Chunk>,
     /// Data-plane chunks alice has emitted but bob has not yet received.
     chunks_to_bob: Vec<iroh_beekem_core::Chunk>,
     /// Encrypted manifest replicas alice has emitted but bob has not received.
@@ -60,43 +65,43 @@ fn two_node_workspace() -> Bus {
 
     let secret = WorkspaceSecret::generate(&mut rng(5));
 
-    let mut alice_cgka =
+    let alice_cgka =
         CgkaController::create(doc_id, alice_signer, &mut rng(10)).expect("alice founds workspace");
-
-    let bob_secret = ShareSecretKey::generate(&mut rng(20));
-    alice_cgka
-        .add_member(bob_id, bob_secret.share_key())
-        .expect("adding bob")
-        .expect("bob is new");
-
-    let log = alice_cgka.op_log().expect("exporting log");
-    let bob_cgka = CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
-
-    let alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
+    let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
         .expect("alice founds the workspace");
 
-    // `add_member` above admits bob at the CGKA level only. A real admission
-    // goes through `Event::AddUser`, which also writes the manifest records
-    // that give the new leaf an owner and therefore a role; mirror that here,
-    // or bob would hold a leaf belonging to nobody.
-    let bob_bytes = bob_id.to_bytes();
+    // Admission through the real event rather than by poking the CGKA and the
+    // manifest separately. That is not merely tidier: `Event::AddUser` mints the
+    // binding and the grant that make bob's leaf attributable and his writes
+    // acceptable, and a bus assembled without them would hand every test a
+    // member who cannot legitimately do anything.
+    let bob_secret = ShareSecretKey::generate(&mut rng(20));
     alice
-        .manifest()
-        .set_user(&bob_bytes, "bob")
-        .expect("recording bob's user");
-    alice
-        .manifest()
-        .set_device(&bob_bytes, &bob_bytes, "first device")
-        .expect("recording bob's device");
-    alice
-        .manifest()
-        .set_role(&bob_bytes, Role::Editor)
-        .expect("granting bob a writing role");
+        .handle(
+            Event::AddUser {
+                member: bob_id,
+                share_key: bob_secret.share_key(),
+                role: Role::Editor,
+                display_name: "bob".into(),
+                endpoint: None,
+            },
+            &mut rng(21),
+        )
+        .expect("alice admits bob");
+
+    let log = alice.op_log().expect("exporting log");
+    let certs = alice.capabilities().certificates();
+    let bob_cgka =
+        CgkaController::join(doc_id, bob_signer, bob_secret, &log, &certs).expect("bob joins");
 
     Bus {
         alice,
         bob: WorkspaceState::joined(bob_cgka, secret),
         to_bob: Vec::new(),
+        certs_to_bob: Vec::new(),
+        to_alice: Vec::new(),
+        certs_to_alice: Vec::new(),
+        manifests_to_alice: Vec::new(),
         chunks_to_bob: Vec::new(),
         manifests_to_bob: Vec::new(),
         bob_id,
@@ -112,6 +117,10 @@ impl Bus {
             alice,
             bob,
             to_bob: Vec::new(),
+            certs_to_bob: Vec::new(),
+            to_alice: Vec::new(),
+            certs_to_alice: Vec::new(),
+            manifests_to_alice: Vec::new(),
             chunks_to_bob: Vec::new(),
             manifests_to_bob: Vec::new(),
             bob_id,
@@ -163,7 +172,10 @@ impl Bus {
         let mut mint: Option<u32> = None;
         for effect in effects {
             match effect {
-                Effect::BroadcastOp(op) => self.to_bob.push(*op),
+                Effect::BroadcastOp { op, proof } => {
+                    self.to_bob.push(AuthorizedOp::new(*op, proof));
+                }
+                Effect::BroadcastCerts(certs) => self.certs_to_bob.extend(certs),
                 Effect::StoreChunk { chunk, .. } => self.chunks_to_bob.push(*chunk),
                 Effect::StoreManifest { chunk, .. } => self.manifests_to_bob.push(*chunk),
                 Effect::PublishNamespace { epoch, chunk } => {
@@ -183,6 +195,7 @@ impl Bus {
                 | Effect::RequestRepair { .. }
                 | Effect::Applied { .. }
                 | Effect::ManifestUpdated
+                | Effect::EvictUncertified { .. }
                 | Effect::DeleteEntry { .. } => {}
             }
         }
@@ -236,8 +249,15 @@ impl Bus {
 
     /// Deliver everything queued for bob, control plane first.
     fn deliver_all_to_bob(&mut self) {
+        // Certificates first: they authorise the operations behind them, and an
+        // operation judged against a closure that has not caught up is refused
+        // rather than parked.
+        let certs = std::mem::take(&mut self.certs_to_bob);
+        if !certs.is_empty() {
+            self.bob_receives(Event::CertsArrived(certs));
+        }
         for op in std::mem::take(&mut self.to_bob) {
-            self.bob_receives(Event::ControlOp(Arc::new(op)));
+            self.bob_receives(Event::ControlOp(op));
         }
         for chunk in std::mem::take(&mut self.manifests_to_bob) {
             self.bob_receives(Event::ManifestArrived {
@@ -250,6 +270,53 @@ impl Bus {
                 chunk: Box::new(chunk),
             });
         }
+    }
+
+    /// Route bob's effects onto the bus, for delivery back to alice.
+    ///
+    /// The bus is mostly one-directional because most tests have one writer.
+    /// This is the narrow reverse path: a viewer legitimately publishes its own
+    /// author and endpoint records, and alice has to receive them for any
+    /// `author_may_write` question to be answerable on her side.
+    fn queue_from_bob_to_alice(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::BroadcastOp { op, proof } => {
+                    self.to_alice.push(AuthorizedOp::new(*op, proof));
+                }
+                Effect::BroadcastCerts(certs) => self.certs_to_alice.extend(certs),
+                Effect::StoreManifest { chunk, .. } => self.manifests_to_alice.push(*chunk),
+                // Bob is a viewer in these tests, so nothing else he emits is
+                // meaningful to alice.
+                _ => {}
+            }
+        }
+    }
+
+    /// Deliver everything queued for alice, control plane first.
+    fn deliver_all_to_alice(&mut self) {
+        let certs = std::mem::take(&mut self.certs_to_alice);
+        if !certs.is_empty() {
+            self.alice_receives(Event::CertsArrived(certs));
+        }
+        for op in std::mem::take(&mut self.to_alice) {
+            self.alice_receives(Event::ControlOp(op));
+        }
+        for chunk in std::mem::take(&mut self.manifests_to_alice) {
+            self.alice_receives(Event::ManifestArrived {
+                chunk: Box::new(chunk),
+            });
+        }
+    }
+
+    /// Apply an event to alice, discarding what she emits.
+    ///
+    /// Unlike `bob_receives` this drops the effects: the tests using it are
+    /// asking what alice now *believes*, not what she says next.
+    fn alice_receives(&mut self, event: Event) {
+        self.alice
+            .handle(event, &mut rng(0))
+            .expect("alice should handle the event");
     }
 
     /// Deliver only the data plane, holding back the control plane.
@@ -319,6 +386,24 @@ fn edit_by_one_member_converges_on_the_other() {
 fn chunk_arriving_before_its_key_is_parked_then_applied() {
     let mut bus = two_node_workspace();
 
+    // Alice rotates and the operation is *withheld*, so the epoch her next
+    // publish uses is one bob provably cannot derive yet. Without this the test
+    // asserts nothing: a joiner replays the admission log, which already carries
+    // the implicit re-key the manifest publish performed, so it can decrypt the
+    // next ordinary edit immediately and there is no window to observe.
+    let rotation = bus.alice_emits(Event::Rotate, 29);
+    let withheld: Vec<_> = rotation
+        .into_iter()
+        .filter_map(|effect| match effect {
+            Effect::BroadcastOp { op, proof } => Some(AuthorizedOp::new(*op, proof)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !withheld.is_empty(),
+        "the rotation must produce an operation for this test to withhold one"
+    );
+
     bus.alice_does(
         Event::LocalEdit {
             doc: DOC,
@@ -342,7 +427,10 @@ fn chunk_arriving_before_its_key_is_parked_then_applied() {
         "the undecryptable chunk should be parked, not discarded"
     );
 
-    // Control plane catches up.
+    // Control plane catches up: the withheld rotation, then anything queued.
+    for op in withheld {
+        bus.bob_receives(Event::ControlOp(op));
+    }
     bus.deliver_all_to_bob();
 
     assert_eq!(
@@ -393,9 +481,12 @@ fn concurrent_edits_from_both_members_converge() {
     // Heal: bob's traffic to alice, then alice's to bob.
     for effect in bob_effects {
         match effect {
-            Effect::BroadcastOp(op) => {
+            Effect::BroadcastOp { op, .. } => {
                 bus.alice
-                    .handle(Event::ControlOp(Arc::new(*op)), &mut rng(0))
+                    .handle(
+                        Event::ControlOp(AuthorizedOp::bare(Arc::new(*op))),
+                        &mut rng(0),
+                    )
                     .expect("alice handles bob's op");
             }
             Effect::StoreChunk { chunk, .. } => {
@@ -408,13 +499,16 @@ fn concurrent_edits_from_both_members_converge() {
                     .handle(Event::ManifestArrived { chunk }, &mut rng(0))
                     .expect("alice handles bob's manifest");
             }
-            // Bob is not an admin in this test, so he never rotates.
+            // Bob is not an admin in this test, so he never rotates, never
+            // grants a role, and never evicts anybody.
             Effect::RotateNamespace { .. }
             | Effect::PublishNamespace { .. }
             | Effect::AdoptNamespace { .. }
             | Effect::RequestRepair { .. }
             | Effect::Applied { .. }
             | Effect::ManifestUpdated
+            | Effect::BroadcastCerts(_)
+            | Effect::EvictUncertified { .. }
             | Effect::DeleteEntry { .. } => {}
         }
     }
@@ -444,7 +538,14 @@ fn concurrent_edits_from_both_members_converge() {
 /// Roles were fully implemented in the manifest but had no caller: nothing
 /// consulted them before acting. These cover the enforcement points.
 mod roles_are_enforced {
-    use iroh_beekem_core::{CoreError, Event, FileEntry, Role};
+    use beekem::id::TreeId;
+    use iroh_beekem_core::{
+        Certificate, CgkaController, CoreError, Event, FileEntry, Role, WorkspaceSecret,
+        WorkspaceState,
+    };
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
 
     use super::{DOC, rng, two_node_workspace};
 
@@ -454,16 +555,29 @@ mod roles_are_enforced {
 
         assert_eq!(
             bus.alice
-                .manifest()
+                .capabilities()
                 .role_of(&bus.alice.member_id().to_bytes()),
             Some(Role::Admin),
             "founding a workspace must make you its first admin"
         );
+        // A joiner arrives *certified*: the invite carries the certificates the
+        // admin minted, so bob holds the role he was granted from the first
+        // moment rather than after a round trip. What `found`/`joined` still
+        // turns on is that the role is one somebody granted — bob is an editor
+        // because alice said so, and no joiner can make itself an admin.
         assert_eq!(
-            bus.bob.manifest().role_of(&bus.bob.member_id().to_bytes()),
-            None,
-            "a joiner's manifest starts empty and is filled by sync, not by \
-             self-assignment"
+            bus.bob
+                .capabilities()
+                .role_of(&bus.bob.member_id().to_bytes()),
+            Some(Role::Editor),
+            "a joiner should arrive holding exactly the role its admission granted"
+        );
+        assert!(
+            !bus.bob
+                .capabilities()
+                .ever_admin(&bus.bob.member_id().to_bytes()),
+            "a joiner granted a non-administrative role must not be able to admit \
+             certificates, or the founder/joiner distinction would be decorative"
         );
     }
 
@@ -512,7 +626,7 @@ mod roles_are_enforced {
         bus.deliver_all_to_bob();
 
         assert_eq!(
-            bus.bob.manifest().role_of(&bob_id.to_bytes()),
+            bus.bob.capabilities().role_of(&bob_id.to_bytes()),
             Some(Role::Editor),
             "bob should learn his own role once the manifest reaches him"
         );
@@ -550,47 +664,58 @@ mod roles_are_enforced {
         );
 
         assert_eq!(
-            bus.alice.manifest().admin_count(),
+            bus.alice.capabilities().admin_count(),
             1,
             "the refused operations must have left the admin in place"
         );
     }
 
+    /// Accepting an entry needs all three links, and since phase 5 the middle
+    /// one is a signed binding rather than a map entry: a member must have
+    /// claimed the author id, a certified binding must attribute that member's
+    /// leaf to a user, and a grant must give that user a role that can write.
+    ///
+    /// The third case is the one that is new. An author claimed by a member whose
+    /// leaf holds *no* binding used to be indistinguishable from one an admin had
+    /// bound, because the binding was a manifest write anybody could make; now the
+    /// claim is worthless on its own.
     #[test]
-    fn an_author_may_write_only_once_claimed_and_roled() {
+    fn an_author_may_write_only_once_claimed_and_certified() {
         let mut bus = two_node_workspace();
-        let bob_id = bus.bob.member_id();
         let bob_author = [0xB0_u8; 32];
 
-        // Claimed by bob, but no role assigned yet.
+        assert!(
+            !bus.alice.author_may_write(&bob_author),
+            "an author nobody has claimed must never be accepted"
+        );
+
+        // Bob is a certified editor, so his claim completes all three links.
         bus.bob
             .handle(Event::AnnounceAuthor { author: bob_author }, &mut rng(70))
             .expect("announcing your own author id needs no privilege");
+        let claim = bus
+            .bob
+            .handle(Event::ResyncManifest, &mut rng(71))
+            .expect("re-publishing the manifest needs no role");
+        bus.queue_from_bob_to_alice(claim);
+        bus.deliver_all_to_alice();
         assert!(
-            !bus.bob.manifest().author_may_write(&bob_author),
-            "self-attestation alone must not confer the right to write"
+            bus.alice.author_may_write(&bob_author),
+            "a claimed author whose member holds a certified writing role should be accepted"
         );
 
-        // Now an admin grants the role. Applied to bob's own replica directly,
-        // standing in for the sync that would carry it — which means writing
-        // the device record too, since a role is granted to a *user* and it is
-        // that record which says whose device this leaf is.
-        bus.bob
+        // An author claimed for a leaf nobody ever bound. The claim itself is a
+        // manifest write, so it converges like any other — and grants nothing.
+        let stranger_author = [0xCD_u8; 32];
+        let stranger = [0xEF_u8; 32];
+        bus.alice
             .manifest()
-            .set_device(&bob_id.to_bytes(), &bob_id.to_bytes(), "first device")
-            .expect("recording the device");
-        bus.bob
-            .manifest()
-            .set_role(&bob_id.to_bytes(), Role::Editor)
-            .expect("recording the role");
+            .set_author(&stranger, &stranger_author)
+            .expect("the authors map is self-attested and accepts any write");
         assert!(
-            bus.bob.manifest().author_may_write(&bob_author),
-            "a claimed author whose member holds a writing role should be accepted"
-        );
-
-        assert!(
-            !bus.bob.manifest().author_may_write(&[0xFF_u8; 32]),
-            "an author nobody has claimed must never be accepted"
+            !bus.alice.author_may_write(&stranger_author),
+            "an author claimed for a leaf with no certified binding was accepted, so the \
+             author map alone would confer the right to write"
         );
     }
 
@@ -604,17 +729,17 @@ mod roles_are_enforced {
         let mut bus = two_node_workspace();
         let bob_id = bus.bob.member_id();
 
-        // Record the demotion on bob's own replica, standing in for the sync
-        // that would carry it. Both records: the role names a user, and the
-        // device record is what ties bob's leaf to that user.
-        bus.bob
-            .manifest()
-            .set_device(&bob_id.to_bytes(), &bob_id.to_bytes(), "first device")
-            .expect("recording the device");
-        bus.bob
-            .manifest()
-            .set_role(&bob_id.to_bytes(), Role::Viewer)
-            .expect("recording the role");
+        // The demotion is issued by the admin and delivered, which is the only
+        // way bob can come to hold it: a role is a signed grant, so bob writing
+        // one for himself would not be admitted by his own closure either.
+        bus.alice_does(
+            Event::SetRole {
+                user: bob_id.to_bytes(),
+                role: Role::Viewer,
+            },
+            79,
+        );
+        bus.deliver_all_to_bob();
 
         let refusals = [
             (
@@ -671,31 +796,59 @@ mod roles_are_enforced {
     }
 
     /// The bootstrap case, and the reason `require_write` is permissive about
-    /// members it has never heard of. A joiner's manifest is empty until it
-    /// syncs, so a role-less member is indistinguishable from an unsynced one.
-    /// Refusing here would deadlock onboarding: no publish, so no author
-    /// announcement, so no peer ever accepts anything from this node.
+    /// members it has never heard of.
+    ///
+    /// An invite normally carries the certificates, so a joiner arrives certified
+    /// and this hatch is not on the ordinary path. It still has to exist: a node
+    /// that received its operations before its certificates — a log exchange that
+    /// raced, a certificate lost in transit — would otherwise be refused by its
+    /// own `require_write`, and refusing there deadlocks onboarding. It cannot
+    /// publish, so it cannot announce its author, so no peer ever accepts anything
+    /// from it, so nothing ever repairs the gap.
+    ///
+    /// Constructed by withholding bob's *grant* while keeping the bindings. That
+    /// is the reachable shape of the gap: the two are separate certificates, so
+    /// one can be lost on its own. Withholding the bindings instead would not
+    /// pose the question at all — replaying the log needs them, so the join
+    /// itself fails, which is `Invite.certs` doing its job rather than this hatch.
     #[test]
-    fn a_member_whose_role_has_not_synced_yet_may_still_write() {
-        let mut bus = two_node_workspace();
+    fn a_member_whose_grant_has_not_arrived_may_still_write() {
+        let bus = two_node_workspace();
+        let doc_id = TreeId::from(MemorySigner::generate(&mut rng(0)).verifying_key());
+        let bob_signer = MemorySigner::generate(&mut rng(2));
+        let bob_secret = ShareSecretKey::generate(&mut rng(20));
+        let log = bus.alice.op_log().expect("exporting the log");
+        let bindings: Vec<Certificate> = bus
+            .alice
+            .capabilities()
+            .certificates()
+            .into_iter()
+            .filter(|cert| matches!(cert, Certificate::Binding(_)))
+            .collect();
+
+        let cgka = CgkaController::join(doc_id, bob_signer, bob_secret, &log, &bindings)
+            .expect("the log replays: every `Add` is authorised by a binding");
+        let mut bob = WorkspaceState::joined(cgka, WorkspaceSecret::generate(&mut rng(5)));
 
         assert_eq!(
-            bus.bob.manifest().role_of(&bus.bob.member_id().to_bytes()),
+            bob.capabilities().role_of(&bob.member_id().to_bytes()),
             None,
-            "precondition: bob has synced no manifest and holds no role"
+            "precondition: this node holds no certificate, so it resolves to no role"
         );
 
-        let result = bus.bob.handle(
+        let result = bob.handle(
             Event::LocalEdit {
                 doc: DOC,
-                text: "written before my role arrived".into(),
+                text: "written before my certificates arrived".into(),
             },
             &mut rng(84),
         );
 
         assert!(
             result.is_ok(),
-            "a member whose role has not yet synced must not be refused, got {result:?}"
+            "a member whose grant has not yet arrived must not be refused, or \
+             onboarding deadlocks: it cannot publish, so it cannot announce its author, \
+             so no peer ever accepts anything from it; got {result:?}"
         );
     }
 }
@@ -885,8 +1038,9 @@ mod repair_reaches_a_member_admitted_late {
             .expect("alice is an admin and may admit bob");
 
         let log = alice.op_log().expect("exporting the operation log");
+        let certs = alice.capabilities().certificates();
         let bob_cgka =
-            CgkaController::join(doc_id, bob_signer, bob_secret, &log).expect("bob joins");
+            CgkaController::join(doc_id, bob_signer, bob_secret, &log, &certs).expect("bob joins");
 
         let mut bus = Bus::new(alice, WorkspaceState::joined(bob_cgka, secret), bob_id);
         bus.queue_for_bob(admission);
@@ -1188,12 +1342,12 @@ mod users_own_devices {
         let alice = bus.alice.member_id().to_bytes();
 
         assert_eq!(
-            bus.alice.manifest().role_of_member(&alice),
+            bus.alice.capabilities().role_of_member(&alice),
             Some(Role::Admin),
             "the founding device must resolve to the founding user's role"
         );
         assert_eq!(
-            bus.alice.manifest().user_of(&alice),
+            bus.alice.capabilities().user_of(&alice),
             Some(alice),
             "a founder's user id is their founding device's member id"
         );
@@ -1220,12 +1374,14 @@ mod users_own_devices {
         );
 
         assert_eq!(
-            bus.alice.manifest().role_of_member(&laptop_id.to_bytes()),
+            bus.alice
+                .capabilities()
+                .role_of_member(&laptop_id.to_bytes()),
             Some(Role::Admin),
             "a new device must inherit its user's role rather than needing its own grant"
         );
         assert_eq!(
-            bus.alice.manifest().devices_of(&alice_user).len(),
+            bus.alice.devices_of(&alice_user).len(),
             2,
             "alice should now own two devices"
         );
@@ -1247,17 +1403,9 @@ mod users_own_devices {
         let rogue_id = beekem::id::MemberId::from(rogue.verifying_key());
         let rogue_secret = ShareSecretKey::generate(&mut rng(311));
 
-        // Give bob his records locally so he is a fully-formed editor.
-        let bob = bus.bob.member_id().to_bytes();
-        bus.bob
-            .manifest()
-            .set_device(&bob, &bob, "first device")
-            .expect("recording bob's device");
-        bus.bob
-            .manifest()
-            .set_role(&bob, Role::Editor)
-            .expect("granting bob a role");
-
+        // Bob arrives from `two_node_workspace` as a certified editor, so no
+        // local setup is needed — and none would be possible: a role is a signed
+        // grant, and one bob wrote for himself would not be admitted.
         let result = bus.bob.handle(
             Event::AddDevice {
                 member: rogue_id,
@@ -1305,7 +1453,7 @@ mod users_own_devices {
             "removing one device of a multi-device admin must be allowed, got {removed:?}"
         );
         assert_eq!(
-            bus.alice.manifest().role_of(&alice_user),
+            bus.alice.capabilities().role_of(&alice_user),
             Some(Role::Admin),
             "the user keeps their role when one of their devices is removed"
         );
@@ -1636,7 +1784,7 @@ mod the_roster_derives_from_membership {
         let stranger_endpoint = [0x5Eu8; 32];
         bus.alice
             .manifest()
-            .set_device(&stranger, &stranger, "uninvited")
+            .set_device(&stranger, "uninvited")
             .expect("writing the stranger's device record");
         bus.alice
             .manifest()
@@ -1717,7 +1865,7 @@ mod removal_rotates_the_namespace {
 
         let removal = effects
             .iter()
-            .position(|e| matches!(e, Effect::BroadcastOp(_)))
+            .position(|e| matches!(e, Effect::BroadcastOp { .. }))
             .expect("removing a member must broadcast the operation that does it");
         let rotation = effects
             .iter()
@@ -1876,6 +2024,518 @@ mod removal_rotates_the_namespace {
             alice_side, winner,
             "the tie-break did not select the larger generation, so the winner depends on \
              delivery order rather than on the values"
+        );
+    }
+}
+
+/// What a *member* can do to other members, as distinct from what an outsider
+/// can do to the group.
+///
+/// Every adversarial test above this one puts the attacker outside the group: a
+/// forged signature fails `try_verify`, and an unrelated keypair fails
+/// `known_members`. Neither says anything about a node that joined legitimately
+/// and then acts beyond its role, and until phase 5 there was nothing to say —
+/// `merge_verified` checked a signature and `known_members` and stopped, and
+/// `on_manifest_arrived` merged whatever decrypted.
+///
+/// These were written against the code *before* the capability closure existed
+/// and were confirmed to fail. Each attack uses the strongest proof the attacker
+/// could actually forge, which for a member means self-signed certificates —
+/// genuinely signed, by a genuine member, and still admitting nothing.
+mod authorization_is_verified_by_the_receiver {
+    use beekem::id::{MemberId, TreeId};
+    use iroh_beekem_core::{
+        AuthorizedOp, CapabilityStore, Certificate, CgkaController, CoreError, DeviceBinding,
+        Effect, Event, Grant, Role, WorkspaceSecret, WorkspaceState,
+    };
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
+
+    use super::rng;
+
+    /// A founder, and one legitimately admitted member at a role of our choosing.
+    ///
+    /// Bob's signer is handed back alongside his controller, because an insider
+    /// forges certificates as well as operations and both need his key.
+    struct Insider {
+        alice: WorkspaceState,
+        bob: CgkaController,
+        bob_signer: MemorySigner,
+        bob_id: MemberId,
+        alice_id: MemberId,
+    }
+
+    fn insider_workspace(role: Role) -> Insider {
+        let tree_id = TreeId::from(MemorySigner::generate(&mut rng(100)).verifying_key());
+        let alice_signer = MemorySigner::generate(&mut rng(101));
+        let bob_signer = MemorySigner::generate(&mut rng(102));
+        let bob_id = MemberId::from(bob_signer.verifying_key());
+        let bob_secret = ShareSecretKey::generate(&mut rng(103));
+        let secret = WorkspaceSecret::generate(&mut rng(104));
+
+        let alice_cgka = CgkaController::create(tree_id, alice_signer, &mut rng(105))
+            .expect("alice founds the workspace");
+        let alice_id = alice_cgka.member_id();
+        let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
+            .expect("alice records herself as the first admin");
+
+        // Admission through the real event, so bob arrives with exactly the
+        // certificates a genuine `add_user` would have minted for him.
+        alice
+            .handle(
+                Event::AddUser {
+                    member: bob_id,
+                    share_key: bob_secret.share_key(),
+                    role,
+                    display_name: "bob".into(),
+                    endpoint: None,
+                },
+                &mut rng(106),
+            )
+            .expect("alice is an admin and may admit bob");
+
+        let log = alice.op_log().expect("exporting the operation log");
+        let certs = alice.capabilities().certificates();
+        let bob = CgkaController::join(tree_id, bob_signer.clone(), bob_secret, &log, &certs)
+            .expect("bob joins from the log");
+
+        Insider {
+            alice,
+            bob,
+            bob_signer,
+            bob_id,
+            alice_id,
+        }
+    }
+
+    /// A fresh keypair that no `Add` in the workspace has ever named.
+    fn stranger(seed: u64) -> (MemberId, ShareSecretKey) {
+        let signer = MemorySigner::generate(&mut rng(seed));
+        (
+            MemberId::from(signer.verifying_key()),
+            ShareSecretKey::generate(&mut rng(seed + 1)),
+        )
+    }
+
+    /// A binding the attacker signs themselves, claiming `device` acts for `user`.
+    fn forged_binding(
+        signer: &MemorySigner,
+        device: [u8; 32],
+        user: [u8; 32],
+        nonce: u8,
+    ) -> Certificate {
+        DeviceBinding {
+            device,
+            user,
+            nonce: [nonce; 16],
+        }
+        .sign(signer)
+        .expect("signing is infallible with a memory signer")
+    }
+
+    /// Given a workspace where bob holds no administrative capability, when bob
+    /// issues an `Add` introducing a new *user*, accompanied by a binding he
+    /// signed himself, we expect alice to refuse the operation and never admit
+    /// the added identity.
+    ///
+    /// Confirmed to fail before the capability closure existed: alice merged it
+    /// and mallory entered `known_members`, after which every operation mallory
+    /// signed was admissible too.
+    #[test]
+    fn an_add_introducing_a_new_user_is_refused_without_admin_capability() {
+        let mut ins = insider_workspace(Role::Viewer);
+        let (mallory, mallory_secret) = stranger(210);
+
+        let proof = vec![forged_binding(
+            &ins.bob_signer,
+            mallory.to_bytes(),
+            mallory.to_bytes(),
+            1,
+        )];
+        let op = ins
+            .bob
+            .add_member(mallory, mallory_secret.share_key())
+            .expect("bob's own controller mints the operation without consulting his role")
+            .expect("mallory is new to the tree");
+
+        let outcome = ins.alice.handle(
+            Event::ControlOp(AuthorizedOp::new(op, proof)),
+            &mut rng(211),
+        );
+
+        assert!(
+            matches!(outcome, Err(CoreError::Uncertified { .. })),
+            "alice accepted a membership change from a member with no administrative \
+             capability, got {outcome:?}"
+        );
+        assert!(
+            !ins.alice
+                .capabilities()
+                .is_certified_device(&mallory.to_bytes()),
+            "a device bound by a member who may not administer became certified, so it \
+             would appear on rosters and its entries would be accepted"
+        );
+    }
+
+    /// Given a workspace where bob holds no administrative capability, when bob
+    /// binds a device he controls to *alice's* user, we expect alice to refuse
+    /// both the binding and the `Add` that carries it.
+    ///
+    /// This is the escalation that matters most: a device bound to an admin's
+    /// user inherits that admin's role. Before phase 5 the binding was a plain
+    /// CRDT map entry, so it needed no authority at all.
+    #[test]
+    fn an_add_binding_a_device_to_another_users_account_is_refused() {
+        let mut ins = insider_workspace(Role::Viewer);
+        let alice_user = ins.alice_id.to_bytes();
+        let (mallory, mallory_secret) = stranger(220);
+
+        let proof = vec![forged_binding(
+            &ins.bob_signer,
+            mallory.to_bytes(),
+            alice_user,
+            2,
+        )];
+        let op = ins
+            .bob
+            .add_member(mallory, mallory_secret.share_key())
+            .expect("bob mints the operation")
+            .expect("mallory is new to the tree");
+
+        let outcome = ins.alice.handle(
+            Event::ControlOp(AuthorizedOp::new(op, proof)),
+            &mut rng(221),
+        );
+
+        assert!(
+            matches!(outcome, Err(CoreError::Uncertified { .. })),
+            "alice accepted a device bound to her own user by somebody else, got {outcome:?}"
+        );
+        assert_eq!(
+            ins.alice.capabilities().role_of_member(&mallory.to_bytes()),
+            None,
+            "a device bound to the admin's user by a viewer inherited the admin's role, so \
+             any member could acquire any other member's permissions"
+        );
+    }
+
+    /// Given a member holding the lowest role, when that member signs a grant
+    /// promoting itself and broadcasts it, we expect alice's view of that
+    /// member's role to be unchanged.
+    ///
+    /// Confirmed to fail before phase 5 in its manifest form: bob wrote
+    /// `roles[bob] = Admin` into his replica, published, and `role_of_member` on
+    /// alice returned `Admin`. There is no such write any more, so the attack
+    /// takes its strongest remaining form — a genuinely signed certificate.
+    #[test]
+    fn a_viewer_cannot_promote_itself_with_a_self_signed_grant() {
+        let mut ins = insider_workspace(Role::Viewer);
+        let bob_user = ins.bob_id.to_bytes();
+
+        let promotion = Grant {
+            subject: bob_user,
+            capability: Role::Admin,
+            // Far beyond anything an admin has issued, so the attack cannot be
+            // dismissed as merely losing the `(seq, digest)` tie-break.
+            seq: u64::MAX,
+            not_after: None,
+            nonce: [3u8; 16],
+        }
+        .sign(&ins.bob_signer)
+        .expect("signing is infallible with a memory signer");
+
+        ins.alice
+            .handle(Event::CertsArrived(vec![promotion]), &mut rng(230))
+            .expect("a validly signed certificate is absorbed even when it grants nothing");
+
+        assert_eq!(
+            ins.alice.capabilities().role_of(&bob_user),
+            Some(Role::Viewer),
+            "a viewer promoted itself to admin on the admin's own node, so every role check \
+             in the system would be evaluated against state the attacker controls"
+        );
+        assert!(
+            !ins.alice.capabilities().ever_admin(&bob_user),
+            "a self-issued admin grant made its subject permanently able to admit further \
+             certificates, which would make the escalation irreversible"
+        );
+    }
+
+    /// Given a legitimate admission bundle, when its certificates are lifted and
+    /// reattached to an `Add` for a different leaf, we expect the receiver to
+    /// refuse it.
+    ///
+    /// The capability check has to be bound to *this* operation's `added_id`.
+    /// Checking only that the issuer may administer would let any member replay a
+    /// bundle it saw on the wire under an `Add` of its own keypair.
+    #[test]
+    fn a_proof_bundle_cannot_be_replayed_under_a_different_add() {
+        // Alice admits carol legitimately, and the bundle goes on the wire.
+        let mut ins = insider_workspace(Role::Admin);
+        let (carol, carol_secret) = stranger(240);
+        let effects = ins
+            .alice
+            .handle(
+                Event::AddUser {
+                    member: carol,
+                    share_key: carol_secret.share_key(),
+                    role: Role::Editor,
+                    display_name: "carol".into(),
+                    endpoint: None,
+                },
+                &mut rng(241),
+            )
+            .expect("alice admits carol");
+        let stolen: Vec<Certificate> = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::BroadcastOp { proof, .. } => Some(proof),
+                _ => None,
+            })
+            .expect("the admission must broadcast an operation with its proof");
+        assert!(
+            !stolen.is_empty(),
+            "the bundle must be non-empty for this test to pose its question"
+        );
+
+        // Bob reattaches alice's certificates to an `Add` of his own keypair.
+        let (mallory, mallory_secret) = stranger(242);
+        let op = ins
+            .bob
+            .add_member(mallory, mallory_secret.share_key())
+            .expect("bob mints the operation")
+            .expect("mallory is new to the tree");
+        let mut fresh = insider_workspace(Role::Admin);
+        let outcome = fresh.alice.handle(
+            Event::ControlOp(AuthorizedOp::new(op, stolen)),
+            &mut rng(243),
+        );
+
+        assert!(
+            outcome.is_err(),
+            "a proof bundle authorising one leaf also authorised a different one, so any \
+             member could splice a keypair in by replaying certificates off the wire, \
+             got {outcome:?}"
+        );
+        assert!(
+            !fresh
+                .alice
+                .capabilities()
+                .is_certified_device(&mallory.to_bytes()),
+            "the replayed bundle certified a leaf it did not name"
+        );
+    }
+
+    /// Given a member enrolling a further device of *their own* user, when the
+    /// binding they sign names that same user, we expect it to be accepted and
+    /// the new device to inherit their role — no more.
+    ///
+    /// The counterpart to the refusals above, and the reason they are phrased in
+    /// terms of *which user* rather than "non-admins may not add". Enrolling your
+    /// own phone is not an act of administration, and a check that refused it
+    /// would make multi-device support an admin-only operation. What must not
+    /// happen is escalation, so the inherited role is asserted too.
+    #[test]
+    fn a_member_may_enrol_a_further_device_of_its_own_user_but_gains_nothing() {
+        let mut ins = insider_workspace(Role::Viewer);
+        let bob_user = ins.bob_id.to_bytes();
+        let (phone, phone_secret) = stranger(250);
+
+        let proof = vec![forged_binding(
+            &ins.bob_signer,
+            phone.to_bytes(),
+            bob_user,
+            4,
+        )];
+        let op = ins
+            .bob
+            .add_member(phone, phone_secret.share_key())
+            .expect("bob mints the operation")
+            .expect("the phone is new to the tree");
+
+        ins.alice
+            .handle(
+                Event::ControlOp(AuthorizedOp::new(op, proof)),
+                &mut rng(251),
+            )
+            .expect("a member may enrol a further device of its own user");
+
+        assert_eq!(
+            ins.alice.capabilities().user_of(&phone.to_bytes()),
+            Some(bob_user),
+            "a member's own second device was refused, which would make enrolling a phone \
+             an administrative operation"
+        );
+        assert_eq!(
+            ins.alice.capabilities().role_of_member(&phone.to_bytes()),
+            Some(Role::Viewer),
+            "the enrolled device holds a role its user was never granted, so self-enrolment \
+             would be an escalation path"
+        );
+    }
+
+    /// Given an admin who has been removed, when that removed admin splices a
+    /// leaf it controls back into the tree, we expect the receiving admin to ask
+    /// for that leaf's removal.
+    ///
+    /// The revenant, and the one case the capability check deliberately does not
+    /// refuse. A removed member keeps its capability — the certificate store is
+    /// grow-only, so `ever_admin` never retracts — and its signature stays
+    /// admissible because `known_members` is monotone. Refusing on
+    /// `current_members` instead would make admissibility order-dependent, so two
+    /// peers seeing the removal and the `Add` in opposite orders would drop
+    /// different operations and diverge permanently.
+    ///
+    /// So the splice is accepted and then *undone*. This asserts the undoing is
+    /// requested; the propsim `Revenant` scenario asserts it actually lands.
+    #[test]
+    fn a_removed_admins_splice_is_answered_with_an_eviction() {
+        let mut ins = insider_workspace(Role::Admin);
+        let bob_id = ins.bob_id;
+        ins.alice
+            .handle(Event::RemoveMember { member: bob_id }, &mut rng(260))
+            .expect("alice removes bob");
+
+        // Bob's controller never saw the removal, so what it mints names
+        // pre-removal predecessors as a matter of course.
+        let (mallory, mallory_secret) = stranger(261);
+        let proof = vec![forged_binding(
+            &ins.bob_signer,
+            mallory.to_bytes(),
+            mallory.to_bytes(),
+            5,
+        )];
+        let op = ins
+            .bob
+            .add_member(mallory, mallory_secret.share_key())
+            .expect("the removed controller still mints operations")
+            .expect("mallory is new to the tree");
+
+        let effects = ins
+            .alice
+            .handle(
+                Event::ControlOp(AuthorizedOp::new(op, proof)),
+                &mut rng(262),
+            )
+            .expect("the splice is accepted rather than refused, by design");
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EvictUncertified { member } if *member == mallory
+            )),
+            "a leaf spliced in by a removed member drew no eviction, so it would stay in \
+             the tree and receive key material from the next honest re-key; got {effects:?}"
+        );
+    }
+
+    /// Given a removed member, when it splices a leaf back in, we expect that
+    /// leaf to hold no capability the remover did not already hold.
+    ///
+    /// The `always` half of the revenant story. Eviction is eventual, so the
+    /// window is real; what must hold throughout it is that the splice buys no
+    /// *escalation* — the closure is rooted, so a revenant can pass on only what
+    /// it had.
+    #[test]
+    fn a_removed_members_splice_confers_no_capability_it_lacked() {
+        let mut ins = insider_workspace(Role::Viewer);
+        let bob_id = ins.bob_id;
+        ins.alice
+            .handle(Event::RemoveMember { member: bob_id }, &mut rng(270))
+            .expect("alice removes bob");
+
+        let (mallory, mallory_secret) = stranger(271);
+        // The most that a removed viewer can claim: a device of its own user,
+        // which is the one binding its own capability admits.
+        let proof = vec![forged_binding(
+            &ins.bob_signer,
+            mallory.to_bytes(),
+            bob_id.to_bytes(),
+            6,
+        )];
+        let op = ins
+            .bob
+            .add_member(mallory, mallory_secret.share_key())
+            .expect("bob mints the operation")
+            .expect("mallory is new to the tree");
+        let _ = ins.alice.handle(
+            Event::ControlOp(AuthorizedOp::new(op, proof)),
+            &mut rng(272),
+        );
+
+        assert_ne!(
+            ins.alice.capabilities().role_of_member(&mallory.to_bytes()),
+            Some(Role::Admin),
+            "a removed viewer's splice acquired an administrative role, so removal would be \
+             recoverable by the party it was aimed at"
+        );
+        assert!(
+            !ins.alice.capabilities().ever_admin(&mallory.to_bytes()),
+            "the spliced leaf became able to admit further certificates"
+        );
+        assert!(
+            ins.alice.roster().is_empty(),
+            "the spliced leaf reached the roster; it has announced no endpoint and should \
+             reach nobody's, got {:?}",
+            ins.alice.roster()
+        );
+    }
+
+    /// Given two nodes that receive the same certificates in opposite orders, we
+    /// expect them to agree on every role and every binding.
+    ///
+    /// The convergence obligation the whole design rests on, stated as a test
+    /// rather than only as a comment. A capability check that diverged peers would
+    /// be worse than no check at all, and this is the shape that failure takes:
+    /// the same set of certificates, two delivery orders.
+    #[test]
+    fn the_closure_is_the_same_whatever_order_certificates_arrive_in() {
+        let mut ins = insider_workspace(Role::Admin);
+        let (carol, carol_secret) = stranger(280);
+        let effects = ins
+            .alice
+            .handle(
+                Event::AddUser {
+                    member: carol,
+                    share_key: carol_secret.share_key(),
+                    role: Role::Editor,
+                    display_name: "carol".into(),
+                    endpoint: None,
+                },
+                &mut rng(281),
+            )
+            .expect("alice admits carol");
+        let mut certs: Vec<Certificate> = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::BroadcastOp { proof, .. } => Some(proof),
+                _ => None,
+            })
+            .expect("the admission broadcasts a proof");
+        certs.extend(ins.alice.capabilities().certificates());
+        assert!(
+            certs.len() > 2,
+            "the set must have several certificates for the order to matter"
+        );
+
+        let founder = ins.alice_id.to_bytes();
+        let mut forwards = CapabilityStore::new(founder);
+        forwards.extend(certs.iter().cloned());
+        let mut backwards = CapabilityStore::new(founder);
+        backwards.extend(certs.iter().rev().cloned());
+
+        assert_eq!(
+            forwards.roles(),
+            backwards.roles(),
+            "two nodes that received the same certificates in opposite orders disagreed \
+             about roles, so a receiver-side capability check would drop different \
+             operations on different peers and diverge the group permanently"
+        );
+        assert_eq!(
+            forwards.certified_devices().collect::<Vec<_>>(),
+            backwards.certified_devices().collect::<Vec<_>>(),
+            "the same certificates in opposite orders certified different devices"
         );
     }
 }

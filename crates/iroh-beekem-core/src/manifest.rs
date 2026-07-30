@@ -1,4 +1,4 @@
-//! The encrypted workspace manifest: directory index plus role assignments.
+//! The encrypted workspace manifest: the directory index and display data.
 //!
 //! Two things live here that deliberately do *not* live in `iroh-docs`:
 //!
@@ -6,15 +6,36 @@
 //!   [`crate::blinding`]). The mapping from those keys back to
 //!   `/finance/q3.json` exists only inside this manifest, which is itself
 //!   encrypted like any other content.
-//! * **Roles.** This is the *permissions* layer, kept separate from the
-//!   *cryptographic* layer. The CGKA tree decides who can decrypt; the manifest
-//!   decides who is authorised to act. That separation is what makes multiple
-//!   admins and admin hand-off tractable: demoting an admin who remains in the
-//!   workspace is a manifest edit with no key rotation at all, whereas removing
-//!   them entirely is a manifest edit *plus* a CGKA removal.
+//! * **Display data.** Human-readable names and labels for users, devices and
+//!   documents, plus the self-attested author and endpoint claims.
 //!
 //! The manifest is a Loro document, so two peers who edit it concurrently while
 //! partitioned converge without a coordinator.
+//!
+//! # What deliberately does *not* live here any more
+//!
+//! Roles and the device-to-user binding used to. They moved to
+//! [`crate::capability`], and the reason is the whole of phase 5.
+//!
+//! `Manifest::import` is an unconditional CRDT merge — that is what a CRDT *is*
+//! — so anything recorded here is writable by any member and converges on every
+//! replica. While roles lived here, a member holding the lowest role could write
+//! `roles[me] = Admin`, or bind a device of theirs to an admin's user, and every
+//! peer accepted it. There was no filter to add: Loro merges an update atomically,
+//! so "import only the records that are authorised" has nowhere to hook.
+//!
+//! The split is therefore not by *topic* but by **what a lie costs**:
+//!
+//! | Here | In [`crate::capability`] |
+//! |---|---|
+//! | Claims that grant nothing: a display name, a label, a mime type, a path | Claims that grant something: who may administer, who may write, which user a leaf acts for |
+//!
+//! The author and endpoint claims stay here and stay self-attested, because they
+//! genuinely grant nothing on their own. An author id is worthless until the
+//! *capability closure* separately says that member may write, and an endpoint id
+//! is worthless until the closure separately says that device is certified. Both
+//! are joins against authority held elsewhere, which is what makes them safe to
+//! let anyone write.
 //!
 //! # Users and devices
 //!
@@ -22,12 +43,13 @@
 //! laptop and phone is not merely untidy, it is unsound: rotating a leaf
 //! replaces the local secret, so two devices rotating the same leaf concurrently
 //! issue conflicting updates for it. Each device therefore holds its own leaf,
-//! and [`Manifest::set_device`] records which user it belongs to.
+//! and a signed [`DeviceBinding`](crate::capability::DeviceBinding) records which
+//! user it belongs to.
 //!
 //! **Roles attach to users, not devices** — a laptop that is an admin while its
 //! owner's phone is a viewer is a distinction nobody wants to reason about. Use
-//! [`Manifest::role_of_member`] to resolve a device to its owner's role;
-//! [`Manifest::role_of`] takes a *user* id.
+//! [`CapabilityStore::role_of_member`](crate::capability::CapabilityStore::role_of_member)
+//! to resolve a device to its owner's role.
 //!
 //! A user id is the member id of that user's founding device. It needs no new
 //! key material and is stable for the user's lifetime, even after the founding
@@ -35,51 +57,32 @@
 //!
 //! # Trust boundary
 //!
-//! Roles are advisory against a *cryptographically* capable member: anyone
-//! holding a leaf can decrypt, whatever the manifest says. Roles constrain what
-//! a well-behaved peer will accept, not what a malicious one can read. Genuine
-//! read revocation is a CGKA removal; see
+//! Roles remain advisory against a *cryptographically* capable member: anyone
+//! holding a leaf can decrypt, whatever any certificate says. That is forward
+//! secrecy working as designed, and it is a different statement from the one
+//! phase 5 fixed — roles now constrain what a malicious member can **do**, and
+//! never constrained what one can **read**. Genuine read revocation is a CGKA
+//! removal; see
 //! [`CgkaController::remove_member`](crate::keys::CgkaController::remove_member).
-//!
-//! The same boundary applies to the device-to-user binding, and it is worth
-//! stating explicitly because the consequence is sharper. The manifest is a
-//! CRDT that merges unconditionally, so a *malicious* member can write a record
-//! claiming their device belongs to an admin's user and every replica will
-//! merge it. What stops that being a privilege escalation is not this module —
-//! it is that the check runs before a well-behaved node acts, and that reading
-//! anything at all still requires a leaf the CGKA granted.
-//!
-//! Closing it properly means making the binding self-certifying: a signature by
-//! an existing device of that user, chained to the founder, who *is*
-//! cryptographically identified by the CGKA's init-add operation. That is a
-//! genuine trust root and the natural next step, but it is a certificate scheme
-//! rather than a map lookup, and it is not what this module does today.
 
 use std::fmt::Write as _;
 
 use loro::{ExportMode, LoroDoc, LoroMap};
-use serde::{Deserialize, Serialize};
 
 use crate::{blinding::DocumentUuid, error::CoreError};
 
 /// Root container holding document metadata, keyed by hex document UUID.
 const FILES_CONTAINER: &str = "files";
-/// Root container holding role assignments, keyed by hex **user** id.
-///
-/// Keyed by user rather than by device so that a person's laptop and phone
-/// cannot hold different permissions; see [`Manifest::role_of_member`].
-const ROLES_CONTAINER: &str = "roles";
 
 /// Root container holding user records, keyed by hex user id.
 const USERS_CONTAINER: &str = "users";
 
-/// Root container holding device records, keyed by hex member id.
+/// Root container holding device *display* records, keyed by hex member id.
 ///
-/// This is the mapping that makes a CGKA leaf attributable to a person. It is
-/// written by whoever admits the device — an admin for a new user's first
-/// device, an existing device of the same user for subsequent ones — and never
-/// by the device itself, since a self-attested claim of "I belong to Alice"
-/// would inherit Alice's role.
+/// Label and endpoint id only. The device-to-user binding that used to live here
+/// is now a signed [`DeviceBinding`](crate::capability::DeviceBinding), because a
+/// binding recorded in a CRDT is a binding any member can forge — see the module
+/// documentation.
 const DEVICES_CONTAINER: &str = "devices";
 
 /// Root container holding workspace-level metadata: name and description.
@@ -99,48 +102,6 @@ const META_CONTAINER: &str = "meta";
 /// unless an *admin* separately assigned that member a writing role.
 const AUTHORS_CONTAINER: &str = "authors";
 
-/// What a member is authorised to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    /// May change roles and add or remove members.
-    Admin,
-    /// May read and write documents.
-    Editor,
-    /// May read documents only.
-    Viewer,
-}
-
-impl Role {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Admin => "admin",
-            Self::Editor => "editor",
-            Self::Viewer => "viewer",
-        }
-    }
-
-    fn from_str(raw: &str) -> Option<Self> {
-        match raw {
-            "admin" => Some(Self::Admin),
-            "editor" => Some(Self::Editor),
-            "viewer" => Some(Self::Viewer),
-            _ => None,
-        }
-    }
-
-    /// Whether this role may write document content.
-    #[must_use]
-    pub fn can_write(self) -> bool {
-        matches!(self, Self::Admin | Self::Editor)
-    }
-
-    /// Whether this role may change roles or membership.
-    #[must_use]
-    pub fn can_administer(self) -> bool {
-        matches!(self, Self::Admin)
-    }
-}
-
 /// One person in the workspace.
 ///
 /// The `id` is the member id of this user's founding device; see the module
@@ -153,18 +114,40 @@ pub struct UserRecord {
     pub display_name: String,
 }
 
+/// What the manifest records about one device: display data, nothing more.
+///
+/// Separate from [`DeviceRecord`] because the two have different trust
+/// properties, and giving them one type would invite writing a `user` here
+/// again. Everything in this struct is self-attested and grants nothing;
+/// [`DeviceRecord`] is the join of this against the capability closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceDisplay {
+    /// This device's CGKA member id — its leaf in the tree.
+    pub member: [u8; 32],
+    /// This device's `iroh` endpoint id, once it has announced one.
+    ///
+    /// Self-attested, and safe to be: claiming an endpoint id grants nothing on
+    /// its own, because a peer is admitted only when the member holding it is
+    /// both certified and still in the group.
+    pub endpoint_id: Option<[u8; 32]>,
+    /// Human-readable label, for display only.
+    pub label: String,
+}
+
 /// One device belonging to a user, holding exactly one CGKA leaf.
+///
+/// The joined view an application sees: display data from the manifest, plus the
+/// owning user from the capability closure. Built by
+/// [`WorkspaceState::devices`](crate::state::WorkspaceState::devices) rather than
+/// by this module, because the manifest alone cannot answer `user` — and the
+/// point of phase 5 is that it must not try.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRecord {
     /// This device's CGKA member id — its leaf in the tree.
     pub member: [u8; 32],
-    /// The user this device belongs to.
+    /// The user this device belongs to, per its signed binding.
     pub user: [u8; 32],
     /// This device's `iroh` endpoint id, once it has announced one.
-    ///
-    /// Self-attested, and safe to be: claiming an endpoint id grants nothing on
-    /// its own, because a peer is admitted only when the *member* holding it is
-    /// one the group already accepted.
     pub endpoint_id: Option<[u8; 32]>,
     /// Human-readable label, for display only.
     pub label: String,
@@ -208,7 +191,7 @@ impl std::fmt::Debug for Manifest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Manifest")
             .field("files", &self.files().len())
-            .field("roles", &self.roles().len())
+            .field("devices", &self.devices().len())
             .finish()
     }
 }
@@ -266,10 +249,6 @@ impl Manifest {
 
     fn files_map(&self) -> LoroMap {
         self.doc.get_map(FILES_CONTAINER)
-    }
-
-    fn roles_map(&self) -> LoroMap {
-        self.doc.get_map(ROLES_CONTAINER)
     }
 
     fn authors_map(&self) -> LoroMap {
@@ -375,28 +354,20 @@ impl Manifest {
         out
     }
 
-    /// Bind a device's CGKA leaf to the user who owns it.
+    /// Record a device's display label.
     ///
-    /// **Not self-attestation.** Unlike [`Self::set_author`], this must be
-    /// written by whoever admits the device — an admin for a user's first
-    /// device, an existing device of the same user thereafter — because a
-    /// device that could name its own user would inherit that user's role. The
-    /// caller is responsible for that check; see `WorkspaceState`.
+    /// Creates the record that [`Self::set_device_endpoint`] attaches to, so it
+    /// must run first. Carries no authority: which user this device acts for is
+    /// decided by its signed [`DeviceBinding`](crate::capability::DeviceBinding),
+    /// not by anything written here.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Manifest`] if the Loro write fails.
-    pub fn set_device(
-        &self,
-        member: &[u8; 32],
-        user: &[u8; 32],
-        label: &str,
-    ) -> Result<(), CoreError> {
+    pub fn set_device(&self, member: &[u8; 32], label: &str) -> Result<(), CoreError> {
         let node = self
             .devices_map()
             .insert_container(&hex(member), LoroMap::new())
-            .map_err(|e| CoreError::Manifest(e.to_string()))?;
-        node.insert("user", hex(user).as_str())
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
         node.insert("label", label)
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
@@ -431,24 +402,33 @@ impl Manifest {
         Ok(())
     }
 
-    /// Look up one device.
+    /// Look up one device's display record.
+    ///
+    /// `None` means no record exists yet — the label write has not synced. A
+    /// device with a record but no binding is a device that speaks for nobody,
+    /// which is a question for the capability closure rather than for this map.
     #[must_use]
-    pub fn device(&self, member: &[u8; 32]) -> Option<DeviceRecord> {
+    pub fn device(&self, member: &[u8; 32]) -> Option<DeviceDisplay> {
         let devices = self.devices_map();
         let key = hex(member);
-        let user = Self::nested_field(&devices, &key, "user").and_then(|s| unhex_32(&s))?;
-        Some(DeviceRecord {
+        // The record exists if it has *either* field; `label` may legitimately be
+        // empty, so its presence rather than its content is what is asked.
+        let label = Self::nested_field(&devices, &key, "label");
+        let endpoint_id =
+            Self::nested_field(&devices, &key, "endpoint_id").and_then(|s| unhex_32(&s));
+        if label.is_none() && endpoint_id.is_none() {
+            return None;
+        }
+        Some(DeviceDisplay {
             member: *member,
-            user,
-            endpoint_id: Self::nested_field(&devices, &key, "endpoint_id")
-                .and_then(|s| unhex_32(&s)),
-            label: Self::nested_field(&devices, &key, "label").unwrap_or_default(),
+            endpoint_id,
+            label: label.unwrap_or_default(),
         })
     }
 
     /// Every recorded device, in arbitrary order.
     #[must_use]
-    pub fn devices(&self) -> Vec<DeviceRecord> {
+    pub fn devices(&self) -> Vec<DeviceDisplay> {
         let mut out = Vec::new();
         let devices = self.devices_map();
         devices.for_each(|key, _| {
@@ -458,31 +438,6 @@ impl Manifest {
             }
         });
         out
-    }
-
-    /// Every device belonging to one user.
-    #[must_use]
-    pub fn devices_of(&self, user: &[u8; 32]) -> Vec<DeviceRecord> {
-        self.devices()
-            .into_iter()
-            .filter(|d| d.user == *user)
-            .collect()
-    }
-
-    /// The user a device belongs to, if a record binds it.
-    #[must_use]
-    pub fn user_of(&self, member: &[u8; 32]) -> Option<[u8; 32]> {
-        self.device(member).map(|d| d.user)
-    }
-
-    /// The role a *device* acts under: its owner's role.
-    ///
-    /// Distinct from [`Self::role_of`], which takes a user id. A device with no
-    /// record yet resolves to `None` rather than to some default, so callers can
-    /// tell "not yet synced" apart from "explicitly has no permissions".
-    #[must_use]
-    pub fn role_of_member(&self, member: &[u8; 32]) -> Option<Role> {
-        self.role_of(&self.user_of(member)?)
     }
 
     /// Record that `author` is the data-plane identity of `member`.
@@ -507,23 +462,6 @@ impl Manifest {
             .and_then(|v| v.into_string().ok())
             .and_then(|s| unhex(&s))
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
-    }
-
-    /// Whether an entry signed by `author` should be accepted.
-    ///
-    /// Requires *all three* links: a member must have claimed the author id, a
-    /// record must bind that member's device to a user, and an admin must have
-    /// given that user a role that can write. An unclaimed author, an
-    /// unattributed device, or a viewer's device all fail.
-    ///
-    /// This is advisory in the same sense as every other role check — it
-    /// constrains what a well-behaved peer accepts, not what a peer holding the
-    /// namespace write capability can push into the replica.
-    #[must_use]
-    pub fn author_may_write(&self, author: &[u8; 32]) -> bool {
-        self.member_for_author(author)
-            .and_then(|member| self.role_of_member(&member))
-            .is_some_and(Role::can_write)
     }
 
     /// Record or replace a document's metadata.
@@ -635,70 +573,6 @@ impl Manifest {
             .map(|f| f.uuid)
     }
 
-    /// Assign a role to a **user**.
-    ///
-    /// Takes a user id, not a device's member id — a person's devices all act
-    /// under one role. Use [`Self::role_of_member`] to go the other way.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CoreError::Manifest`] if the Loro write fails.
-    pub fn set_role(&self, user: &[u8; 32], role: Role) -> Result<(), CoreError> {
-        self.roles_map()
-            .insert(&hex(user), role.as_str())
-            .map_err(|e| CoreError::Manifest(e.to_string()))?;
-        self.doc.commit();
-        Ok(())
-    }
-
-    /// The role assigned to a **user**, if any.
-    #[must_use]
-    pub fn role_of(&self, user: &[u8; 32]) -> Option<Role> {
-        self.roles_map()
-            .get(&hex(user))
-            .and_then(|v| v.into_value().ok())
-            .and_then(|v| v.as_string().map(|s| s.to_string()))
-            .as_deref()
-            .and_then(Role::from_str)
-    }
-
-    /// Every role assignment, keyed by user, in arbitrary order.
-    #[must_use]
-    pub fn roles(&self) -> Vec<([u8; 32], Role)> {
-        let mut out = Vec::new();
-        self.roles_map().for_each(|key, value| {
-            let Some(bytes) = unhex(key).and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
-                return;
-            };
-            let Some(role) = value
-                .into_value()
-                .ok()
-                .and_then(|v| v.into_string().ok())
-                .and_then(|s| Role::from_str(&s))
-            else {
-                return;
-            };
-            out.push((bytes, role));
-        });
-        out
-    }
-
-    /// How many admin *users* the workspace currently has.
-    ///
-    /// Counted per user, not per device: a person with three devices is one
-    /// administrator, and counting leaves would let the last admin be removed
-    /// while the count still looked healthy.
-    ///
-    /// Callers should refuse to demote or remove the last admin; losing every
-    /// admin leaves a workspace that nobody can ever administer again.
-    #[must_use]
-    pub fn admin_count(&self) -> usize {
-        self.roles()
-            .iter()
-            .filter(|(_, role)| role.can_administer())
-            .count()
-    }
-
     /// Export the full manifest state, for a peer joining from scratch.
     ///
     /// # Errors
@@ -726,7 +600,7 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileEntry, Manifest, Role};
+    use super::{FileEntry, Manifest};
     use crate::blinding::DocumentUuid;
 
     fn entry(uuid: u8, path: &str) -> FileEntry {
@@ -777,50 +651,6 @@ mod tests {
                 Err(crate::CoreError::UnknownDocument)
             ),
             "renaming a document that was never recorded should fail"
-        );
-    }
-
-    #[test]
-    fn roles_round_trip() {
-        let m = Manifest::new();
-        let alice = [1u8; 32];
-        m.set_role(&alice, Role::Admin).unwrap();
-
-        assert_eq!(m.role_of(&alice), Some(Role::Admin));
-        assert_eq!(
-            m.role_of(&[2u8; 32]),
-            None,
-            "unassigned members have no role"
-        );
-    }
-
-    #[test]
-    fn viewer_cannot_write_and_only_admin_can_administer() {
-        assert!(!Role::Viewer.can_write(), "viewers are read-only");
-        assert!(Role::Editor.can_write(), "editors may write");
-        assert!(!Role::Editor.can_administer(), "editors are not admins");
-        assert!(Role::Admin.can_administer(), "admins may administer");
-    }
-
-    #[test]
-    fn admin_count_tracks_demotion() {
-        let m = Manifest::new();
-        m.set_role(&[1u8; 32], Role::Admin).unwrap();
-        m.set_role(&[2u8; 32], Role::Admin).unwrap();
-        assert_eq!(m.admin_count(), 2);
-
-        // An admin stepping down while staying in the workspace: a pure
-        // manifest edit, with no CGKA rotation.
-        m.set_role(&[2u8; 32], Role::Editor).unwrap();
-        assert_eq!(
-            m.admin_count(),
-            1,
-            "demoting an admin should reduce the admin count"
-        );
-        assert_eq!(
-            m.role_of(&[2u8; 32]),
-            Some(Role::Editor),
-            "the demoted admin should remain a member, just without admin rights"
         );
     }
 
