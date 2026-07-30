@@ -71,22 +71,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The secret half never leaves his device, which is what makes an
     // intercepted invite useless for joining.
     let bob_identity = Identity::generate(&mut OsRng);
-    let bob_id = bob_identity.member_id();
+    // One value carrying everything alice needs: bob's member id, his public
+    // leaf key, and his endpoint. His endpoint is in there because admitting him
+    // puts him on alice's roster, and without that her node would refuse the
+    // connection he is about to make.
+    let bob_enrollment = bob_identity.enrollment(bob_node.endpoint().id());
 
     println!("\nalice invites bob as an editor...");
-    // Bob's endpoint id goes in with the invite: admitting him puts him on
-    // alice's roster, and without that her node would refuse the connection he
-    // is about to make.
-    let invite = alice
-        .add_user(
-            bob_id,
-            bob_identity.share_key(),
-            bob_node.endpoint().id(),
-            Role::Editor,
-            "Bob",
-        )
-        .await?;
-    println!("  invite carries {} CGKA operations", invite.log.len());
+    let invite = alice.add_user(&bob_enrollment, Role::Editor, "Bob").await?;
+    println!(
+        "  invite carries {} CGKA operations, expires at {}",
+        invite.terms().log.len(),
+        invite.not_after()
+    );
 
     let bob = Workspace::join(bob_node, &invite, &bob_identity, &mut OsRng).await?;
     println!("  bob joined; group size = {}", bob.group_size().await);
@@ -152,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
-    let leaked = revocation_takes_hold(&alice, &bob, bob_id, notes).await?;
+    let leaked = revocation_takes_hold(&alice, &bob, bob_identity.member_id(), notes).await?;
 
     alice.shutdown().await?;
     bob.shutdown().await?;

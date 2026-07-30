@@ -38,6 +38,9 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 rand_chacha = "0.3"
+# Tests only, pinned to the major version `keyhive_crypto` uses: the encoding
+# tests in `invite` are only meaningful if they serialize the way `Signed` does.
+bincode = "1"
 tracing-subscriber = "0.3"
 tracing = "0.1"
 

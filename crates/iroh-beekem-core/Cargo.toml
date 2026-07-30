@@ -42,6 +42,11 @@ adversarial-testing = []
 
 [dev-dependencies]
 rand_chacha = "0.3"
+# Tests only, and pinned to the major version `keyhive_crypto` uses, because
+# `the_signed_payload_types_cannot_share_an_encoding` is only meaningful if it
+# serializes the way `Signed` does. bincode 2 has a different default config; if
+# keyhive ever moves, this must move with it or the test silently checks nothing.
+bincode = "1"
 
 [lints]
 workspace = true

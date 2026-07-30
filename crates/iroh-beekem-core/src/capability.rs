@@ -105,13 +105,63 @@ impl Role {
     }
 }
 
+/// Domain separation for a [`Grant`] signature.
+///
+/// See [`BINDING_DOMAIN`] for why these exist and what they are worth.
+pub const GRANT_DOMAIN: [u8; 16] = *b"iroh-beekem/grnt";
+
+/// Domain separation for a [`DeviceBinding`] signature.
+///
+/// # What a tag buys
+///
+/// [`Signed`] covers `bincode(payload)` with no type name and no discriminator,
+/// and `try_verify` recomputes it for whatever `T` the *deserializer* chose — and
+/// on the wire a [`Certificate`] is an enum, so a receiver's choice of `T` is the
+/// attacker's choice. A genuine `(issuer, signature)` pair is therefore
+/// transferable between any two payload types whose encodings match byte for
+/// byte. The attacker forges nothing; they lift the pair and reattach it.
+///
+/// That is not hypothetical here. Untagged, a `DeviceBinding` encoded to exactly
+/// 80 bytes and *every* 80-byte string decoded as one, while
+/// `CgkaOperation::Remove` encoded to 88 — eight bytes apart, signed by the same
+/// member key, and an admin's `Remove` lifted into a
+/// `DeviceBinding { device: attacker, user: admin }` is an escalation the closure
+/// admits without further question. What held those eight bytes apart was
+/// `CgkaOperation`'s field list, which belongs to beekem and is a *version*
+/// dependency here rather than a pinned revision. A release that shrank `Remove`
+/// would have been a silent break.
+///
+/// # Why an ASCII tag closes it structurally, not probabilistically
+///
+/// Every domain constant in this workspace is 16 bytes of printable ASCII, and
+/// that is load-bearing. bincode encodes an enum discriminant as a little-endian
+/// `u32`, so for any variant index below 2^24 the second, third and fourth bytes
+/// of the encoding are **zero**. A tagged payload's are not. A tagged payload can
+/// therefore never share an encoding with an untagged bincode enum — which is
+/// exactly what `CgkaOperation` is — regardless of what beekem does to its
+/// fields later. The two tags differ from each other, and from
+/// `iroh-beekem`'s invite tag, so no pair of tagged types can collide either.
+///
+/// `the_signed_payload_types_cannot_share_an_encoding` in this module's tests is
+/// what keeps all of that true.
+///
+/// Public so that `iroh-beekem` can assert its own invite tag differs from both
+/// of these. A constant an attacker already knows; publishing it costs nothing
+/// and the alternative is a cross-crate test that cannot see what it is checking.
+pub const BINDING_DOMAIN: [u8; 16] = *b"iroh-beekem/bind";
+
 /// An admin's statement that a user holds a role.
 ///
 /// Roles attach to *users*, not devices — a laptop that is an admin while its
 /// owner's phone is a viewer is a distinction nobody wants to reason about. A
 /// device's role is its owner's; see [`CapabilityStore::role_of_member`].
+///
+/// Build one with [`Grant::new`]: the domain tag is not a field a caller fills.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
+    /// Domain separation, always [`GRANT_DOMAIN`]. First field, so it is the
+    /// first bytes of the signed encoding.
+    domain: [u8; 16],
     /// The user this grant is about.
     pub subject: [u8; 32],
     /// What that user may do.
@@ -142,8 +192,14 @@ pub struct Grant {
 /// user — enrolling your own phone is not an act of administration. It may never
 /// be self-attested, because a device that could name its own user would inherit
 /// that user's role.
+///
+/// Build one with [`DeviceBinding::new`]: the domain tag is not a field a caller
+/// fills.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceBinding {
+    /// Domain separation, always [`BINDING_DOMAIN`]. First field, so it is the
+    /// first bytes of the signed encoding.
+    domain: [u8; 16],
     /// The device's CGKA member id — its leaf in the tree.
     pub device: [u8; 32],
     /// The user this device acts for.
@@ -166,6 +222,28 @@ pub enum Certificate {
 }
 
 impl Grant {
+    /// A grant of `capability` to `subject`, stamped with its domain tag.
+    ///
+    /// The only way to build one, so a `Grant` that exists is a `Grant` that
+    /// verification will recognise as one.
+    #[must_use]
+    pub fn new(
+        subject: [u8; 32],
+        capability: Role,
+        seq: u64,
+        not_after: Option<u64>,
+        nonce: [u8; 16],
+    ) -> Self {
+        Self {
+            domain: GRANT_DOMAIN,
+            subject,
+            capability,
+            seq,
+            not_after,
+            nonce,
+        }
+    }
+
     /// Sign a grant with the issuing device's key.
     ///
     /// Synchronous: `MemorySigner::try_sign_sync` does no I/O, so unlike the
@@ -184,6 +262,19 @@ impl Grant {
 }
 
 impl DeviceBinding {
+    /// A binding of `device` to `user`, stamped with its domain tag.
+    ///
+    /// The only way to build one, for the reason given on [`Grant::new`].
+    #[must_use]
+    pub fn new(device: [u8; 32], user: [u8; 32], nonce: [u8; 16]) -> Self {
+        Self {
+            domain: BINDING_DOMAIN,
+            device,
+            user,
+            nonce,
+        }
+    }
+
     /// Sign a binding with the issuing device's key.
     ///
     /// # Errors
@@ -220,18 +311,32 @@ impl Certificate {
         }
     }
 
-    /// Check the signature against the embedded issuer key.
+    /// Check the domain tag, then the signature against the embedded issuer key.
+    ///
+    /// The tag first, and the order matters for what a failure *means*: a
+    /// payload signed for another purpose has a perfectly good signature, and
+    /// reporting it as [`CoreError::BadSignature`] would describe a
+    /// cross-protocol lift as a corrupt message.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::BadSignature`] if the certificate is forged or was
-    /// tampered with in transit.
+    /// Returns [`CoreError::WrongDomain`] if the payload is not a certificate of
+    /// this kind, and [`CoreError::BadSignature`] if it is forged or was tampered
+    /// with in transit.
     pub fn verify(&self) -> Result<(), CoreError> {
-        let verified = match self {
-            Self::Grant(signed) => signed.try_verify(),
-            Self::Binding(signed) => signed.try_verify(),
+        let domain_ok = match self {
+            Self::Grant(signed) => signed.payload().domain == GRANT_DOMAIN,
+            Self::Binding(signed) => signed.payload().domain == BINDING_DOMAIN,
         };
-        verified.map_err(|_| CoreError::BadSignature)
+        if domain_ok {
+            let verified = match self {
+                Self::Grant(signed) => signed.try_verify(),
+                Self::Binding(signed) => signed.try_verify(),
+            };
+            verified.map_err(|_| CoreError::BadSignature)
+        } else {
+            Err(CoreError::WrongDomain)
+        }
     }
 }
 
@@ -594,7 +699,9 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    use super::{CapabilityStore, Certificate, DeviceBinding, Grant, Role};
+    use super::{
+        BINDING_DOMAIN, CapabilityStore, Certificate, DeviceBinding, GRANT_DOMAIN, Grant, Role,
+    };
 
     /// A signer and its device id.
     fn device(seed: u64) -> (MemorySigner, [u8; 32]) {
@@ -610,25 +717,15 @@ mod tests {
         seq: u64,
         nonce: u8,
     ) -> Certificate {
-        Grant {
-            subject,
-            capability,
-            seq,
-            not_after: None,
-            nonce: [nonce; 16],
-        }
-        .sign(signer)
-        .expect("signing a grant is infallible with a memory signer")
+        Grant::new(subject, capability, seq, None, [nonce; 16])
+            .sign(signer)
+            .expect("signing a grant is infallible with a memory signer")
     }
 
     fn bind(signer: &MemorySigner, dev: [u8; 32], user: [u8; 32], nonce: u8) -> Certificate {
-        DeviceBinding {
-            device: dev,
-            user,
-            nonce: [nonce; 16],
-        }
-        .sign(signer)
-        .expect("signing a binding is infallible with a memory signer")
+        DeviceBinding::new(dev, user, [nonce; 16])
+            .sign(signer)
+            .expect("signing a binding is infallible with a memory signer")
     }
 
     /// Given a store rooted at a founder, when nothing has been inserted, we
@@ -850,25 +947,58 @@ mod tests {
         );
     }
 
-    /// Given a device already bound to a user, when a second binding names a
-    /// different user for it, we expect the first to stand.
+    /// Given two bindings naming different users for one device, when they are
+    /// inserted in either order, we expect one to win and both orders to pick
+    /// the same one.
+    ///
+    /// **Not "the first-issued binding stands"** — the closure iterates in digest
+    /// order and takes the first admissible binding per device, so which one wins
+    /// is a function of the certificate *set* and not of who issued first. That
+    /// distinction is the whole guarantee: two peers holding the same
+    /// certificates must resolve a leaf to the same user however those
+    /// certificates reached them, or a receiver-side check diverges the group
+    /// permanently.
+    ///
+    /// This test previously asserted that the binding inserted first survived,
+    /// which held only because the nonce it used happened to hash below the
+    /// other's. Adding the domain tag changed both digests and flipped the
+    /// winner, failing a test whose subject had not changed at all — so the
+    /// assertion is now on the property the code actually has.
     #[test]
-    fn a_certified_device_cannot_be_rebound() {
+    fn a_certified_devices_user_does_not_depend_on_arrival_order() {
         let (founder_signer, founder) = device(1);
         let (_, bob) = device(2);
         let (_, carol) = device(3);
-        let mut store = CapabilityStore::new(founder);
-        store.insert(bind(&founder_signer, bob, bob, 1)).unwrap();
 
-        store
-            .insert(bind(&founder_signer, bob, carol, 2))
-            .expect("the certificate is stored");
+        let first = bind(&founder_signer, bob, bob, 1);
+        let second = bind(&founder_signer, bob, carol, 2);
 
+        let mut forwards = CapabilityStore::new(founder);
+        forwards.insert(first.clone()).expect("stored");
+        forwards.insert(second.clone()).expect("stored");
+
+        let mut backwards = CapabilityStore::new(founder);
+        backwards.insert(second).expect("stored");
+        backwards.insert(first).expect("stored");
+
+        let resolved = forwards.user_of(&bob);
         assert_eq!(
-            store.user_of(&bob),
-            Some(bob),
-            "a device's binding was overwritten, so whoever issues the last binding decides \
-             which user a leaf acts for"
+            resolved,
+            backwards.user_of(&bob),
+            "two peers holding the same certificates resolved one leaf to two \
+             different users; a receiver-side authorization check on that would \
+             diverge the group and never recover"
+        );
+        assert!(
+            resolved == Some(bob) || resolved == Some(carol),
+            "the leaf must resolve to one of the two users named, not to neither \
+             and not to something invented, got {resolved:?}"
+        );
+        assert_eq!(
+            forwards.devices_of(&bob).len() + forwards.devices_of(&carol).len(),
+            1,
+            "one device must act for exactly one user, or a second binding is a \
+             way to inherit somebody else's role"
         );
     }
 
@@ -886,13 +1016,7 @@ mod tests {
             unreachable!("grant() returns a Grant variant")
         };
         let forged = Certificate::Grant(keyhive_crypto::signed::Signed::new(
-            Grant {
-                subject: bob,
-                capability: Role::Admin,
-                seq: 0,
-                not_after: None,
-                nonce: [1u8; 16],
-            },
+            Grant::new(bob, Role::Admin, 0, None, [1u8; 16]),
             *valid.issuer(),
             *valid.signature(),
         ));
@@ -906,6 +1030,194 @@ mod tests {
             store.role_of(&bob),
             None,
             "the refused certificate still changed the closure"
+        );
+    }
+
+    /// Given the domain tags this crate stamps, we expect all of them to be
+    /// sixteen bytes of printable ASCII and pairwise distinct.
+    ///
+    /// Both halves are load-bearing rather than tidy. **Distinct** is what stops
+    /// a `Grant` signature being read as a `DeviceBinding`. **Printable ASCII**
+    /// is what stops either being read as a `CgkaOperation`: bincode writes an
+    /// enum discriminant as a little-endian `u32`, so bytes 1–3 of any variant
+    /// index below 2^24 are zero, and no ASCII byte is. A tag containing a NUL
+    /// would satisfy the first property and quietly lose the second, which is
+    /// why this asserts the encoding and not just the inequality.
+    #[test]
+    fn the_domain_tags_are_distinct_and_free_of_nul_bytes() {
+        assert_ne!(
+            GRANT_DOMAIN, BINDING_DOMAIN,
+            "two certificate kinds sharing a tag would leave them mutually \
+             confusable, which is the whole thing the tags exist to prevent"
+        );
+        for (name, tag) in [("grant", GRANT_DOMAIN), ("binding", BINDING_DOMAIN)] {
+            assert!(
+                tag.iter().all(u8::is_ascii_graphic),
+                "the {name} tag must be printable ASCII: a zero byte in positions \
+                 1..4 would let the payload alias a bincode enum discriminant"
+            );
+        }
+    }
+
+    /// Given the signed payload types this protocol defines, when each is
+    /// encoded the way `Signed` encodes it, we expect no two to produce the same
+    /// bytes — and we expect the certificate payloads to be unreadable as any
+    /// `CgkaOperation`.
+    ///
+    /// **The test that would have caught the original defect.** `Signed<T>` signs
+    /// `bincode(payload)` with no type tag, and verification recomputes it for
+    /// whatever `T` the deserializer chose, so a genuine `(issuer, signature)`
+    /// pair transfers between any two payload types with equal encodings. Before
+    /// the domain tags, `DeviceBinding` was exactly 80 bytes — *every* 80-byte
+    /// string decoded as one — and `CgkaOperation::Remove` was 88. Eight bytes,
+    /// both signed by the same member key, and an admin's `Remove` lifted into a
+    /// `DeviceBinding { device: attacker, user: admin }` is an escalation the
+    /// closure admits. Nothing in the build would have failed had a beekem
+    /// release closed that gap.
+    ///
+    /// The first-byte assertions are the structural argument and the reason this
+    /// is not merely a size pin: they hold whatever beekem does to its fields.
+    /// The size assertions are the loud-failure half — they pin what the wire
+    /// format *is*, so a bincode or dependency change that silently alters it
+    /// fails here rather than in a peer's decoder.
+    #[test]
+    fn the_signed_payload_types_cannot_share_an_encoding() {
+        use beekem::{
+            id::{MemberId, TreeId},
+            operation::CgkaOperation,
+        };
+
+        let (_, id) = device(1);
+        let member = MemberId::from(
+            ed25519_dalek::VerifyingKey::from_bytes(&id).expect("a signer's key is a valid point"),
+        );
+        let tree = TreeId::from(
+            ed25519_dalek::VerifyingKey::from_bytes(&id).expect("a signer's key is a valid point"),
+        );
+
+        let grant = bincode::serialize(&Grant::new(id, Role::Admin, 0, None, [0u8; 16]))
+            .expect("a grant serializes");
+        let binding = bincode::serialize(&DeviceBinding::new(id, id, [0u8; 16])).expect(
+            "a binding
+ serializes",
+        );
+        // The smallest `CgkaOperation` there is: no removed keys, no
+        // predecessors. Anything larger is further away, so bounding the
+        // smallest bounds them all.
+        let remove = bincode::serialize(&CgkaOperation::Remove {
+            id: member,
+            leaf_idx: 0,
+            removed_keys: Vec::new(),
+            predecessors: Vec::new(),
+            doc_id: tree,
+        })
+        .expect("an operation serializes");
+
+        assert_ne!(
+            grant, binding,
+            "a grant and a binding must never encode alike, or one signature \
+             authorises both"
+        );
+        for (name, encoded) in [("grant", &grant), ("binding", &binding)] {
+            assert_ne!(
+                encoded[..],
+                remove[..],
+                "a {name} must never encode as a CGKA operation: both are signed \
+                 by the same member key, so a lifted signature would be genuine"
+            );
+            assert!(
+                encoded[1..4].iter().any(|b| *b != 0),
+                "a {name} must not begin with bytes a bincode enum discriminant \
+                 could produce; that is what makes the previous assertion hold \
+                 for every CgkaOperation rather than just this one"
+            );
+        }
+        assert_eq!(
+            remove[1..4],
+            [0u8; 3],
+            "the discriminant argument above assumes a CGKA operation's variant \
+             index is small enough to leave bytes 1..4 zero; if beekem ever \
+             exceeds 2^24 variants, the argument needs redoing"
+        );
+
+        // The wire format, pinned. Untagged these were 61 and 80.
+        assert_eq!(grant.len(), 77, "a grant with no expiry is 16+32+4+8+1+16");
+        assert_eq!(binding.len(), 96, "a binding is 16+32+32+16");
+        assert_eq!(
+            bincode::serialize(&Grant::new(id, Role::Admin, 0, Some(1), [0u8; 16]))
+                .expect("a grant serializes")
+                .len(),
+            85,
+            "an expiring grant carries eight more bytes than one without"
+        );
+    }
+
+    /// Given a payload signed for another purpose, when it is presented as a
+    /// certificate, we expect `WrongDomain` rather than a signature failure.
+    ///
+    /// The two verdicts say opposite things about the issuer, and only one of
+    /// them is a security event: a bad signature means nobody vouched for these
+    /// bytes, while a wrong domain means somebody *did* and their signature is
+    /// being pointed at something they never agreed to. Reporting the second as
+    /// the first would file a cross-protocol lift under "corrupt message".
+    #[test]
+    fn a_certificate_carrying_another_types_tag_is_refused_as_such() {
+        let (signer, id) = device(1);
+
+        // Signed genuinely, so the signature is perfectly valid — the tag is the
+        // only thing wrong with it.
+        let mut mislabelled = Grant::new(id, Role::Admin, 0, None, [0u8; 16]);
+        mislabelled.domain = BINDING_DOMAIN;
+        let cert = mislabelled
+            .sign(&signer)
+            .expect("signing is infallible with a memory signer");
+
+        assert!(
+            matches!(cert.verify(), Err(crate::error::CoreError::WrongDomain)),
+            "a grant wearing the binding tag must be refused as the wrong kind of \
+             certificate, not as a forgery"
+        );
+
+        let mut untagged = DeviceBinding::new(id, id, [0u8; 16]);
+        untagged.domain = [0u8; 16];
+        let cert = untagged
+            .sign(&signer)
+            .expect("signing is infallible with a memory signer");
+        assert!(
+            matches!(cert.verify(), Err(crate::error::CoreError::WrongDomain)),
+            "an untagged payload must be refused too, which is what makes the tag \
+             a requirement rather than a hint"
+        );
+    }
+
+    /// Given a certificate whose tag is wrong, when it reaches the store, we
+    /// expect it to change nothing.
+    ///
+    /// `verify` returning an error is only half the guarantee; the half that
+    /// matters is that `insert` consults it. A store that recomputed its closure
+    /// before checking would satisfy every assertion above and still admit the
+    /// certificate.
+    #[test]
+    fn a_wrongly_tagged_certificate_never_reaches_the_closure() {
+        let (founder_signer, founder) = device(1);
+        let (_, bob) = device(2);
+        let mut store = CapabilityStore::new(founder);
+
+        let mut mislabelled = Grant::new(bob, Role::Admin, 0, None, [0u8; 16]);
+        mislabelled.domain = BINDING_DOMAIN;
+        let cert = mislabelled
+            .sign(&founder_signer)
+            .expect("signing is infallible with a memory signer");
+
+        assert!(
+            store.insert(cert).is_err(),
+            "the store must refuse a certificate its own verifier rejects"
+        );
+        assert_eq!(
+            store.role_of(&bob),
+            None,
+            "a refused certificate must leave the closure untouched, however \
+             genuine the signature over it was"
         );
     }
 }

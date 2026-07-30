@@ -102,6 +102,13 @@ holds roles or device bindings. The standing phrasing is **"the capability closu
 authorised to act; the manifest records what that produced"** — if you find the older "the manifest
 decides who is authorised to act" anywhere, it is stale.
 
+Phase 6 has since landed: an [`Invite`](crates/iroh-beekem/src/invite.rs) is a signed ticket bound to
+one device, with an expiry and a single-use nonce, and `add_user`/`add_device` take an `Enrollment`
+rather than raw `beekem`/`keyhive_crypto` types. The standing phrasing is **"a stolen invite buys
+visibility, not membership and not plaintext"** — if you find "invites are replayable" anywhere, it is
+stale, and if you find a claim that signing a ticket protects a *leaked* one, it is wrong: what bounds
+a thief is the roster and namespace rotation.
+
 ## Easy to break by accident
 
 Properties of the code as currently written. Changing the surrounding design may retire these; changing
@@ -134,6 +141,36 @@ them *without* noticing will not fail loudly.
   the log without the store reinstates the exact hole phase 5 closed, on every `NeighborUp`. A role
   change is worse still: it mints a grant and no operation, so the log exchange is its *only*
   anti-entropy.
+
+- **The invite's nonce is claimed *after* every other check, and the order is the point.**
+  `Workspace::join` runs `Invite::verify` first and `Node::claim_invite` last. Claiming first would
+  let a garbled, expired or misaddressed copy of a ticket burn the nonce of the one that would have
+  worked — a denial of service anybody who can hand the invitee a file can mount. The nonce ledger
+  also lives on `Node` and not on `Workspace`, because redeeming a ticket is what *creates* a
+  workspace: there is nothing else to ask at the moment of the check.
+
+- **Every signed payload carries a 16-byte printable-ASCII domain tag, and both halves of that
+  sentence are load-bearing.** `Signed<T>` covers `bincode(payload)` with no type name and no
+  discriminator, and verification recomputes it for whatever `T` the *deserializer* chose — on the
+  wire a `Certificate` is an enum, so that choice is the attacker's. A genuine `(issuer, signature)`
+  pair therefore transfers between any two payload types whose encodings match byte for byte.
+  **Distinct** tags stop a `Grant` being read as a `DeviceBinding`. **Printable ASCII** stops either
+  being read as a `CgkaOperation`: bincode writes an enum discriminant as a little-endian `u32`, so
+  bytes 1–3 of any variant index below 2^24 are zero, and no ASCII byte is. A tag containing a NUL
+  would keep the first property and silently lose the second. Untagged, `DeviceBinding` was exactly
+  80 bytes — every 80-byte string decoded as one — against `CgkaOperation::Remove` at 88, both signed
+  by the same member key, and an admin's `Remove` lifted into a
+  `DeviceBinding { device: attacker, user: admin }` is an escalation the closure admits.
+  `the_signed_payload_types_cannot_share_an_encoding` in [capability.rs](crates/iroh-beekem-core/src/capability.rs)
+  is what keeps this true; **any new `Signed<T>` needs a tag and a line in that test**, phase 8's
+  `Policy` and `Approval` included.
+
+- **A joiner's namespace generation comes from the invite, and it is not cosmetic.**
+  `WorkspaceState::joined` takes it from `Invite.epoch`. Seeded at `NamespaceEpoch::INITIAL` instead,
+  a member admitted at generation 3 will adopt an announcement of generation 1 — peers that are
+  themselves behind re-announce on the ordinary `ResyncNamespace` schedule, under the *current* group
+  key, so the joiner can decrypt it — and move onto a replica the group abandoned before it arrived.
+  It recovers at the next rotation, so the failure is a silent stall rather than an error.
 
 - **`ever_admin` and `role_of` are two predicates on purpose**, and it is the same split as
   `known_members`/`current_members` for the same reason. `ever_admin` is monotone and decides whether

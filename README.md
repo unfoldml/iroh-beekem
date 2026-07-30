@@ -48,9 +48,15 @@ let notes = ws.create_file("/notes.md", "text/markdown").await?;
 ws.write(notes, "# Agenda").await?;
 ws.append(notes, "\n1. ship 0.1").await?;
 
+// What the invitee sends out of band: their member id, their public leaf key,
+// and the endpoint they will connect from. `Identity::enrollment` builds it, so
+// neither side has to name a `beekem` or `keyhive_crypto` type to invite anyone.
+let bob = their_identity.enrollment(their_endpoint_id);
+
 // Admitting someone returns the invite they need. The role is chosen here
-// because it decides what capability the ticket carries.
-let invite = ws.add_user(their_member_id, their_share_key, Role::Editor, "Bob").await?;
+// because it decides what capability the ticket carries. The ticket is signed,
+// names Bob's device, expires within the hour, and is single-use.
+let invite = ws.add_user(&bob, Role::Editor, "Bob").await?;
 
 for user in ws.users().await {
     println!("{:?}: {:?} on {} device(s)", user.display_name, user.role, user.devices.len());
@@ -252,6 +258,33 @@ member that cannot decrypt any of them ask for one keyed under a fresh epoch. Wi
 them a single lost announcement strands a member on an abandoned replica — removed in
 effect, without anyone having removed them.
 
+### An invite is a ticket, not a bearer token
+
+An `Invite` is `Signed<InviteTerms>`, and the terms name the device they admit (`invitee`), the
+moment they stop being redeemable (`not_after`, an hour out), the ticket that identifies them
+(`nonce`), and the namespace generation their `doc_ticket` belongs to (`epoch`). `Workspace::join`
+checks the signature, that the issuer may administer under a closure rooted at `tree_id`, that the
+terms name *this* device, that the window is still open, and that this node has not redeemed the
+nonce before — in that order, with the nonce claimed last so a ticket that fails an earlier check
+does not burn one that would have worked.
+
+Every check is in `iroh-beekem`, not in the core. Expiry needs a clock and single use needs a
+ledger, and the core has neither by design; an invite is redeemed once, locally, by one device, so
+the decision is local and the cost of two peers disagreeing is a refused join rather than a diverged
+group. That is the same line drawn for `Grant::not_after`, which is carried on the wire and
+deliberately never evaluated during a merge.
+
+**What this does and does not buy.** A leaked ticket has never granted read access: joining needs
+the leaf secret whose public half the inviter named in the `Add`, and that secret never travels.
+What it grants is *visibility* — the blinding secret, the replica to watch, the inviter to dial. The
+checks above stop a thief redeeming a ticket **through this library**; they cannot stop one reading
+the struct's fields directly. Two things do, and they are the group's real remedy: `RosterGuard`
+refuses the thief's endpoint because it is on nobody's roster, and a namespace rotation abandons the
+replica the ticket names. There is nothing in a bearer token to revoke, so rotation is the answer to
+a leak. The `StolenInvite` scenario in `iroh-beekem-sim` states exactly that boundary: the thief
+never enters anyone's `users()`, never reconstructs the group, never decrypts a byte, and stops
+seeing entries the moment the group rotates — but it *does* see the replica until then.
+
 ### Two DAGs must both be satisfied
 
 An arriving chunk applies only when the CGKA operation graph has caught up far enough to reach its PCS
@@ -288,9 +321,35 @@ target, since a member in good standing holds that key already.
 | **Outsider** (never admitted) | `known_members` on merge, `RosterGuard` on connect | Nothing. The `Outsider` and `Forging` scenarios prove it |
 | **Member, any role** | The capability closure, checked by **every receiver** | Read everything (that is forward secrecy, not a defect); enrol further devices of *its own* user; nothing else. Its `Add` of a new user, its `Remove` of an admin, and any grant it writes itself are all dropped by every peer |
 | **Removed member** | The same, plus eviction | Splice a leaf it controls into the tree, and read what is published during the window before an admin evicts it. It cannot escalate: the leaf inherits only what the revenant itself held |
+| **Thief holding a leaked invite** | The invite's own signature and binding, then `RosterGuard`, then rotation | Read the operation log and the certificate store, both public anyway; compute the blinded key of a document whose uuid it can name; watch the replica until the group rotates. It cannot join — that needs the invitee's leaf secret, which no ticket carries — and it decrypts nothing. The `StolenInvite` scenario proves the bound |
 
 **Out of scope, and stated so:** traffic analysis by a member in good standing, and connection
 metadata visible to relay servers. Neither is fixable at this layer.
+
+### Signature domain separation
+
+`Signed<T>` covers `bincode(payload)` with no type name and no discriminator, and verification
+recomputes it for whatever `T` the *deserializer* chose — and on the wire a `Certificate` is an enum,
+so that choice is the attacker's. A genuine `(issuer, signature)` pair is therefore transferable
+between any two payload types whose encodings match byte for byte. The attacker forges nothing; they
+lift the pair and reattach it.
+
+Every payload this project signs — `Grant`, `DeviceBinding`, `InviteTerms` — begins with a 16-byte
+printable-ASCII domain tag, checked before the signature. Both properties do work. **Distinct** tags
+stop a grant being read as a binding. **Printable ASCII** stops either being read as a
+`CgkaOperation`: bincode writes an enum discriminant as a little-endian `u32`, so bytes 1–3 of any
+variant index below 2²⁴ are zero, and no ASCII byte is. A tagged payload therefore cannot share an
+encoding with an untagged bincode enum, whatever beekem later does to its fields.
+
+That last point is why the tags exist rather than an argument from sizes. Untagged, a
+`DeviceBinding` encoded to exactly 80 bytes — and *every* 80-byte string decoded as one — against a
+`CgkaOperation::Remove` at 88. Eight bytes, both signed by the same member key, and an admin's
+`Remove` lifted into a `DeviceBinding { device: attacker, user: admin }` is an escalation the
+capability closure admits. Nothing was exploitable, but what held those eight bytes apart was
+beekem's field list, which this project depends on by version rather than by revision — so a release
+that shrank `Remove` would have been a silent break.
+`the_signed_payload_types_cannot_share_an_encoding` is what keeps this true; a new signed type needs
+a tag and a line in that test.
 
 ## Verification
 
@@ -378,7 +437,18 @@ reason enough to revisit the choice underneath.
 13. **A removed member can splice a leaf in, and read for one eviction window.** It cannot escalate.
    See [A removed member is evicted again](#a-removed-member-is-evicted-again) for why refusing the
    operation outright is not available.
-14. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
+14. **An invite still carries the workspace secret, and must travel confidentially.** Signing it
+   binds who may redeem it and for how long; it does not encrypt it. A ticket read in transit hands
+   the reader the blinding secret and the `iroh-docs` ticket, and no signature over a plaintext
+   struct can change that. Deliver it over an authenticated, confidential channel — a direct `iroh`
+   QUIC stream to a known public key qualifies, a public gossip topic does not — and treat a leak as
+   a reason to rotate. What signing buys is that a *leaked* ticket is not a *redeemable* one.
+15. **Spent invite nonces are in memory, so a restart un-consumes every one.** The ledger lives on
+   `Node`, because redeeming an invite is what creates a workspace and there is nothing else to ask
+   at the moment of the check. Nothing persists it yet, so after a crash a ticket already used
+   becomes redeemable again — bounded only by its hour-long expiry, which is the guarantee that does
+   survive. Persisting it belongs with the node's endpoint secret key, and both land together.
+16. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
    certificates remain valid documents; what stops them mattering is CGKA removal. There is no
    expiry either: `Grant::not_after` is carried on the wire but deliberately **not** evaluated,
    because an expiry inside an authorization predicate makes admissibility depend on clock skew and
@@ -410,15 +480,11 @@ These are gaps, not trades. Nothing in the design prevents them.
    entries, and nothing retracts what it already synced. The `a_removed_member_stops_seeing`
    properties in `iroh-beekem-sim` state exactly where the line now sits.
 
-5. **Invites are replayable.** No expiry, no nonce, no binding to the invitee — and the ticket
-   carries the raw workspace secret, so it must travel over an authenticated, confidential channel.
-   It does *not* grant read access: joining also needs the leaf secret, which never leaves the
-   invitee's device.
-6. **One roster per node, not per workspace.** The roster lives on `Node` because the guards must
+5. **One roster per node, not per workspace.** The roster lives on `Node` because the guards must
    be installed when the router is built, before any workspace exists. Two workspaces on one node
    would therefore union their rosters, admitting a member of either to both. Fixing it means
    keying the roster by workspace, which belongs with `Workspace::open`/`list` and persistence.
-7. **The gossip topic still never rotates.** It is derived from the tree id, which is the founder's
+6. **The gossip topic still never rotates.** It is derived from the tree id, which is the founder's
    public key, so every past invitee knows it permanently. The roster is what refuses them; without
    a new tree id — that is, a new workspace — the topic itself cannot change.
 

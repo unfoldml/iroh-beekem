@@ -4,7 +4,7 @@
 
 The near-term goal is **a publishable 0.1 crate**.
 
-Phases 0–5 are closed. Phase 5 answered the post-Phase-4 security review finding that outranked
+Phases 0–6 are closed. Phase 5 answered the post-Phase-4 security review finding that outranked
 everything else on the list:
 
 > **Authorization is enforced only on the node that issues an action.** Every role check —
@@ -26,7 +26,16 @@ each is recorded in place below: the manifest filter of §5.3 was not implementa
 drafted was unachievable, and a grow-only certificate set cannot express demotion without an explicit
 `(seq, digest)` order.
 
-What remains is Phases 6–9.
+Phase 6 then closed the invite surface, which 0.1 freezes: a ticket is now signed, bound to one
+device, dated, and single-use, and `add_user`/`add_device` no longer force `beekem` and
+`keyhive_crypto` into a caller's manifest. Two residuals are stated rather than implied. Signing a
+ticket does not encrypt it, so what bounds a thief who reads one is the roster and namespace
+rotation. And `INVITE_DOMAIN` shipped described as closing a signature-confusion hole, which it did
+not — the invite was the least confusable payload in the protocol. The exposed pair was
+`DeviceBinding` against `CgkaOperation::Remove`; both certificate payloads are now tagged too, and
+the whole analysis is recorded under *Signature domain separation*.
+
+What remains is Phases 7–9.
 
 NB: Where this document and the code disagree on detail, the
 code wins.
@@ -43,6 +52,7 @@ code wins.
 | 3 | `RosterGuard` on all three ALPNs, roster derived from manifest devices ∩ `current_members`, bootstrap admission for cold joiners | [roster.rs](crates/iroh-beekem/src/roster.rs), `WorkspaceState::roster` |
 | 4 | `Remove`-before-rotate ordering, `NamespaceEpoch` on `(epoch, digest)`, `Effect::AdoptNamespace`, demand-driven repair via `Keying::Fresh`, read-only invite tickets for Viewers | [state.rs](crates/iroh-beekem-core/src/state.rs), [workspace.rs](crates/iroh-beekem/src/workspace.rs) |
 | 5 | `Grant`/`DeviceBinding`/`CapabilityStore` with a monotone `ever_admin` and `(seq, digest)`-ordered `role_of`; the third check in `merge`; `AuthorizedOp` proof bundles on `BroadcastOp`/`ControlMsg::Op`/`Msg::Op`; `ControlMsg::Log` ships the whole store; `Effect::BroadcastCerts` and `Effect::EvictUncertified`; roles and bindings removed from the manifest; `Insider` and `Revenant` scenarios | [capability.rs](crates/iroh-beekem-core/src/capability.rs), [keys.rs](crates/iroh-beekem-core/src/keys.rs), [state.rs](crates/iroh-beekem-core/src/state.rs) |
+| 6 | `Signed<InviteTerms>` with `invitee`/`not_after`/`nonce`/`epoch`; domain tags on all three signed payload types, checked before the signature; `Node::claim_invite` nonce ledger; `Enrollment` plus `MemberId`/`ShareKey`/`Role` re-exports; `WorkspaceState::joined` seeded with the joiner's namespace generation; `Msg::Welcome` carries the invitee and the replica; `StolenInvite` scenario | [invite.rs](crates/iroh-beekem/src/invite.rs), [identity.rs](crates/iroh-beekem/src/identity.rs), [node.rs](crates/iroh-beekem/src/node.rs) |
 
 ### Residuals from the landed phases
 
@@ -50,10 +60,21 @@ Small, verified, and homeless — each is picked up by a phase below.
 
 - **`author_seed` has no production caller.** `Workspace::assemble` still calls `author_create()`,
   minting a random author every spawn. Harmless until restart exists → **Phase 7.3**.
-- **`keyhive_crypto` is still a required downstream dependency.** `add_user` and `add_device` take
-  `MemberId` and `ShareKey`, and [lib.rs](crates/iroh-beekem/src/lib.rs) re-exports neither, so a
-  caller cannot invite anyone without adding `keyhive_crypto` to their own manifest. **0.1 freezes
-  this** — re-export both types, or wrap them → **Phase 6**, with the rest of the invite surface.
+- ~~**`keyhive_crypto` is still a required downstream dependency.**~~ **Done in Phase 6.**
+  `add_user`/`add_device` take an [`Enrollment`](crates/iroh-beekem/src/identity.rs), built by
+  `Identity::enrollment`, and [lib.rs](crates/iroh-beekem/src/lib.rs) re-exports `MemberId`,
+  `ShareKey` and `Role` for callers that need to name them anyway. Wrapped *and* re-exported rather
+  than one or the other: the wrapper is what an ordinary caller uses, and the re-exports are what
+  stops the wrapper from being a wall.
+- **Spent invite nonces do not survive a restart.** `Node::claim_invite` keeps them in memory, so a
+  crash makes an already-redeemed ticket redeemable again until it expires. Persisting them belongs
+  with the endpoint secret key → **Phase 7.2**.
+- ~~**`Signed<T>` has no domain separation, and only `InviteTerms` is tagged.**~~ **Done in Phase 6**,
+  after the first pass got the analysis wrong. `Grant` and `DeviceBinding` now carry 16-byte
+  printable-ASCII domain tags checked by `Certificate::verify`, alongside the invite's. Full reasoning
+  under *Signature domain separation* below; the standing rule is that **a new `Signed<T>` needs a tag
+  and a line in `the_signed_payload_types_cannot_share_an_encoding`** → **Phase 8**, whose `Policy` and
+  `Approval` are the next two.
 - **`Workspace::delete()` was specified and never built.** `open`/`list` land in Phase 7 and `leave`
   in Phase 8; `delete` joins the latter.
 - ~~**CLAUDE.md's coverage workflow is dangling.**~~ **Done in Phase 5.** [Makefile](Makefile) and
@@ -192,8 +213,11 @@ Two structural points survive the roster:
 - **The topic id is the founder's public key** and never rotates, so everyone ever invited knows it
   permanently. Rotating it would require a new tree id — that is, a new workspace. The roster is what
   refuses them.
-- **One leaked invite, ever, is permanent.** Phase 6's expiry stops *replay of the join*, but the
-  `tree_id`, `TopicId` and blinding secret it carries never rotate.
+- **One leaked invite, ever, is permanent.** Phase 6's signature, binding, expiry and nonce stop the
+  *join* from being replayed, and they are what a thief running this library hits. They do not
+  unlearn what the ticket already told a thief running its own: the `tree_id`, the `TopicId` and the
+  blinding secret it carries never rotate. What ends the exposure is the namespace rotation, which is
+  why a leak is a reason to remove somebody rather than a reason to reissue a ticket.
 
 ### The axis this table does not have: an insider
 
@@ -347,25 +371,136 @@ nothing.
 
 ---
 
-## Phase 6 — Invite security and the public surface
+## Phase 6 — Invite security and the public surface — **closed**
 
-The README's "invites are replayable" understates one half and overstates the other. A leaked
+The README's "invites are replayable" understated one half and overstated the other. A leaked
 `Invite` **does not grant read access**: `CgkaController::join` requires the `share_secret` whose
 `ShareKey` the inviter named in the `Add`, and that never travels in the ticket. What it *does* grant
-is the whole threat-model surface: sync and write capability on the data plane, and the topic id.
+is visibility — the replica to watch, the inviter to dial, and the blinding secret.
 
-- Add `invitee: [u8; 32]`, `not_after: u64` (absolute ms), `nonce: [u8; 16]`, and `epoch: u32` to
-  `Invite`, plus the Phase 5 `Grant` and `DeviceBinding`.
-- Sign the whole `Invite`; `join` verifies the signature and that `invitee` matches the joining
-  `Identity`.
-- **Do not add a clock to `iroh-beekem-core`.** Expiry is checked in `iroh-beekem`, which has one; if
-  the core ever needs the timestamp it arrives as data. That constraint is what makes the simulator
-  possible and is enforced by the `cargo tree` check.
-- Track consumed nonces so a ticket is single-use.
-- **Close the `keyhive_crypto` leak** while the invite surface is open: re-export or wrap `MemberId`
-  and `ShareKey` so a caller of `add_user`/`add_device` needs only `iroh-beekem`. 0.1 freezes this.
+What landed:
 
-**Ships with:** the `StolenInvite` scenario.
+- `Invite` is `Signed<InviteTerms>`, carrying `invitee`, `not_after` (absolute Unix seconds, one hour
+  out), `nonce`, `epoch`, and the Phase 5 certificate store beside the log.
+- `Invite::verify` checks, in order: the domain tag, the signature, the invitee binding, the window,
+  and that the issuer may administer under a `CapabilityStore` rooted at `tree_id`. `Workspace::join`
+  calls it and then claims the nonce — **last**, so a ticket failing an earlier check cannot burn a
+  legitimate one.
+- **Domain tags on every signed payload type**, checked before the signature: `INVITE_DOMAIN` on the
+  invite, and `GRANT_DOMAIN`/`BINDING_DOMAIN` on the certificates. The invite's alone was hygiene —
+  it was never the confusable type — and the certificates' is the part that closes something. See
+  *Signature domain separation* below, including what the first pass got wrong about this.
+- `Node::claim_invite` is the nonce ledger, on the node rather than the workspace because redeeming a
+  ticket is what *creates* a workspace. In memory only — see the residual above.
+- No clock in `iroh-beekem-core`, and none needed: every check above is local, decided once, by one
+  device, and the cost of two peers disagreeing is a refused join. The `cargo tree` check still
+  matches nothing.
+- **The `keyhive_crypto` leak is closed.** `Identity::enrollment(endpoint)` produces an `Enrollment`
+  carrying member id, leaf key and endpoint; `add_user`/`add_device` take one. `MemberId`, `ShareKey`
+  and `Role` are re-exported for callers that name them anyway.
+
+One thing was added that the plan did not name, because building it made the need visible:
+`WorkspaceState::joined` now takes the joiner's namespace generation, seeded from `Invite.epoch`. A
+joiner used to start at `NamespaceEpoch::INITIAL`, and a peer that is itself behind re-announces its
+own generation under the *current* group key on the ordinary anti-entropy schedule — so a member
+admitted at generation 3 could decrypt an announcement of generation 1, compare it against `INITIAL`,
+and move onto a replica the group abandoned before it arrived. That is the field's only consumer, and
+without it `epoch` would have been dead weight on the wire.
+
+**Shipped with:** the `StolenInvite` scenario and property 4.6 in three parts, plus two counterweights
+— one asserting the theft actually happened and bought the thief visibility, so the other three are
+not vacuous, and one asserting the remaining members converge through the rotation that ends it.
+Seven pure unit tests in [invite.rs](crates/iroh-beekem/src/invite.rs) cover the checks themselves,
+and four real-QUIC tests in `invite_security` cover the two that need a node and a clock.
+
+**The residual, stated:** signing a ticket does not encrypt it. A thief who reads one holds the
+blinding secret and the docs ticket whatever this library refuses, and the bound on that is
+`RosterGuard` plus namespace rotation — not the ticket. There is nothing in a bearer token to revoke.
+
+### Signature domain separation — closed, and larger than the invite
+
+Phase 6 first shipped `INVITE_DOMAIN` described as closing a hole. **That description was wrong, and
+the correction was worth more than the constant.** Recording both, because the wrong version is the
+kind that survives review: it names a real mechanism and points it at the wrong type.
+
+`Signed<T>` signs `bincode(payload)` with no type name and no discriminator, and `try_verify`
+recomputes it for whatever `T` the *deserializer* chose. The type is therefore decided by the
+receiving code path, not by the signed bytes, so a genuine `(issuer, signature)` pair transfers
+between any two payload types whose encodings are byte-identical. The attacker forges nothing — they
+lift the pair and reattach it. On the wire `Certificate` is an enum, so they choose the destination
+type freely.
+
+Three conditions have to hold for that to bite:
+
+1. two signed types encode to the same bytes — same length, with the attacker able to steer content;
+2. an honest key signs the source type over content the attacker influenced;
+3. the destination type grants something.
+
+Under bincode 1.3 (fixint, `u64` `Vec` prefixes, `u32` enum discriminants), **before** the tags:
+
+| Signed payload | Encoded size | Notes |
+|---|---|---|
+| `Grant` | 61 or 69 | needs a valid `Role` discriminant and `Option` tag |
+| `DeviceBinding` | **80** | *any* 80 bytes decode as one |
+| `CgkaOperation::Remove` | **≥ 88** | 4+32+4+8+8+32, plus 32 per removed key and predecessor |
+| `CgkaOperation::Add` | ≥ 120 | |
+| `InviteTerms` | ≥ ~232 | 188 fixed plus a `DocTicket`, before any log or certificates |
+
+Nothing was exploitable — condition 1 failed everywhere. But **the invite was the safest of the
+five, not the one at risk**: it missed by ~150 bytes, and the only bytes an attacker contributes
+(`invitee`) must be a valid Ed25519 point at a fixed offset, so its encoding could not be steered at
+all. Tagging it alone achieved close to nothing.
+
+**The pair that mattered was `DeviceBinding` (80) against `CgkaOperation::Remove` (≥ 88).** Eight
+bytes, both signed by the same member key, with conditions 2 and 3 already satisfied: an admin issues
+`Remove`s routinely, and an admin-signed `DeviceBinding { device: attacker, user: admin }` is a full
+escalation the closure admits without further checks. What held the eight bytes apart was
+`CgkaOperation`'s field list, which lives in `beekem` and is a **version** dependency here, not a
+pinned revision.
+
+#### What closed it
+
+`Grant` and `DeviceBinding` now begin with `GRANT_DOMAIN` and `BINDING_DOMAIN`, sixteen bytes of
+printable ASCII each, private fields stamped by `Grant::new`/`DeviceBinding::new` and checked by
+`Certificate::verify` **before** the signature — a payload signed for another purpose has a perfectly
+good signature, and `CoreError::WrongDomain` says so rather than calling it corrupt.
+
+Both properties of the tag are load-bearing, and the second is the one that is easy to lose:
+
+- **Distinct** tags mean no two tagged types can collide, whatever their sizes.
+- **Printable ASCII** means no *tagged* type can collide with an *untagged* bincode enum. A
+  discriminant is a little-endian `u32`, so bytes 1–3 of any variant index below 2²⁴ are zero, and no
+  ASCII byte is. This is what makes the `CgkaOperation` argument structural rather than a size
+  coincidence — it survives anything beekem does to its fields. A tag containing a NUL would keep the
+  first property and silently lose the second, which is why the test asserts the encoding and not
+  merely the inequality.
+
+`the_signed_payload_types_cannot_share_an_encoding` in
+[capability.rs](crates/iroh-beekem-core/src/capability.rs) holds all of it: pairwise distinctness, the
+no-zero-bytes property, the certificate-versus-operation inequality, and the encoded sizes pinned so a
+bincode or dependency change fails loudly. `the_invite_tag_is_distinct_from_every_certificate_tag` in
+[invite.rs](crates/iroh-beekem/src/invite.rs) is the cross-crate half — the constants live in crates
+with different release cadences, and nothing else notices a future tag chosen to collide.
+
+**The standing rule: a new `Signed<T>` needs a tag and a line in that test.** Phase 8.2's
+`Signed<Policy>` (~12 bytes) and `Signed<Approval>` (32 bytes) are the next two, and small
+fixed-size payloads are exactly the ones that collide.
+
+#### One thing this surfaced
+
+`a_certified_device_cannot_be_rebound` failed once the payloads grew 16 bytes, and it was right to.
+The closure iterates bindings in **digest** order and takes the first admissible one per device, so
+which of two competing bindings wins is a function of the certificate set — not of who issued first.
+The test asserted the first-*inserted* binding survived, which held only because its nonce happened to
+hash lower. It now asserts the property the code actually has: both insertion orders resolve the leaf
+to the same user, and one device resolves to exactly one. Renamed to
+`a_certified_devices_user_does_not_depend_on_arrival_order`.
+
+#### Wire-format note
+
+This is a breaking change to the certificate store: certificates minted before it fail
+`Certificate::verify` with `WrongDomain`. Nothing depends on that ordering yet — Phase 6 had already
+broken `iroh-beekem-core`'s API — but it lands before 0.1 rather than after for exactly that reason.
 
 ---
 
@@ -498,7 +633,7 @@ Post-0.1 and non-breaking, which is why it ranks last despite the quadratic grow
 
 One `Scenario` per user story in [docs/USER_STORIES.md](docs/USER_STORIES.md). Existing scenarios:
 `Honest`, `Churn`, `Forging`, `Eviction`, `Outsider`, `Crud`, `CrudChurn`. Absent, and named by the
-phase that brings them: `Insider` and `Revenant` (Phase 5), `StolenInvite` (Phase 6), `OfflineEdit`
+phase that brings them: `Insider` and `Revenant` (Phase 5), `StolenInvite` (Phase 6, landed), `OfflineEdit`
 (Phase 7), `Onboarding` (unblocked already — see Story 1).
 
 ### Cross-cutting — asserted in *every* scenario
@@ -596,7 +731,7 @@ guards against a rejected insider issuing `RequestRepair` forever.
 | # | Property | Status |
 |---|---|---|
 | 4.5 | A forging node's entries never enter any honest node's index | **new** |
-| 4.6 | A replayed invite never enters `users()`, never decrypts content, and after the next rotation its `observed_keys()` stops growing | **new** (Phase 6, `StolenInvite`) |
+| 4.6 | A replayed invite never enters `users()`, never decrypts content, and after the next rotation its `observed_keys()` stops growing | **landed** (Phase 6, `a_stolen_invite_buys_only_visibility`) |
 
 **Read the scope of this story literally.** Every adversary here sits *outside* the group. **No
 property in this story constrains a member** — that is why the insider finding survived a green

@@ -96,7 +96,10 @@ fn two_node_workspace() -> Bus {
 
     Bus {
         alice,
-        bob: WorkspaceState::joined(bob_cgka, secret),
+        // Generation zero: these buses never rotate the namespace, so a
+        // joiner seeded anywhere else would be describing a run that does not
+        // happen here.
+        bob: WorkspaceState::joined(bob_cgka, secret, 0),
         to_bob: Vec::new(),
         certs_to_bob: Vec::new(),
         to_alice: Vec::new(),
@@ -828,7 +831,7 @@ mod roles_are_enforced {
 
         let cgka = CgkaController::join(doc_id, bob_signer, bob_secret, &log, &bindings)
             .expect("the log replays: every `Add` is authorised by a binding");
-        let mut bob = WorkspaceState::joined(cgka, WorkspaceSecret::generate(&mut rng(5)));
+        let mut bob = WorkspaceState::joined(cgka, WorkspaceSecret::generate(&mut rng(5)), 0);
 
         assert_eq!(
             bob.capabilities().role_of(&bob.member_id().to_bytes()),
@@ -1042,7 +1045,7 @@ mod repair_reaches_a_member_admitted_late {
         let bob_cgka =
             CgkaController::join(doc_id, bob_signer, bob_secret, &log, &certs).expect("bob joins");
 
-        let mut bus = Bus::new(alice, WorkspaceState::joined(bob_cgka, secret), bob_id);
+        let mut bus = Bus::new(alice, WorkspaceState::joined(bob_cgka, secret, 0), bob_id);
         bus.queue_for_bob(admission);
         (bus, stale)
     }
@@ -2125,13 +2128,9 @@ mod authorization_is_verified_by_the_receiver {
         user: [u8; 32],
         nonce: u8,
     ) -> Certificate {
-        DeviceBinding {
-            device,
-            user,
-            nonce: [nonce; 16],
-        }
-        .sign(signer)
-        .expect("signing is infallible with a memory signer")
+        DeviceBinding::new(device, user, [nonce; 16])
+            .sign(signer)
+            .expect("signing is infallible with a memory signer")
     }
 
     /// Given a workspace where bob holds no administrative capability, when bob
@@ -2233,15 +2232,15 @@ mod authorization_is_verified_by_the_receiver {
         let mut ins = insider_workspace(Role::Viewer);
         let bob_user = ins.bob_id.to_bytes();
 
-        let promotion = Grant {
-            subject: bob_user,
-            capability: Role::Admin,
+        let promotion = Grant::new(
+            bob_user,
+            Role::Admin,
             // Far beyond anything an admin has issued, so the attack cannot be
             // dismissed as merely losing the `(seq, digest)` tie-break.
-            seq: u64::MAX,
-            not_after: None,
-            nonce: [3u8; 16],
-        }
+            u64::MAX,
+            None,
+            [3u8; 16],
+        )
         .sign(&ins.bob_signer)
         .expect("signing is infallible with a memory signer");
 

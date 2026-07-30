@@ -21,6 +21,17 @@ pub enum CoreError {
     #[error("control operation signature verification failed")]
     BadSignature,
 
+    /// A correctly-signed payload was not a certificate of the kind it arrived
+    /// as: its domain tag is absent or belongs to another type.
+    ///
+    /// Distinct from [`Self::BadSignature`] because the two say opposite things
+    /// about the issuer. A bad signature means nobody vouched for these bytes; a
+    /// wrong domain means somebody *did* — and the signature is being presented
+    /// as authorising something they never agreed to. See the domain constants in
+    /// [`crate::capability`] for the confusion this refuses.
+    #[error("certificate carries the wrong domain tag")]
+    WrongDomain,
+
     /// A correctly-signed operation was issued by a key that no `Add` in the
     /// accepted history ever named.
     ///

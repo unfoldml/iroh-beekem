@@ -243,6 +243,20 @@ pub trait Scenario: Clone + Default + 'static {
     /// all. It is on the network and receives every broadcast, and the only
     /// thing standing between it and the workspace is the roster.
     const OUTSIDER: Option<u64> = None;
+    /// Which node redeems a ticket that was issued to somebody else, if any.
+    ///
+    /// A third kind of outsider, and the distinction from [`Self::OUTSIDER`] is
+    /// what makes the scenario worth having: a plain outsider knows nothing and
+    /// is refused by the roster before it observes anything at all. A thief holds
+    /// a genuine [`Msg::Welcome`] — the inviter's identity, the replica the
+    /// ticket names, the whole operation log — and is refused by *less*. What it
+    /// still cannot obtain is the invitee's leaf secret, which never travels in a
+    /// ticket, so it can watch the replica and decrypt nothing.
+    ///
+    /// The thief ignores the invitee binding, as an attacker running its own code
+    /// would. Modelling it as honouring the check would make every property below
+    /// pass for the wrong reason.
+    const INVITE_THIEF: Option<u64> = None;
 }
 
 /// The base protocol: joins, edits and anti-entropy, nothing adversarial.
@@ -323,6 +337,28 @@ impl Scenario for Revenant {
     const WRITE_AFTER_REVOKE: bool = true;
 }
 
+/// A stranger holding a copy of somebody else's admission ticket.
+///
+/// The scenario for what an `Invite` is actually worth to a thief. It is *not*
+/// a read capability: joining needs the invitee's leaf secret, which never
+/// travels in a ticket, so the thief reconstructs no group state and decrypts
+/// nothing. What it does hold is a metadata capability — the inviter to dial and
+/// the replica to watch — and the properties are about the size of that.
+///
+/// Node 3 steals; node 2 is removed partway through, which is the group's actual
+/// remedy for a leaked ticket: the removal rotates the namespace, and the thief
+/// cannot follow because following needs the group key it never had.
+/// `WRITE_AFTER_REVOKE` is what makes "stops growing" mean something — without
+/// post-rotation content there is nothing the thief could have gone on seeing,
+/// and a rotation that did nothing at all would pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StolenInvite;
+impl Scenario for StolenInvite {
+    const INVITE_THIEF: Option<u64> = Some(3);
+    const REVOKE: Option<u64> = Some(2);
+    const WRITE_AFTER_REVOKE: bool = true;
+}
+
 /// Content driven entirely by generated CRUD operations.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Crud;
@@ -356,7 +392,35 @@ pub enum Msg {
     /// and in a real deployment this message must travel over an authenticated,
     /// encrypted channel — which is exactly what an `iroh` QUIC stream to a
     /// known public key provides.
+    ///
+    /// The counterpart of `Invite`. It models the two fields of a hardened
+    /// invite that change what the *protocol* does — the invitee binding and the
+    /// namespace generation — and deliberately not the two that do not:
+    /// `not_after` and the single-use nonce are decided against a wall clock and
+    /// a per-node ledger, both of which live in `iroh-beekem` for the same reason
+    /// the core has no clock. Modelling them here would be modelling the
+    /// transport's bookkeeping rather than the protocol's behaviour.
     Welcome {
+        /// The device this ticket admits, and the only one that may redeem it.
+        ///
+        /// An honest node that receives a `Welcome` naming somebody else drops
+        /// it. That is not what stops a thief — a thief runs its own code — it is
+        /// what stops a misdirected or replayed ticket from being redeemed by a
+        /// well-behaved peer, and it is the modelled half of `Invite.invitee`.
+        invitee: MemberId,
+        /// The replica this admission is against.
+        ///
+        /// The whole [`NamespaceEpoch`] and not merely its generation, because
+        /// here it *is* the replica identifier: production hands the joiner an
+        /// `iroh-docs` ticket, which names one replica exactly, and the digest is
+        /// this model's stand-in for that. Only the generation reaches
+        /// `WorkspaceState::joined`, mirroring production exactly — the joiner is
+        /// given the half of the capability its role allows and so cannot
+        /// reproduce the digest the rest of the group computed over the whole of
+        /// it. Seeding the generation is what stops a peer still on an older one
+        /// from re-announcing it and pulling a fresh joiner onto a replica the
+        /// group has already abandoned.
+        namespace: NamespaceEpoch,
         /// The full CGKA operation log, in causal order.
         log: Vec<Signed<CgkaOperation>>,
         /// The capability certificates for the workspace.
@@ -646,6 +710,14 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// any node could apply anything — and a real client queues an edit made
     /// while it is still connecting rather than discarding it.
     deferred_ops: Vec<(OpToken, WsOp)>,
+    /// Whether this node has redeemed a ticket issued to somebody else.
+    ///
+    /// Only ever true for [`Scenario::INVITE_THIEF`]. Recorded rather than
+    /// inferred from the scenario constant because it marks the moment the leak
+    /// *landed*: before it, the thief is indistinguishable from an outsider, and
+    /// a property that could not tell the two apart would pass in a run where the
+    /// ticket never arrived.
+    stolen_invite: bool,
     _scenario: PhantomData<S>,
 }
 
@@ -768,6 +840,22 @@ impl<S: Scenario> WorkspaceNode<S> {
     #[must_use]
     pub fn has_joined(&self) -> bool {
         self.state.is_some()
+    }
+
+    /// Whether this node is the one the scenario has steal a ticket.
+    #[must_use]
+    pub fn is_invite_thief(&self) -> bool {
+        S::INVITE_THIEF == Some(self.me)
+    }
+
+    /// Whether a stolen ticket has actually reached this node yet.
+    ///
+    /// Distinct from [`Self::is_invite_thief`], which is true from `on_start`.
+    /// A property about what a stolen ticket buys is vacuous until the theft has
+    /// happened, so it asserts on this and not on the scenario constant.
+    #[must_use]
+    pub fn holds_stolen_invite(&self) -> bool {
+        self.stolen_invite
     }
 
     /// The default document's text as this node currently sees it.
@@ -1516,14 +1604,27 @@ impl<S: Scenario> WorkspaceNode<S> {
         // joiner's own binding and grant — which is what lets it arrive certified
         // rather than needing a second exchange.
         let certs = state.capabilities().certificates();
-        cx.send(
-            from,
-            Msg::Welcome {
-                log,
-                certs,
-                secret: workspace_secret_bytes(),
-            },
-        );
+        let welcome = Msg::Welcome {
+            invitee: member,
+            namespace: self.namespace,
+            log,
+            certs,
+            secret: workspace_secret_bytes(),
+        };
+        cx.send(from, welcome.clone());
+
+        // The leak, injected where the ticket exists rather than modelled as an
+        // interception: a `Welcome` is unicast, exactly as an `Invite` travels
+        // over an authenticated QUIC stream, so no eavesdropper on this network
+        // could obtain one. What `StolenInvite` models is a ticket copied *out of
+        // band* — pasted into a chat, left in a shell history — and the only
+        // faithful way to inject that is to hand the thief the same bytes the
+        // invitee got.
+        if let Some(thief) = S::INVITE_THIEF {
+            cx.send(NodeId(thief), welcome);
+        } else {
+            // No thief in this scenario.
+        }
 
         // Re-announce current state, exactly as `Workspace` does when a peer
         // appears on the gossip overlay. Without this the simulator omits a
@@ -1537,9 +1638,16 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.republish(cx);
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per `Msg::Welcome` field, destructured at the call site; \
+                  passing the message itself would only move the destructuring inside"
+    )]
     fn on_welcome(
         &mut self,
         from: NodeId,
+        invitee: MemberId,
+        namespace: NamespaceEpoch,
         log: &[Signed<CgkaOperation>],
         certs: &[Certificate],
         secret: [u8; 32],
@@ -1551,12 +1659,29 @@ impl<S: Scenario> WorkspaceNode<S> {
         let (Some(signer), Some(share_secret)) = (self.signer.clone(), self.share_secret) else {
             return;
         };
+        // Somebody else's ticket. Refused rather than attempted: `CgkaController::join`
+        // would fail anyway for want of the leaf secret, but failing *there* would
+        // report "the log does not admit me", which is the diagnosis for a lost race
+        // and not for a misaddressed ticket. An honest node must be able to tell the
+        // two apart, and after Phase 6 the real `Workspace::join` can.
+        if MemberId::from(signer.verifying_key()) != invitee {
+            return;
+        }
         // A `Welcome` that lost a race against a later membership change may not
         // yet name us; that is an early arrival, not a failure.
         let Ok(cgka) = CgkaController::join(tree_id(), signer, share_secret, log, certs) else {
             return;
         };
-        self.state = Some(WorkspaceState::joined(cgka, WorkspaceSecret::new(secret)));
+        self.state = Some(WorkspaceState::joined(
+            cgka,
+            WorkspaceSecret::new(secret),
+            namespace.epoch,
+        ));
+        // The replica the ticket named is now this node's, so entries stamped
+        // with it are the ones it should be seeing. Set from the message rather
+        // than left at `INITIAL`, which would have a joiner admitted after a
+        // rotation filtering out every entry the group is actually writing.
+        self.namespace = namespace;
         // The inviter, accepted on faith until a manifest arrives to derive a
         // real roster from. `Invite.inviter` plays exactly this role in
         // `Workspace::join`; without it the joiner would refuse the very
@@ -1567,6 +1692,38 @@ impl<S: Scenario> WorkspaceNode<S> {
         // Client operations issued while this node was still onboarding apply
         // now, in arrival order, rather than having been discarded.
         self.flush_deferred_ops(cx);
+    }
+
+    /// Take everything a ticket issued to somebody else can be made to give up.
+    ///
+    /// The thief's path, and deliberately not a call into [`Self::on_welcome`]:
+    /// that function honours the invitee binding, and an attacker running its own
+    /// code would not. What is modelled here is the *maximum* a thief can extract
+    /// from the bytes, so that the properties bound the real exposure rather than
+    /// the exposure of an attacker that plays fair.
+    ///
+    /// It takes two things and fails at a third:
+    ///
+    /// * the inviter, accepted on faith and so a peer whose broadcasts it will
+    ///   admit — the modelled counterpart of importing `Invite.doc_ticket`, whose
+    ///   embedded addresses are what a thief would dial;
+    /// * the replica the ticket names, so entries stamped with it are visible;
+    /// * and **not** a [`WorkspaceState`], because building one needs the
+    ///   invitee's leaf secret and no ticket carries it. `state` stays `None`,
+    ///   which is why the thief decrypts nothing however much it can see.
+    ///
+    /// The blinding secret is a simulation-wide constant, so "the ticket carried
+    /// the workspace secret" is not observable here and is not what these
+    /// properties are about. What the ticket confers in this model is visibility,
+    /// and visibility is exactly what the index measures.
+    fn on_stolen_welcome(&mut self, from: NodeId, namespace: NamespaceEpoch) {
+        if self.stolen_invite {
+            // One ticket is enough; later copies add nothing.
+            return;
+        }
+        self.stolen_invite = true;
+        self.bootstrap.insert(from);
+        self.namespace = namespace;
     }
 
     /// Publish this node's transport address into the manifest.
@@ -1618,6 +1775,11 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
             // and nobody who accepts it. It still receives every broadcast the
             // simulator delivers, which is what makes "observes nothing" a
             // claim about the roster rather than about the network.
+        } else if S::INVITE_THIEF == Some(me.0) {
+            // Silent for the same reason as an outsider, and for one more: a
+            // thief that sent a `Hello` would be *legitimately admitted*, and
+            // the scenario would stop being about a stolen ticket. It waits for
+            // the leak, and everything it gains it gains from those bytes.
         } else {
             // A joiner accepts its inviter from the outset, before it has any
             // state of its own. This models `Invite.inviter`, which reaches the
@@ -1679,8 +1841,38 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         }
         match msg {
             Msg::Hello { member, share_key } => self.on_hello(from, member, share_key, cx),
-            Msg::Welcome { log, certs, secret } => {
-                self.on_welcome(from, &log, &certs, secret, cx);
+            // The thief first, because the two paths differ in exactly the way
+            // the scenario is about: `on_welcome` honours the invitee binding and
+            // an attacker does not.
+            Msg::Welcome { namespace, .. } if self.is_invite_thief() => {
+                self.on_stolen_welcome(from, namespace);
+            }
+            Msg::Welcome {
+                invitee,
+                namespace,
+                log,
+                certs,
+                secret,
+            } => {
+                self.on_welcome(from, invitee, namespace, &log, &certs, secret, cx);
+            }
+            // A thief never builds state, so without this arm every entry it
+            // receives would land in the inbox below and its index would stay
+            // empty — which would make "a stolen ticket lets you watch the
+            // replica" untestable by making it look already false. Observed and
+            // never decrypted, which is precisely the exposure being bounded.
+            Msg::Entry {
+                namespace,
+                key,
+                author,
+                chunk,
+            } if self.stolen_invite && self.state.is_none() => {
+                if namespace == self.namespace {
+                    self.observe(key, author, &chunk);
+                } else {
+                    // A replica this ticket does not name. After the rotation
+                    // that is every entry, which is the point.
+                }
             }
             other if self.state.is_none() => {
                 // Not joined yet: hold this rather than dropping it. A dropped

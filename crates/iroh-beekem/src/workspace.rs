@@ -12,19 +12,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use beekem::{
-    id::{MemberId, TreeId},
-    operation::CgkaOperation,
-};
+use beekem::id::{MemberId, TreeId};
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    AuthorizedOp, Certificate, CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event,
-    FileEntry, NamespaceEpoch, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
+    AuthorizedOp, CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
+    NamespaceEpoch, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::store::mem::MemStore;
 use iroh_docs::{
-    AuthorId, DocTicket, NamespaceId,
+    AuthorId, NamespaceId,
     api::{
         Doc,
         protocol::{AddrInfoOptions, ShareMode},
@@ -36,7 +33,7 @@ use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
     proto::TopicId,
 };
-use keyhive_crypto::{share_key::ShareKey, signed::Signed, verifiable::Verifiable};
+use keyhive_crypto::{signer::memory::MemorySigner, verifiable::Verifiable};
 use n0_future::StreamExt;
 use rand::{CryptoRng, RngCore};
 use tokio::{
@@ -46,49 +43,12 @@ use tokio::{
 
 use crate::{
     error::WorkspaceError,
-    identity::Identity,
+    identity::{Enrollment, Identity},
+    invite::{INVITE_DOMAIN, Invite, InviteError, InviteTerms, unix_now},
     node::Node,
     roster::Roster,
     wire::{ControlMsg, NamespaceCapability, decode_chunk, encode_chunk},
 };
-
-/// Everything a new member needs to join.
-///
-/// The operation log is public, signed data; the other two fields are not.
-/// This whole ticket must therefore be delivered over an authenticated,
-/// confidential channel — a direct `iroh` QUIC stream to a known public key
-/// qualifies, a public gossip topic does not.
-///
-/// # The write-capability caveat
-///
-/// `doc_ticket` carries the `iroh-docs` **write** capability, which is
-/// all-or-nothing: there is no per-member write key. A revoked member keeps
-/// this capability and can still push entries into the replica. They cannot
-/// *read* anything written after their removal — that is what the CGKA
-/// guarantees — but shutting off their writes requires rotating to a fresh
-/// namespace, which is not automatic. Applications that care should check the
-/// author against the manifest roles before accepting an entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Invite {
-    /// The CGKA tree id, as raw bytes.
-    pub tree_id: [u8; 32],
-    /// A write ticket for the `iroh-docs` namespace, including peer addresses.
-    pub doc_ticket: DocTicket,
-    /// The blinding secret for storage keys.
-    pub workspace_secret: [u8; 32],
-    /// The full CGKA operation log, in causal order.
-    pub log: Vec<Signed<CgkaOperation>>,
-    /// The capability certificates for the workspace.
-    ///
-    /// Public, signed data like the log, and not optional: they authorise every
-    /// `Add` the log contains, so a joiner handed the log without them would
-    /// refuse the whole history including its own admission. They also carry the
-    /// joiner's own binding and grant, which is what lets it arrive certified
-    /// rather than needing a second round trip.
-    pub certs: Vec<Certificate>,
-    /// The inviter's endpoint, so the joiner can also gossip with them.
-    pub inviter: EndpointId,
-}
 
 /// One person in the workspace, with everything an application needs to show
 /// them: their role, and the devices acting on their behalf.
@@ -137,6 +97,15 @@ struct Inner {
     author: AuthorId,
     gossip_tx: GossipSender,
     secret: WorkspaceSecret,
+    /// This device's signing key, for signing invites.
+    ///
+    /// A second handle on the key `CgkaController` already holds, not a second
+    /// key. Kept here because an [`Invite`] is a transport-layer object — it
+    /// names an `iroh-docs` ticket and an `EndpointId`, neither of which the
+    /// I/O-free core knows about — so the core has no business signing one, and
+    /// the alternative of a generic `sign<T>` on `CgkaController` would be a
+    /// signing oracle over the device key for any payload a caller invents.
+    signer: MemorySigner,
     /// The content hash last ingested for each (blinded key, author) pair.
     ///
     /// `ingest_all` re-reads every entry on every sync event, and with several
@@ -386,7 +355,16 @@ impl Workspace {
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
         let state = WorkspaceState::found(cgka, WorkspaceSecret::new(secret.to_bytes()))?;
-        let workspace = Self::assemble(node, state, secret, doc, tree_id, Vec::new()).await?;
+        let workspace = Self::assemble(
+            node,
+            state,
+            secret,
+            doc,
+            tree_id,
+            identity.signer(),
+            Vec::new(),
+        )
+        .await?;
         workspace.set_info(info).await?;
         Ok(workspace)
     }
@@ -396,12 +374,21 @@ impl Workspace {
     /// `identity` must be the device whose [`share_key`](Identity::share_key)
     /// the inviter named when admitting it. The secret half never travels in
     /// the invite, which is what makes an intercepted invite useless for
-    /// joining.
+    /// *reading*; the checks below are what make it useless for joining.
+    ///
+    /// Four things are checked before any state is built, in this order:
+    /// the ticket's signature and the issuer's authority, that it names this
+    /// device, that it has not expired, and that this node has not redeemed it
+    /// before. The first three are [`Invite::verify`]; the fourth is
+    /// [`Node::claim_invite`], and it comes last on purpose — a ticket that
+    /// fails any earlier check must not consume the nonce, or a garbled copy
+    /// would burn a legitimate ticket.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkspaceError::Invite`] if the log does not admit this device,
-    /// and propagates endpoint and storage failures.
+    /// Returns [`WorkspaceError::Invite`] if any of those checks fails,
+    /// [`WorkspaceError::NotAdmitted`] if the log the ticket carries does not
+    /// admit this device, and propagates endpoint and storage failures.
     pub async fn join<R: CryptoRng + RngCore>(
         node: Node,
         invite: &Invite,
@@ -410,12 +397,21 @@ impl Workspace {
     ) -> Result<Self, WorkspaceError> {
         let signer = identity.signer();
         let share_secret = identity.share_secret();
+
+        invite.verify(identity.member_id().to_bytes(), unix_now()?)?;
+        if node.claim_invite(invite.tree_id(), invite.nonce()) {
+            // First redemption on this node; the nonce is now spent.
+        } else {
+            return Err(WorkspaceError::Invite(InviteError::Replayed));
+        }
+        let terms = invite.terms();
+
         let tree_id = TreeId::from(
-            ed25519_verifying_key(&invite.tree_id)
-                .ok_or_else(|| WorkspaceError::Invite("malformed tree id".into()))?,
+            ed25519_verifying_key(&terms.tree_id).ok_or(InviteError::MalformedTreeId)?,
         );
-        let cgka = CgkaController::join(tree_id, signer, share_secret, &invite.log, &invite.certs)?;
-        let secret = WorkspaceSecret::new(invite.workspace_secret);
+        let cgka = CgkaController::join(tree_id, signer, share_secret, &terms.log, &terms.certs)
+            .map_err(|e| WorkspaceError::NotAdmitted(e.to_string()))?;
+        let secret = WorkspaceSecret::new(terms.workspace_secret);
 
         // `import` installs the capability *and* starts syncing with the peers
         // named in the ticket; `open` would fail here because a joiner has
@@ -423,7 +419,7 @@ impl Workspace {
         let doc = node
             .docs()
             .api()
-            .import(invite.doc_ticket.clone())
+            .import(terms.doc_ticket.clone())
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
@@ -431,20 +427,42 @@ impl Workspace {
         // peer each node forms its own disjoint overlay and no CGKA operation
         // ever crosses between them — the data plane would sync while the
         // control plane silently did not, leaving every chunk undecryptable.
-        let state = WorkspaceState::joined(cgka, WorkspaceSecret::new(secret.to_bytes()));
-        let workspace =
-            Self::assemble(node, state, secret, doc, tree_id, vec![invite.inviter]).await?;
-        workspace.sync_with(invite.inviter).await?;
+        //
+        // The namespace generation comes from the ticket because the joiner
+        // cannot derive it: starting at `INITIAL` instead would let a peer that
+        // is itself behind re-announce an older generation and pull this node
+        // onto a replica the group abandoned before it arrived.
+        let state =
+            WorkspaceState::joined(cgka, WorkspaceSecret::new(secret.to_bytes()), terms.epoch);
+        let inviter = terms.inviter;
+        let workspace = Self::assemble(
+            node,
+            state,
+            secret,
+            doc,
+            tree_id,
+            identity.signer(),
+            vec![inviter],
+        )
+        .await?;
+        workspace.sync_with(inviter).await?;
         Ok(workspace)
     }
 
     /// Wire up the pump loops shared by [`Self::create`] and [`Self::join`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is a distinct piece of already-constructed state that \
+                  `create` and `join` build differently; bundling them into a struct would \
+                  add a type whose only purpose is to be destructured on the next line"
+    )]
     async fn assemble(
         node: Node,
         state: WorkspaceState,
         secret: WorkspaceSecret,
         doc: Doc,
         tree_id: TreeId,
+        signer: MemorySigner,
         bootstrap: Vec<EndpointId>,
     ) -> Result<Self, WorkspaceError> {
         let topic = topic_for(tree_id);
@@ -483,6 +501,7 @@ impl Workspace {
             author,
             gossip_tx,
             secret,
+            signer,
             seen_entries: Mutex::new(HashMap::new()),
             neighbor_cooldown: Mutex::new(Cooldown::new(NEIGHBOR_COOLDOWN)),
             repair_cooldown: Mutex::new(Cooldown::new(REPAIR_COOLDOWN)),
@@ -658,36 +677,36 @@ impl Workspace {
     /// capability the invite carries: a viewer's ticket grants read access to
     /// the replica, an editor's grants write.
     ///
-    /// `endpoint` is the invitee's transport address, and admits them to this
-    /// node's roster before the invite is handed over. It is required rather
-    /// than optional because the alternative is a deadlock: an admitted device
-    /// cannot sync until it is on somebody's roster, and it cannot reach a
-    /// roster until its address has propagated through the manifest — which it
-    /// cannot receive without syncing. The caller already has to obtain the
-    /// invitee's `member` and `share_key` out of band, so their `EndpointId`
-    /// comes from the same exchange at no extra cost.
+    /// The [`Enrollment`] carries the invitee's transport address as well as
+    /// their key material, and that address admits them to this node's roster
+    /// before the invite is handed over. It is required rather than optional
+    /// because the alternative is a deadlock: an admitted device cannot sync
+    /// until it is on somebody's roster, and it cannot reach a roster until its
+    /// address has propagated through the manifest — which it cannot receive
+    /// without syncing. The caller already has to obtain the invitee's key
+    /// material out of band, so their `EndpointId` comes from the same exchange
+    /// at no extra cost.
     ///
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Core`] wrapping `NotAnAdmin` unless this node
-    /// is an admin, and propagates CGKA failures.
+    /// is an admin, [`WorkspaceError::Identity`] if the enrollment is malformed,
+    /// and propagates CGKA failures.
     pub async fn add_user(
         &self,
-        member: MemberId,
-        share_key: ShareKey,
-        endpoint: EndpointId,
+        enrollment: &Enrollment,
         role: Role,
         display_name: &str,
     ) -> Result<Invite, WorkspaceError> {
         self.drive(Event::AddUser {
-            member,
-            share_key,
+            member: enrollment.member_id()?,
+            share_key: enrollment.share_key(),
             role,
             display_name: display_name.to_string(),
-            endpoint: Some(*endpoint.as_bytes()),
+            endpoint: Some(enrollment.endpoint()?.as_bytes().to_owned()),
         })
         .await?;
-        self.build_invite(role).await
+        self.build_invite(enrollment.member_bytes(), role).await
     }
 
     /// Admit another device for an existing person.
@@ -699,28 +718,27 @@ impl Workspace {
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Core`] wrapping `NotThisUsersDevice` if this
-    /// node may not act for `user`.
+    /// node may not act for `user`, and [`WorkspaceError::Identity`] if the
+    /// enrollment is malformed.
     pub async fn add_device(
         &self,
-        member: MemberId,
-        share_key: ShareKey,
-        endpoint: EndpointId,
+        enrollment: &Enrollment,
         user: [u8; 32],
         label: &str,
     ) -> Result<Invite, WorkspaceError> {
         self.drive(Event::AddDevice {
-            member,
-            share_key,
+            member: enrollment.member_id()?,
+            share_key: enrollment.share_key(),
             user,
             label: label.to_string(),
-            endpoint: Some(*endpoint.as_bytes()),
+            endpoint: Some(enrollment.endpoint()?.as_bytes().to_owned()),
         })
         .await?;
         let role = {
             let state = self.inner.state.lock().await;
             state.capabilities().role_of(&user).unwrap_or(Role::Viewer)
         };
-        self.build_invite(role).await
+        self.build_invite(enrollment.member_bytes(), role).await
     }
 
     /// Build the ticket a freshly admitted device needs.
@@ -729,10 +747,23 @@ impl Workspace {
     /// key, so a write ticket is impossible to withdraw short of rotating the
     /// namespace — handing one to somebody who is not supposed to write is a
     /// capability given away for nothing.
-    async fn build_invite(&self, role: Role) -> Result<Invite, WorkspaceError> {
-        let (log, certs) = {
+    ///
+    /// `invitee` is the device the ticket is minted *for*, and it goes inside
+    /// the signature: without it a leaked ticket is a bearer token any holder
+    /// can redeem, and with it a thief has to break Ed25519 to re-address one.
+    ///
+    /// The log and the certificates are taken *after* the admission that
+    /// preceded this call, so the bundle already contains the invitee's own
+    /// binding and grant — which is what lets it arrive certified rather than
+    /// waiting for a second exchange.
+    async fn build_invite(&self, invitee: [u8; 32], role: Role) -> Result<Invite, WorkspaceError> {
+        let (log, certs, epoch) = {
             let state = self.inner.state.lock().await;
-            (state.op_log()?, state.capabilities().certificates())
+            (
+                state.op_log()?,
+                state.capabilities().certificates(),
+                state.namespace().epoch,
+            )
         };
         let mode = if role.can_write() {
             ShareMode::Write
@@ -745,14 +776,23 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
-        Ok(Invite {
-            tree_id: *self.tree_id.as_bytes(),
-            doc_ticket,
-            workspace_secret: self.inner.secret.to_bytes(),
-            log,
-            certs,
-            inviter: self.endpoint_id(),
-        })
+        let (nonce, not_after) = Invite::terms_now(&mut rand::rngs::OsRng)?;
+        Ok(Invite::sign(
+            InviteTerms {
+                domain: INVITE_DOMAIN,
+                tree_id: *self.tree_id.as_bytes(),
+                invitee,
+                not_after,
+                nonce,
+                epoch,
+                doc_ticket,
+                workspace_secret: self.inner.secret.to_bytes(),
+                log,
+                certs,
+                inviter: self.endpoint_id(),
+            },
+            &self.inner.signer,
+        )?)
     }
 
     /// Revoke one device, so it cannot read anything written afterwards.

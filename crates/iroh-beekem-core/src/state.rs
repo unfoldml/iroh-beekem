@@ -741,8 +741,28 @@ impl WorkspaceState {
     /// The manifest starts empty, which for a joiner is correct — theirs
     /// arrives by sync. A *founder* must use [`Self::found`] instead, or the
     /// workspace begins with no admin and can never gain one.
+    ///
+    /// `namespace_epoch` is the generation the joiner's replica capability
+    /// belongs to, which the admitter knows and the joiner does not. Starting a
+    /// joiner at [`NamespaceEpoch::INITIAL`] instead is not merely imprecise: a
+    /// peer that is itself behind re-announces its own generation on the
+    /// ordinary [`Event::ResyncNamespace`] schedule, and that announcement is
+    /// encrypted under the *current* group key, so a joiner admitted at
+    /// generation 3 can decrypt an announcement of generation 1 and — comparing
+    /// it against `INITIAL` — adopt it. It would then leave the namespace the
+    /// group is actually using for one it has abandoned, and stay there until
+    /// the next rotation. Seeding the generation is what makes the
+    /// "an announcement no newer than what we hold is dropped" test mean what it
+    /// says from the joiner's first message onwards.
+    ///
+    /// The digest stays all-zero rather than being derived from the joiner's own
+    /// ticket, because the joiner is handed the *role-appropriate half* of the
+    /// capability and cannot reproduce the digest the rest of the group computed
+    /// over the whole of it. All-zero is the smallest digest, so a re-announcement
+    /// of the generation the joiner is already on is adopted a second time —
+    /// a redundant re-import, never a move backwards.
     #[must_use]
-    pub fn joined(cgka: CgkaController, secret: WorkspaceSecret) -> Self {
+    pub fn joined(cgka: CgkaController, secret: WorkspaceSecret, namespace_epoch: u32) -> Self {
         Self {
             cgka,
             secret,
@@ -756,7 +776,10 @@ impl WorkspaceState {
             repairs_answered: 0,
             last_ref: HashMap::new(),
             endpoint_id: None,
-            namespace: NamespaceEpoch::INITIAL,
+            namespace: NamespaceEpoch {
+                epoch: namespace_epoch,
+                ..NamespaceEpoch::INITIAL
+            },
             namespace_ticket: Vec::new(),
         }
     }
@@ -773,7 +796,9 @@ impl WorkspaceState {
     ///
     /// Returns [`CoreError::Manifest`] if the initial role cannot be recorded.
     pub fn found(cgka: CgkaController, secret: WorkspaceSecret) -> Result<Self, CoreError> {
-        let mut this = Self::joined(cgka, secret);
+        // Generation zero by definition: the founder *is* the first namespace,
+        // so there is no earlier one it could be told about.
+        let mut this = Self::joined(cgka, secret, NamespaceEpoch::INITIAL.epoch);
         // The founder is their own user, and this device is that user's first —
         // which makes the user id and the member id the same bytes here, and
         // only here.

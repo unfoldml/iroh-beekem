@@ -583,12 +583,7 @@ impl CgkaController {
         user: [u8; 32],
         nonce: [u8; 16],
     ) -> Result<Certificate, CoreError> {
-        let cert = DeviceBinding {
-            device,
-            user,
-            nonce,
-        }
-        .sign(&self.signer)?;
+        let cert = DeviceBinding::new(device, user, nonce).sign(&self.signer)?;
         self.certs.insert(cert.clone())?;
         Ok(cert)
     }
@@ -608,14 +603,8 @@ impl CgkaController {
         capability: Role,
         nonce: [u8; 16],
     ) -> Result<Certificate, CoreError> {
-        let cert = Grant {
-            subject: user,
-            capability,
-            seq: self.certs.next_seq(&user),
-            not_after: None,
-            nonce,
-        }
-        .sign(&self.signer)?;
+        let cert = Grant::new(user, capability, self.certs.next_seq(&user), None, nonce)
+            .sign(&self.signer)?;
         self.certs.insert(cert.clone())?;
         Ok(cert)
     }

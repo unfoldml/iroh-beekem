@@ -1280,3 +1280,188 @@ mod a_removed_member_is_evicted_again {
         .run(deterministic());
     }
 }
+
+/// What a stolen admission ticket is actually worth — Story 4, property 4.6.
+///
+/// The README used to say invites are "replayable", which understated one half
+/// and overstated the other. A leaked ticket does **not** grant read access:
+/// joining needs the invitee's leaf secret, whose public half the inviter named
+/// in the `Add`, and that secret never travels in a ticket. What it does grant is
+/// visibility — the inviter to dial and the replica to watch.
+///
+/// The scenario models a thief that ignores every check this library performs,
+/// because an attacker runs its own code. So none of what follows is a claim
+/// about the invitee binding, the expiry or the single-use nonce; those are
+/// verified against the real `Invite` in the `iroh-beekem` suite, where the clock
+/// and the nonce ledger live. What follows is a claim about what remains once an
+/// attacker has ignored all three: it can watch, it cannot read, and a namespace
+/// rotation ends even the watching.
+mod a_stolen_invite_buys_only_visibility {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{
+        POST_REVOCATION_DOC, StolenInvite, WorkspaceNode, doc_key, member_bytes_of,
+    };
+    use propsim::prelude::*;
+
+    use super::{NODES, plan_of_size};
+
+    /// One more node than the honest group, so the thief's presence does not
+    /// shrink the set of members the other properties are about.
+    const NODES_WITH_THIEF: usize = NODES + 1;
+
+    /// Which node redeems a ticket it was never issued.
+    const THIEF: u64 = 3;
+
+    fn thief<'a>(
+        w: &'a World<'a, WorkspaceNode<StolenInvite>>,
+    ) -> Option<&'a WorkspaceNode<StolenInvite>> {
+        w.nodes().find(|n| n.id() == THIEF)
+    }
+
+    /// The members still in the group after the revocation the leak provokes.
+    fn remaining<'a>(
+        w: &'a World<'a, WorkspaceNode<StolenInvite>>,
+    ) -> Vec<&'a WorkspaceNode<StolenInvite>> {
+        w.nodes()
+            .filter(|n| n.id() != THIEF && n.has_joined() && !n.is_revocation_target())
+            .collect()
+    }
+
+    /// Given a node holding a ticket issued to somebody else, at every point in
+    /// the run, we expect no member to record it as a person or a device.
+    ///
+    /// The first clause of 4.6. A ticket carries the operation log and the
+    /// certificate store, both public, signed data — so a thief can read the
+    /// whole membership. Reading it must not put the thief *in* it: nothing in a
+    /// ticket is an admission, because the admission is the `Add` the inviter
+    /// already issued for a leaf the thief does not hold.
+    #[test]
+    fn a_stolen_invite_never_enters_any_members_user_list() {
+        plan_of_size::<StolenInvite>(
+            NODES_WITH_THIEF,
+            vec![property::always(
+                "no member's capability closure resolves any device to the thief",
+                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                    let thief_user = member_bytes_of(THIEF);
+                    w.nodes().filter(|n| n.has_joined()).all(|n| {
+                        !n.certified_users().contains(&thief_user)
+                            && n.role_of(thief_user).is_none()
+                    })
+                },
+            )],
+        )
+        .run(deterministic());
+    }
+
+    /// Given the same node, at every point in the run, we expect it to hold no
+    /// group state and to read no document text.
+    ///
+    /// The second clause of 4.6, and the one that says the README's old wording
+    /// was wrong in the thief's favour. `has_joined()` is false because
+    /// `CgkaController::join` needs the leaf secret to derive the group key, and
+    /// `all_text()` is empty because there is no state to read it out of. Both
+    /// are asserted, not just the second: a thief that somehow built state and
+    /// happened to read nothing would be one lucky delivery order away from
+    /// reading everything.
+    #[test]
+    fn a_stolen_invite_never_reconstructs_the_group_or_reads_content() {
+        plan_of_size::<StolenInvite>(
+            NODES_WITH_THIEF,
+            vec![property::always(
+                "the thief joins nothing and decrypts nothing",
+                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                    thief(w).is_none_or(|t| {
+                        !t.has_joined() && t.all_text().iter().all(String::is_empty)
+                    })
+                },
+            )],
+        )
+        .run(deterministic());
+    }
+
+    /// Given the group rotates its namespace, at every point in the run, we
+    /// expect the thief never to observe an entry written after the rotation.
+    ///
+    /// The third clause of 4.6, and the group's actual remedy for a leaked
+    /// ticket: there is nothing in a bearer token to revoke, so what ends the
+    /// exposure is abandoning the replica the token names. `always` rather than
+    /// `eventually`, for the same reason as the revoked victim's counterpart —
+    /// seeing the entry once is a leak no later rotation can unlearn.
+    #[test]
+    fn a_stolen_invite_stops_seeing_entries_once_the_group_rotates() {
+        plan_of_size::<StolenInvite>(
+            NODES_WITH_THIEF,
+            vec![property::always(
+                "the thief observes no entry written after the rotation",
+                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                    thief(w).is_none_or(|t| t.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
+                },
+            )],
+        )
+        .run(deterministic());
+    }
+
+    /// Given the same run, when it settles, we expect the theft to have actually
+    /// happened and to have bought the thief *something*.
+    ///
+    /// **The counterweight, and the property to write first.** Every assertion
+    /// above is satisfied by a run in which the leaked ticket never arrived, or
+    /// in which nobody ever wrote anything — and such a run proves nothing about
+    /// the protocol. This is what makes the three above claims about a bound on
+    /// real exposure rather than accidents of timing. It is also the honest half
+    /// of the README's new wording: a stolen ticket *does* let a stranger watch
+    /// the replica until the group rotates, and that is a residual to state
+    /// rather than one to imply.
+    #[test]
+    fn the_stolen_invite_does_reach_the_thief_and_does_show_it_the_replica() {
+        plan_of_size::<StolenInvite>(
+            NODES_WITH_THIEF,
+            vec![property::eventually_within(
+                "the thief holds the ticket and has seen at least one entry",
+                Duration::from_secs(10),
+                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                    thief(w).is_some_and(|t| t.holds_stolen_invite() && t.index_len() > 0)
+                },
+            )],
+        )
+        .run(deterministic());
+    }
+
+    /// Given the members whose ticket leaked, when the run settles, we expect
+    /// them to converge regardless.
+    ///
+    /// The other counterweight. Everything above is satisfied by a group that
+    /// rotated itself into oblivion, and the rotation here is provoked by a
+    /// removal — so this is what says the remedy for a leaked ticket costs the
+    /// remaining members nothing but a generation.
+    #[test]
+    fn the_remaining_members_converge_through_the_rotation() {
+        plan_of_size::<StolenInvite>(
+            NODES_WITH_THIEF,
+            vec![property::eventually_within(
+                "the remaining members agree on one namespace and one document",
+                Duration::from_secs(20),
+                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                    let members = remaining(w);
+                    if members.len() < 2 {
+                        return false;
+                    }
+                    let mut namespaces: Vec<_> = members.iter().map(|n| n.namespace()).collect();
+                    namespaces.dedup();
+                    let mut sorted: Vec<Vec<char>> = members
+                        .iter()
+                        .map(|n| {
+                            let mut cs: Vec<char> = n.document_text().chars().collect();
+                            cs.sort_unstable();
+                            cs
+                        })
+                        .collect();
+                    sorted.dedup();
+                    namespaces.len() == 1 && sorted.len() == 1
+                },
+            )],
+        )
+        .run(deterministic());
+    }
+}

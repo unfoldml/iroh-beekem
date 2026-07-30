@@ -21,7 +21,11 @@
 //! every document's existence, size, author and timing — readable by anyone who
 //! learned the namespace.
 
-use std::ops::Deref;
+use std::{
+    collections::HashSet,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
 
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::mem::MemStore};
@@ -48,7 +52,23 @@ pub struct Node {
     /// workspace exists. The workspace populates it; until it does, the node
     /// accepts nobody.
     roster: Roster,
+    /// Invite nonces this node has already redeemed, per workspace.
+    ///
+    /// What makes a ticket single-use. Owned by the node rather than by the
+    /// workspace for the obvious reason: redeeming an invite is what *creates* a
+    /// workspace, so there is no workspace to ask at the moment of the check.
+    ///
+    /// A `std::sync::Mutex` and not tokio's: the critical section is a set
+    /// lookup and an insert with no await inside it, so an async lock would buy
+    /// nothing and cost a scheduler round trip on the join path.
+    redeemed: RedeemedInvites,
 }
+
+/// Invite nonces already spent, keyed by `(tree id, nonce)`.
+///
+/// A named type only because the nesting is otherwise unreadable; the tree id is
+/// part of the key so two workspaces on one node cannot collide.
+type RedeemedInvites = Arc<Mutex<HashSet<([u8; 32], [u8; 16])>>>;
 
 impl Node {
     /// Bind an endpoint and start the blobs, gossip and docs protocols.
@@ -96,7 +116,43 @@ impl Node {
             gossip,
             docs,
             roster: admission,
+            redeemed: Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// Record an invite nonce as redeemed, and say whether it was fresh.
+    ///
+    /// Returns `true` the first time a `(tree_id, nonce)` pair is presented and
+    /// `false` on every repeat, which is what makes an [`Invite`](crate::Invite)
+    /// single-use. Keyed by tree id as well as nonce so that two workspaces
+    /// cannot collide, however their inviters generate nonces.
+    ///
+    /// # What this does and does not defend
+    ///
+    /// It stops a ticket being redeemed twice *on this node* — the accidental
+    /// double-join, and a replay against the device the ticket names. It does
+    /// nothing about a thief redeeming the same ticket on a machine of their
+    /// own; nothing a bearer token carries could. The defences that reach that
+    /// case are the roster, which refuses the thief's endpoint, and namespace
+    /// rotation, which abandons the replica the ticket points at.
+    ///
+    /// # In memory only, and a restart un-consumes every nonce
+    ///
+    /// Stated rather than implied, because it is a real gap: this set does not
+    /// survive a process restart, so a ticket redeemed before a crash is
+    /// redeemable again after one — for as long as it has not expired, which is
+    /// the bound that still holds. Phase 7 persists it alongside the node's
+    /// endpoint secret key.
+    ///
+    /// Returns `false` if the lock is poisoned, which is the safe direction: a
+    /// node that cannot consult its ledger must refuse the join rather than
+    /// assume the nonce is fresh.
+    #[must_use]
+    pub fn claim_invite(&self, tree_id: [u8; 32], nonce: [u8; 16]) -> bool {
+        match self.redeemed.lock() {
+            Ok(mut redeemed) => redeemed.insert((tree_id, nonce)),
+            Err(_) => false,
+        }
     }
 
     /// This node's endpoint.

@@ -21,12 +21,15 @@
 //! generated a signer internally and dropped it, leaving no way to reuse the
 //! founder's identity on the next run.
 
+use beekem::id::MemberId;
+use iroh::EndpointId;
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
     signer::memory::MemorySigner,
     verifiable::Verifiable,
 };
 use rand::{CryptoRng, RngCore};
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::WorkspaceError;
@@ -117,6 +120,21 @@ impl Identity {
         self.share_secret.share_key()
     }
 
+    /// Everything an admin needs to admit this device, in one value.
+    ///
+    /// The three halves of an admission travel together because they are useless
+    /// apart: the member id says *who*, the leaf key is what the CGKA encrypts
+    /// to, and the endpoint is what puts the device on the admitter's roster
+    /// before it has synced anything. See [`Enrollment`].
+    #[must_use]
+    pub fn enrollment(&self, endpoint: EndpointId) -> Enrollment {
+        Enrollment {
+            member: self.member_id().to_bytes(),
+            share_key: self.share_key(),
+            endpoint: *endpoint.as_bytes(),
+        }
+    }
+
     pub(crate) fn signer(&self) -> MemorySigner {
         self.signer.clone()
     }
@@ -126,12 +144,98 @@ impl Identity {
     }
 }
 
+/// What a prospective device hands an admin, out of band, to be admitted.
+///
+/// # Why this is a type and not three arguments
+///
+/// [`Workspace::add_user`](crate::Workspace::add_user) previously took a
+/// `MemberId` and a `ShareKey` positionally — two `keyhive_crypto` and `beekem`
+/// types this crate did not re-export — so no application could invite anybody
+/// without adding those crates to its own manifest and pinning them to whatever
+/// version this one happens to resolve. That is the leak Phase 6 closes, and 0.1
+/// freezes the answer: an admission is one value, produced by
+/// [`Identity::enrollment`], and the raw types are re-exported for callers that
+/// genuinely need them rather than being the only way in.
+///
+/// Public in every field: the member id and the leaf key are in every operation
+/// the device will ever sign, and the endpoint is what it dials from. Nothing
+/// here is secret, which is why it can cross an unauthenticated channel — unlike
+/// the [`Invite`](crate::Invite) that comes back the other way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enrollment {
+    /// The device's CGKA identity, as raw verifying-key bytes.
+    ///
+    /// Raw bytes rather than a `MemberId`, which wraps an *expanded* Ed25519
+    /// point and is an order of magnitude larger on the wire for no gain — the
+    /// same reasoning `CoreError::Unauthorized` records.
+    member: [u8; 32],
+    /// The public half of the device's leaf secret.
+    share_key: ShareKey,
+    /// The device's transport address, as raw bytes.
+    endpoint: [u8; 32],
+}
+
+impl Enrollment {
+    /// Assemble an enrollment from parts an application obtained some other way.
+    ///
+    /// [`Identity::enrollment`] is the ordinary route; this exists for a caller
+    /// holding the three values already, and takes the re-exported types rather
+    /// than raw bytes so that a malformed member id cannot be constructed here
+    /// at all.
+    #[must_use]
+    pub fn new(member: MemberId, share_key: ShareKey, endpoint: EndpointId) -> Self {
+        Self {
+            member: member.to_bytes(),
+            share_key,
+            endpoint: *endpoint.as_bytes(),
+        }
+    }
+
+    /// The device's CGKA identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Identity`] if the bytes are not a valid Ed25519
+    /// point. Deserialization cannot check that — a member id round-trips as raw
+    /// bytes on purpose — so it is checked here, where the failure is one value
+    /// refused rather than a whole message.
+    pub fn member_id(&self) -> Result<MemberId, WorkspaceError> {
+        ed25519_dalek::VerifyingKey::from_bytes(&self.member)
+            .map(MemberId::from)
+            .map_err(|_| WorkspaceError::Identity("malformed member id".into()))
+    }
+
+    /// The device's CGKA identity, unparsed.
+    #[must_use]
+    pub fn member_bytes(&self) -> [u8; 32] {
+        self.member
+    }
+
+    /// The public half of the device's leaf secret.
+    #[must_use]
+    pub fn share_key(&self) -> ShareKey {
+        self.share_key
+    }
+
+    /// The device's transport address.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Identity`] if the bytes are not a valid
+    /// endpoint id, for the same reason [`Self::member_id`] can.
+    pub fn endpoint(&self) -> Result<EndpointId, WorkspaceError> {
+        EndpointId::from_bytes(&self.endpoint)
+            .map_err(|_| WorkspaceError::Identity("malformed endpoint id".into()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use iroh::EndpointId;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    use super::Identity;
+    use super::{Enrollment, Identity};
 
     fn identity(seed: u64) -> Identity {
         Identity::generate(&mut ChaCha20Rng::seed_from_u64(seed))
@@ -195,5 +299,87 @@ mod tests {
             let _ = write!(acc, "{b:02x}");
             acc
         })
+    }
+
+    /// An endpoint id derived from a fixed key, so the tests are reproducible.
+    fn endpoint() -> EndpointId {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        EndpointId::from_bytes(&key.to_bytes()).expect("a verifying key is a valid endpoint id")
+    }
+
+    #[test]
+    fn an_enrollment_carries_exactly_what_an_admission_needs() {
+        // The three values an admin needs, and the reason they travel together:
+        // an `Add` names the member and encrypts to the leaf key, and the
+        // endpoint is what puts the device on the admitter's roster before it
+        // has synced anything. Any one of them missing is a deadlock, not an
+        // inconvenience.
+        let id = identity(1);
+        let enrollment = id.enrollment(endpoint());
+
+        assert_eq!(
+            enrollment
+                .member_id()
+                .expect("a freshly built enrollment parses"),
+            id.member_id(),
+            "an enrollment must name the device it was built from"
+        );
+        assert_eq!(
+            enrollment.share_key(),
+            id.share_key(),
+            "an enrollment must carry the leaf key the CGKA will encrypt to"
+        );
+        assert_eq!(
+            enrollment
+                .endpoint()
+                .expect("a freshly built enrollment parses"),
+            endpoint(),
+            "an enrollment must carry the address the admitter will admit"
+        );
+        assert_eq!(
+            enrollment.member_bytes(),
+            id.member_id().to_bytes(),
+            "the unparsed accessor must agree with the parsed one"
+        );
+    }
+
+    #[test]
+    fn assembling_an_enrollment_from_parts_matches_deriving_one() {
+        // `Enrollment::new` exists for a caller that already holds the three
+        // values. It must produce the same value `Identity::enrollment` does, or
+        // the two routes into `add_user` would admit subtly different devices.
+        let id = identity(1);
+
+        assert_eq!(
+            Enrollment::new(id.member_id(), id.share_key(), endpoint()),
+            id.enrollment(endpoint()),
+            "the two ways to build an enrollment must agree"
+        );
+    }
+
+    #[test]
+    fn a_malformed_enrollment_is_refused_rather_than_coerced() {
+        // An enrollment crosses an out-of-band channel and comes back as bytes,
+        // and neither a member id nor an endpoint id is checked by
+        // deserialization — both round-trip as raw arrays on purpose, because a
+        // `MemberId` on the wire would carry an expanded Ed25519 point. So the
+        // check happens on the way out, where the failure is one value refused.
+        // `0x02` repeated is not a point on the curve. Any value that fails
+        // decompression would do; this one is named rather than searched for so
+        // the test says nothing about *which* invalid encodings exist.
+        let malformed = Enrollment {
+            member: [0x02u8; 32],
+            share_key: identity(1).share_key(),
+            endpoint: [0x02u8; 32],
+        };
+
+        assert!(
+            malformed.member_id().is_err(),
+            "a member id that is not a valid Ed25519 point must be refused"
+        );
+        assert!(
+            malformed.endpoint().is_err(),
+            "an endpoint id that is not a valid Ed25519 point must be refused"
+        );
     }
 }

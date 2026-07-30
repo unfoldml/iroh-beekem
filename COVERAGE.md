@@ -8,9 +8,9 @@ a defect to fix before declaring done.
 
 | Metric | Covered | Total | % |
 |---|---|---|---|
-| Lines | 3634 | 4102 | 88.6% |
-| Functions | 480 | 571 | 84.1% |
-| Regions | 5760 | 6636 | 86.8% |
+| Lines | 4075 | 4552 | 89.5% |
+| Functions | 528 | 620 | 85.2% |
+| Regions | 6540 | 7423 | 88.1% |
 
 ## Lowest-covered files
 
@@ -18,18 +18,19 @@ Ranked by uncovered lines, not by percentage: a 40%-covered 20-line module is a 
 
 | File | Uncovered | Total | % |
 |---|---|---|---|
-| [crates/iroh-beekem/src/workspace.rs](crates/iroh-beekem/src/workspace.rs) | 215 | 1002 | 78.5% |
-| [crates/iroh-beekem-sim/src/lib.rs](crates/iroh-beekem-sim/src/lib.rs) | 87 | 795 | 89.1% |
-| [crates/iroh-beekem-core/src/state.rs](crates/iroh-beekem-core/src/state.rs) | 58 | 746 | 92.2% |
+| [crates/iroh-beekem/src/workspace.rs](crates/iroh-beekem/src/workspace.rs) | 214 | 1034 | 79.3% |
+| [crates/iroh-beekem-sim/src/lib.rs](crates/iroh-beekem-sim/src/lib.rs) | 92 | 849 | 89.2% |
+| [crates/iroh-beekem-core/src/state.rs](crates/iroh-beekem-core/src/state.rs) | 58 | 749 | 92.3% |
 | [crates/iroh-beekem-core/src/manifest.rs](crates/iroh-beekem-core/src/manifest.rs) | 29 | 356 | 91.9% |
-| [crates/iroh-beekem-core/src/keys.rs](crates/iroh-beekem-core/src/keys.rs) | 27 | 363 | 92.6% |
-| [crates/iroh-beekem-core/src/capability.rs](crates/iroh-beekem-core/src/capability.rs) | 19 | 392 | 95.2% |
+| [crates/iroh-beekem-core/src/keys.rs](crates/iroh-beekem-core/src/keys.rs) | 27 | 352 | 92.3% |
+| [crates/iroh-beekem-core/src/capability.rs](crates/iroh-beekem-core/src/capability.rs) | 17 | 485 | 96.5% |
 | [crates/iroh-beekem/src/roster.rs](crates/iroh-beekem/src/roster.rs) | 13 | 108 | 88.0% |
 | [crates/iroh-beekem-core/src/content.rs](crates/iroh-beekem-core/src/content.rs) | 8 | 21 | 61.9% |
+| [crates/iroh-beekem/src/invite.rs](crates/iroh-beekem/src/invite.rs) | 6 | 201 | 97.0% |
+| [crates/iroh-beekem/src/node.rs](crates/iroh-beekem/src/node.rs) | 4 | 61 | 93.4% |
 | [crates/iroh-beekem-core/src/blinding.rs](crates/iroh-beekem-core/src/blinding.rs) | 3 | 92 | 96.7% |
 | [crates/iroh-beekem-core/src/error.rs](crates/iroh-beekem-core/src/error.rs) | 3 | 3 | 0.0% |
-| [crates/iroh-beekem/src/node.rs](crates/iroh-beekem/src/node.rs) | 3 | 55 | 94.5% |
-| [crates/iroh-beekem/src/identity.rs](crates/iroh-beekem/src/identity.rs) | 2 | 87 | 97.7% |
+| [crates/iroh-beekem/src/identity.rs](crates/iroh-beekem/src/identity.rs) | 2 | 159 | 98.7% |
 | [crates/iroh-beekem-core/src/sync_poll.rs](crates/iroh-beekem-core/src/sync_poll.rs) | 1 | 13 | 92.3% |
 | [crates/iroh-beekem/src/wire.rs](crates/iroh-beekem/src/wire.rs) | 0 | 69 | 100.0% |
 
@@ -38,17 +39,18 @@ Ranked by uncovered lines, not by percentage: a 40%-covered 20-line module is a 
 | File | Covered | Total | % |
 |---|---|---|---|
 | [crates/iroh-beekem-core/src/blinding.rs](crates/iroh-beekem-core/src/blinding.rs) | 89 | 92 | 96.7% |
-| [crates/iroh-beekem-core/src/capability.rs](crates/iroh-beekem-core/src/capability.rs) | 373 | 392 | 95.2% |
+| [crates/iroh-beekem-core/src/capability.rs](crates/iroh-beekem-core/src/capability.rs) | 468 | 485 | 96.5% |
 | [crates/iroh-beekem-core/src/content.rs](crates/iroh-beekem-core/src/content.rs) | 13 | 21 | 61.9% |
 | [crates/iroh-beekem-core/src/error.rs](crates/iroh-beekem-core/src/error.rs) | 0 | 3 | 0.0% |
-| [crates/iroh-beekem-core/src/keys.rs](crates/iroh-beekem-core/src/keys.rs) | 336 | 363 | 92.6% |
+| [crates/iroh-beekem-core/src/keys.rs](crates/iroh-beekem-core/src/keys.rs) | 325 | 352 | 92.3% |
 | [crates/iroh-beekem-core/src/manifest.rs](crates/iroh-beekem-core/src/manifest.rs) | 327 | 356 | 91.9% |
-| [crates/iroh-beekem-core/src/state.rs](crates/iroh-beekem-core/src/state.rs) | 688 | 746 | 92.2% |
+| [crates/iroh-beekem-core/src/state.rs](crates/iroh-beekem-core/src/state.rs) | 691 | 749 | 92.3% |
 | [crates/iroh-beekem-core/src/sync_poll.rs](crates/iroh-beekem-core/src/sync_poll.rs) | 12 | 13 | 92.3% |
-| [crates/iroh-beekem-sim/src/lib.rs](crates/iroh-beekem-sim/src/lib.rs) | 708 | 795 | 89.1% |
-| [crates/iroh-beekem/src/identity.rs](crates/iroh-beekem/src/identity.rs) | 85 | 87 | 97.7% |
-| [crates/iroh-beekem/src/node.rs](crates/iroh-beekem/src/node.rs) | 52 | 55 | 94.5% |
+| [crates/iroh-beekem-sim/src/lib.rs](crates/iroh-beekem-sim/src/lib.rs) | 757 | 849 | 89.2% |
+| [crates/iroh-beekem/src/identity.rs](crates/iroh-beekem/src/identity.rs) | 157 | 159 | 98.7% |
+| [crates/iroh-beekem/src/invite.rs](crates/iroh-beekem/src/invite.rs) | 195 | 201 | 97.0% |
+| [crates/iroh-beekem/src/node.rs](crates/iroh-beekem/src/node.rs) | 57 | 61 | 93.4% |
 | [crates/iroh-beekem/src/roster.rs](crates/iroh-beekem/src/roster.rs) | 95 | 108 | 88.0% |
 | [crates/iroh-beekem/src/wire.rs](crates/iroh-beekem/src/wire.rs) | 69 | 69 | 100.0% |
-| [crates/iroh-beekem/src/workspace.rs](crates/iroh-beekem/src/workspace.rs) | 787 | 1002 | 78.5% |
+| [crates/iroh-beekem/src/workspace.rs](crates/iroh-beekem/src/workspace.rs) | 820 | 1034 | 79.3% |
 

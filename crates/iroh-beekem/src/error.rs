@@ -23,9 +23,22 @@ pub enum WorkspaceError {
     #[error("storage failure: {0}")]
     Storage(String),
 
-    /// The invite ticket could not be parsed or applied.
+    /// The invite ticket was refused, or could not be applied.
+    ///
+    /// Wraps [`InviteError`](crate::InviteError) rather than a string because a
+    /// caller acts on the difference: an expired ticket means "ask for another",
+    /// a wrong invitee means "you were handed somebody else's".
     #[error("invalid invite: {0}")]
-    Invite(String),
+    Invite(#[from] crate::invite::InviteError),
+
+    /// The invite verified, but the log it carries does not admit this device.
+    ///
+    /// Distinct from [`Self::Invite`]: the ticket itself is in order, and what
+    /// failed is reconstructing the group from it — a race against a later
+    /// membership change, or a ticket for a workspace this identity was never
+    /// added to.
+    #[error("invite does not admit this device: {0}")]
+    NotAdmitted(String),
 
     /// Stored device key material could not be restored.
     #[error("invalid identity: {0}")]

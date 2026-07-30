@@ -98,13 +98,10 @@ async fn invited_pair_as(seed: u64, role: Role) -> Pair {
     // the secret half never leaves his device, which is what makes an
     // intercepted invite useless for joining.
     let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(seed + 1));
-    let bob_id = bob_identity.member_id();
 
     let invite: Invite = alice
         .add_user(
-            bob_id,
-            bob_identity.share_key(),
-            bob_node.endpoint().id(),
+            &bob_identity.enrollment(bob_node.endpoint().id()),
             role,
             "bob",
         )
@@ -123,7 +120,7 @@ async fn invited_pair_as(seed: u64, role: Role) -> Pair {
     Pair {
         alice,
         bob,
-        bob_id,
+        bob_id: bob_identity.member_id(),
         doc,
     }
 }
@@ -223,9 +220,7 @@ async fn content_written_before_the_invite_reaches_the_joiner() {
     let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(22));
     let invite: Invite = alice
         .add_user(
-            bob_identity.member_id(),
-            bob_identity.share_key(),
-            bob_node.endpoint().id(),
+            &bob_identity.enrollment(bob_node.endpoint().id()),
             Role::Editor,
             "bob",
         )
@@ -559,32 +554,28 @@ async fn a_viewer_is_given_a_read_only_capability() {
 
     let invite = alice
         .add_user(
-            viewer.member_id(),
-            viewer.share_key(),
-            viewer_node.endpoint().id(),
+            &viewer.enrollment(viewer_node.endpoint().id()),
             Role::Viewer,
             "viewer",
         )
         .await
         .expect("alice admits a viewer");
     assert!(
-        matches!(invite.doc_ticket.capability, Capability::Read(_)),
+        matches!(invite.terms().doc_ticket.capability, Capability::Read(_)),
         "a viewer must not receive a write capability"
     );
 
     let editor = Identity::generate(&mut ChaCha20Rng::seed_from_u64(112));
     let invite = alice
         .add_user(
-            editor.member_id(),
-            editor.share_key(),
-            editor_node.endpoint().id(),
+            &editor.enrollment(editor_node.endpoint().id()),
             Role::Editor,
             "editor",
         )
         .await
         .expect("alice admits an editor");
     assert!(
-        matches!(invite.doc_ticket.capability, Capability::Write(_)),
+        matches!(invite.terms().doc_ticket.capability, Capability::Write(_)),
         "an editor must still receive a write capability"
     );
 
@@ -602,9 +593,7 @@ async fn a_second_device_joins_its_users_account_and_inherits_the_role() {
     let laptop_node = Node::spawn().await.expect("laptop should bind");
     let invite = alice
         .add_device(
-            laptop_identity.member_id(),
-            laptop_identity.share_key(),
-            laptop_node.endpoint().id(),
+            &laptop_identity.enrollment(laptop_node.endpoint().id()),
             alice_user,
             "laptop",
         )
@@ -951,5 +940,219 @@ mod removal_abandons_the_namespace {
 
         alice.shutdown().await.expect("alice shuts down");
         bob.shutdown().await.expect("bob shuts down");
+    }
+}
+
+/// The checks that make an [`Invite`] a ticket rather than a bearer token.
+///
+/// These are the half of Phase 6 the simulator cannot state. Expiry is decided
+/// against a wall clock and single use against a per-node ledger, and neither
+/// exists in `iroh-beekem-core` — deliberately, because a clock in the core would
+/// make the whole property suite impossible. So this is where they are checked.
+///
+/// Every test here is about what *this library* refuses. A thief that ignores the
+/// code and reads the struct's fields directly still holds the blinding secret
+/// and the docs ticket; what bounds that is the roster and namespace rotation,
+/// and `a_stolen_invite_buys_only_visibility` in the simulator is where it is
+/// stated.
+mod invite_security {
+    use iroh_beekem::{Identity, InviteError, Node, Workspace, WorkspaceError};
+    use iroh_beekem_core::Role;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    use super::founded;
+
+    /// Given an invite minted for one device, when a *different* device presents
+    /// it, we expect the join to be refused with `WrongInvitee`.
+    ///
+    /// The property that turns a leaked ticket from a credential into a piece of
+    /// paper. Before Phase 6 an `Invite` named nobody, so any holder could feed
+    /// it to `join` — and while `CgkaController::join` would then fail for want
+    /// of the leaf secret, it would fail reporting "the log does not admit this
+    /// device", which is indistinguishable from a ticket that lost a race
+    /// against a later membership change. Refusing here says which it was.
+    #[tokio::test]
+    async fn an_invite_is_refused_to_a_device_it_does_not_name() {
+        let (alice, _doc) = founded(700, "shared").await;
+        let bob_node = Node::spawn().await.expect("bob should bind");
+        let bob = Identity::generate(&mut ChaCha20Rng::seed_from_u64(701));
+        let invite = alice
+            .add_user(
+                &bob.enrollment(bob_node.endpoint().id()),
+                Role::Editor,
+                "bob",
+            )
+            .await
+            .expect("alice admits bob");
+
+        // A third device that was never admitted, holding bob's ticket.
+        let thief = Identity::generate(&mut ChaCha20Rng::seed_from_u64(702));
+        let thief_node = Node::spawn().await.expect("the thief's node should bind");
+        let refused = Workspace::join(
+            thief_node,
+            &invite,
+            &thief,
+            &mut ChaCha20Rng::seed_from_u64(703),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(WorkspaceError::Invite(InviteError::WrongInvitee))
+            ),
+            "a ticket naming another device must be refused as misaddressed, not \
+             as an admission failure, got {refused:?}"
+        );
+        alice.shutdown().await.expect("alice shuts down");
+    }
+
+    /// Given an invite that has already been redeemed on a node, when the same
+    /// ticket is presented to that node again, we expect `Replayed`.
+    ///
+    /// What makes a ticket single-use. The nonce ledger lives on [`Node`] and not
+    /// on the workspace because redeeming an invite is what *creates* a
+    /// workspace: there is nothing to ask at the moment of the check. It is in
+    /// memory only, so a restart un-consumes every nonce — recorded on
+    /// `Node::claim_invite` and in the README, because the bound that still holds
+    /// after a restart is expiry and nothing else.
+    #[tokio::test]
+    async fn an_invite_cannot_be_redeemed_twice_on_one_node() {
+        let (alice, _doc) = founded(710, "shared").await;
+        let bob_node = Node::spawn().await.expect("bob should bind");
+        let bob = Identity::generate(&mut ChaCha20Rng::seed_from_u64(711));
+        let invite = alice
+            .add_user(
+                &bob.enrollment(bob_node.endpoint().id()),
+                Role::Editor,
+                "bob",
+            )
+            .await
+            .expect("alice admits bob");
+
+        let joined = Workspace::join(
+            bob_node.clone(),
+            &invite,
+            &bob,
+            &mut ChaCha20Rng::seed_from_u64(712),
+        )
+        .await
+        .expect("the first redemption succeeds");
+
+        let replayed = Workspace::join(
+            bob_node,
+            &invite,
+            &bob,
+            &mut ChaCha20Rng::seed_from_u64(713),
+        )
+        .await;
+
+        assert!(
+            matches!(replayed, Err(WorkspaceError::Invite(InviteError::Replayed))),
+            "a second redemption of the same ticket must be refused, got {replayed:?}"
+        );
+        joined.shutdown().await.expect("bob shuts down");
+        alice.shutdown().await.expect("alice shuts down");
+    }
+
+    /// Given a freshly minted invite, when it is verified at a moment past its
+    /// `not_after`, we expect `Expired`.
+    ///
+    /// Checked through [`Invite::verify`] with an explicit `now` rather than by
+    /// waiting an hour: the clock is a parameter of the check precisely so the
+    /// window can be tested without one. That it is the *system* clock supplying
+    /// that parameter in production is `Workspace::join`'s single call to
+    /// `unix_now`.
+    #[tokio::test]
+    async fn an_invite_is_refused_after_its_window_closes() {
+        let (alice, _doc) = founded(720, "shared").await;
+        let bob_node = Node::spawn().await.expect("bob should bind");
+        let bob = Identity::generate(&mut ChaCha20Rng::seed_from_u64(721));
+        let invite = alice
+            .add_user(
+                &bob.enrollment(bob_node.endpoint().id()),
+                Role::Editor,
+                "bob",
+            )
+            .await
+            .expect("alice admits bob");
+
+        let invitee = bob.member_id().to_bytes();
+        assert!(
+            invite.verify(invitee, invite.not_after()).is_ok(),
+            "the last second of the window must still be inside it"
+        );
+        let too_late = invite.verify(invitee, invite.not_after() + 1);
+        assert!(
+            matches!(too_late, Err(InviteError::Expired { .. })),
+            "one second past the window must be refused, got {too_late:?}"
+        );
+        alice.shutdown().await.expect("alice shuts down");
+    }
+
+    /// Given a member who is not an administrator, when they mint an invite from
+    /// the log and certificates every member holds, we expect `NotAnAdmin`.
+    ///
+    /// A viewer holds the whole operation log, the whole certificate store and
+    /// the blinding secret — everything an invite carries. Nothing stops them
+    /// assembling a ticket that parses. What stops it being redeemable is that
+    /// the closure it carries is rooted at `tree_id`, the founder's verifying
+    /// key, and no chain from there authorises a viewer to admit anybody. This is
+    /// the invite path's half of the check `CgkaController::merge` performs on
+    /// the operation itself.
+    #[tokio::test]
+    async fn a_viewer_cannot_mint_an_invite_at_all() {
+        let (alice, _doc) = founded(740, "shared").await;
+        let viewer_node = Node::spawn().await.expect("the viewer's node should bind");
+        let viewer = Identity::generate(&mut ChaCha20Rng::seed_from_u64(741));
+        let invite = alice
+            .add_user(
+                &viewer.enrollment(viewer_node.endpoint().id()),
+                Role::Viewer,
+                "viewer",
+            )
+            .await
+            .expect("alice admits a viewer");
+        let viewer_ws = Workspace::join(
+            viewer_node,
+            &invite,
+            &viewer,
+            &mut ChaCha20Rng::seed_from_u64(742),
+        )
+        .await
+        .expect("the viewer joins");
+
+        // The viewer tries to admit somebody. It never reaches the point of
+        // minting a ticket, because admitting is what mints one and the core
+        // refuses that first — which is the stronger statement: a viewer cannot
+        // produce an invite this library would emit at all.
+        let outsider = Identity::generate(&mut ChaCha20Rng::seed_from_u64(743));
+        let outsider_node = Node::spawn()
+            .await
+            .expect("the outsider's node should bind");
+        let refused = viewer_ws
+            .add_user(
+                &outsider.enrollment(outsider_node.endpoint().id()),
+                Role::Editor,
+                "outsider",
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(WorkspaceError::Core(_))),
+            "a viewer must not be able to admit anybody, got {refused:?}"
+        );
+
+        // And the invite the viewer *did* legitimately receive names alice as
+        // its issuer, not itself — so there is no ticket in the viewer's hands
+        // that a peer would accept as issued by them.
+        assert_eq!(
+            invite.issuer(),
+            alice.member_id().await.to_bytes(),
+            "an invite must be signed by the device that issued the admission"
+        );
+
+        viewer_ws.shutdown().await.expect("the viewer shuts down");
+        alice.shutdown().await.expect("alice shuts down");
     }
 }
