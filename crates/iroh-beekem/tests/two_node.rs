@@ -1156,3 +1156,420 @@ mod invite_security {
         alice.shutdown().await.expect("alice shuts down");
     }
 }
+
+/// A node that restarts must come back as itself, not as a stranger.
+///
+/// The simulator models a restart; only these tests prove the modelled restart
+/// corresponds to what `iroh` and the filesystem actually do — that the endpoint
+/// key, the docs replica, the blobs and the CGKA state all survive together, and
+/// that a peer still accepts what the restarted node writes.
+mod persistence_survives_a_restart {
+    use std::{path::PathBuf, time::Duration};
+
+    use iroh_beekem::{Identity, Node, Workspace, WorkspaceError};
+    use iroh_beekem_core::Role;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    use super::{PATH, eventually, info};
+
+    /// A private directory for one test, removed when the guard drops.
+    ///
+    /// Hand-rolled rather than pulled from `tempfile`: this needs a path and a
+    /// deletion, and the crate has no other reason to grow a dev-dependency.
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "iroh-beekem-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// In a persistent node that founded a workspace and wrote to it, upon
+    /// shutting down and reopening from the same directory, we expect the same
+    /// endpoint id, the same document contents, and the same membership.
+    ///
+    /// The endpoint id is the load-bearing one. It *is* the node's entry on
+    /// every peer's roster, so a restart that changed it would produce a node
+    /// that holds every key it needs and is refused at the connection level by
+    /// the workspace it still belongs to.
+    #[tokio::test]
+    async fn a_restarted_founder_keeps_its_identity_and_its_content() {
+        let root = TempRoot::new("founder");
+        let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(80));
+
+        let (endpoint_before, tree_id, doc) = {
+            let node = Node::spawn_persistent(&root.0)
+                .await
+                .expect("a persistent node binds");
+            let endpoint = node.endpoint().id();
+            let ws = Workspace::create(
+                node,
+                &identity,
+                info("durable"),
+                &mut ChaCha20Rng::seed_from_u64(80),
+            )
+            .await
+            .expect("founding succeeds");
+            let doc = ws.create_file(PATH, "text/markdown").await.expect("a file");
+            ws.append(doc, "written before the restart")
+                .await
+                .expect("an acknowledged write");
+            let tree_id = ws.tree_id();
+            ws.node().shutdown().await.expect("the node shuts down");
+            (endpoint, tree_id, doc)
+        };
+
+        let node = Node::spawn_persistent(&root.0)
+            .await
+            .expect("the same directory reopens");
+        assert_eq!(
+            node.endpoint().id(),
+            endpoint_before,
+            "the restarted node bound a new endpoint identity, so no peer could \
+             re-dial it and it would be refused by its own workspace's roster"
+        );
+
+        let listed = Workspace::list(&node).expect("listing succeeds");
+        assert_eq!(listed.len(), 1, "the founded workspace was not listed");
+        assert_eq!(
+            listed[0].tree_id, tree_id,
+            "the listed workspace is not the one that was founded"
+        );
+        assert_eq!(
+            listed[0].info.name, "durable",
+            "the workspace name did not survive, so the manifest was not restored"
+        );
+
+        let ws = Workspace::open(node, tree_id, &identity)
+            .await
+            .expect("the stored workspace reopens");
+        assert_eq!(
+            ws.read(doc).await,
+            "written before the restart",
+            "an acknowledged write did not survive the restart, so persistence \
+             does not happen before acknowledgement"
+        );
+        assert_eq!(
+            ws.group_size().await,
+            1,
+            "the CGKA tree did not survive the restart"
+        );
+        assert_eq!(
+            ws.me().await.and_then(|me| me.role),
+            Some(Role::Admin),
+            "the founder's own admin grant did not survive, so it could no longer \
+             administer the workspace it created"
+        );
+    }
+
+    /// In a two-node workspace, upon the joiner restarting, we expect the
+    /// founder to still accept what it writes afterwards.
+    ///
+    /// This is the check that the *derived* author identity is wired up. A
+    /// random author would change on restart, every peer's `author_may_write`
+    /// would reject the restarted node's entries as coming from an author no
+    /// manifest maps to a member, and it would go permanently mute while looking
+    /// entirely healthy from its own side.
+    #[tokio::test]
+    async fn a_restarted_joiners_later_writes_are_still_accepted() {
+        let root = TempRoot::new("joiner");
+
+        let (alice, alice_doc) = {
+            let node = Node::spawn().await.expect("alice binds");
+            let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(90));
+            let ws = Workspace::create(
+                node,
+                &identity,
+                info("shared"),
+                &mut ChaCha20Rng::seed_from_u64(90),
+            )
+            .await
+            .expect("alice founds");
+            let doc = ws.create_file(PATH, "text/markdown").await.expect("a file");
+            (ws, doc)
+        };
+
+        let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(91));
+        let bob_tree = {
+            let node = Node::spawn_persistent(&root.0)
+                .await
+                .expect("bob binds persistently");
+            let invite = alice
+                .add_user(
+                    &bob_identity.enrollment(node.endpoint().id()),
+                    Role::Editor,
+                    "bob",
+                )
+                .await
+                .expect("alice admits bob");
+            let bob = Workspace::join(
+                node,
+                &invite,
+                &bob_identity,
+                &mut ChaCha20Rng::seed_from_u64(92),
+            )
+            .await
+            .expect("bob joins");
+
+            eventually(
+                "bob sees alice's document",
+                Duration::from_secs(20),
+                || async { bob.resolve(PATH).await.is_some() },
+            )
+            .await;
+
+            let tree = bob.tree_id();
+            bob.node().shutdown().await.expect("bob shuts down");
+            tree
+        };
+
+        let node = Node::spawn_persistent(&root.0)
+            .await
+            .expect("bob's directory reopens");
+        let bob = Workspace::open(node, bob_tree, &bob_identity)
+            .await
+            .expect("bob reopens his workspace");
+        bob.append(alice_doc, "bob after restart")
+            .await
+            .expect("bob writes again");
+
+        eventually(
+            "alice accepts the restarted joiner's write",
+            Duration::from_secs(30),
+            || async { alice.read(alice_doc).await.contains("bob after restart") },
+        )
+        .await;
+    }
+
+    /// In a node holding two workspaces, upon both deriving their rosters, we
+    /// expect each to still admit its own members.
+    ///
+    /// The registry is keyed by workspace because `set_derived` *replaces*: with
+    /// one shared set the second workspace's refresh would evict the first's
+    /// members, and since both refresh on every manifest arrival, membership
+    /// would flap for as long as the node ran. Asserted over real endpoints
+    /// because the unit test can only show the bookkeeping, not that both
+    /// workspaces really do share one guard.
+    #[tokio::test]
+    async fn two_workspaces_on_one_node_do_not_evict_each_others_members() {
+        let host = Node::spawn().await.expect("the host binds");
+        let first_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(100));
+        let second_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(101));
+
+        let first = Workspace::create(
+            host.clone(),
+            &first_identity,
+            info("first"),
+            &mut ChaCha20Rng::seed_from_u64(100),
+        )
+        .await
+        .expect("the first workspace is founded");
+        let second = Workspace::create(
+            host.clone(),
+            &second_identity,
+            info("second"),
+            &mut ChaCha20Rng::seed_from_u64(101),
+        )
+        .await
+        .expect("the second workspace is founded");
+
+        // One member each, admitted after both workspaces already exist, so the
+        // second admission is what would clobber the first under a shared set.
+        let mut guests = Vec::new();
+        for (i, ws) in [(0u64, &first), (1, &second)] {
+            let node = Node::spawn().await.expect("a guest binds");
+            let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(110 + i));
+            let invite = ws
+                .add_user(
+                    &identity.enrollment(node.endpoint().id()),
+                    Role::Editor,
+                    "guest",
+                )
+                .await
+                .expect("the guest is admitted");
+            let joined = Workspace::join(
+                node,
+                &invite,
+                &identity,
+                &mut ChaCha20Rng::seed_from_u64(120 + i),
+            )
+            .await
+            .expect("the guest joins");
+            guests.push(joined);
+        }
+
+        // Both guests must reach the host. Under a single shared roster the
+        // second `set_derived` would have dropped the first guest, and its
+        // syncs would be refused at the connection level from then on.
+        for (ws, guest) in [(&first, &guests[0]), (&second, &guests[1])] {
+            let doc = ws.create_file(PATH, "text/markdown").await.expect("a file");
+            ws.append(doc, "host write").await.expect("the host writes");
+            let guest_ref = guest;
+            eventually(
+                "a guest of one workspace still syncs after the other refreshed \
+                 its roster",
+                Duration::from_secs(30),
+                || async {
+                    match guest_ref.resolve(PATH).await {
+                        Some(uuid) => guest_ref.read(uuid).await.contains("host write"),
+                        None => false,
+                    }
+                },
+            )
+            .await;
+        }
+    }
+
+    /// In an in-memory node, upon asking for stored workspaces, we expect a
+    /// refusal rather than an empty list.
+    ///
+    /// An empty vector would read as "this node holds no workspaces" when the
+    /// truth is "this node cannot hold any across a restart", and a caller
+    /// building a workspace picker would show the user an empty screen instead
+    /// of a configuration error.
+    #[tokio::test]
+    async fn an_in_memory_node_reports_that_it_cannot_persist() {
+        let node = Node::spawn().await.expect("an in-memory node binds");
+        assert!(
+            matches!(Workspace::list(&node), Err(WorkspaceError::NotPersistent)),
+            "an in-memory node did not report that it has no store"
+        );
+    }
+}
+
+/// Leaving and deleting, over real endpoints.
+///
+/// The simulator states what a departure means for membership; these prove the
+/// facade actually performs it — that the removals reach the peer before the
+/// transport is torn down, and that the local teardown really removes what it
+/// says it does.
+mod a_member_can_walk_away {
+    use std::time::Duration;
+
+    use iroh_beekem::{Identity, Node, Workspace};
+    use iroh_beekem_core::WorkspaceInfo;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    use super::{PATH, eventually, info, invited_pair, never};
+
+    /// In a two-member workspace, upon the joiner leaving, we expect the founder
+    /// to stop counting it.
+    ///
+    /// The ordering is what this proves. `leave` broadcasts the removals and
+    /// only then tears the gossip sender down; reversed, the operations would be
+    /// dropped on a closed channel and the group would keep the departed member
+    /// on every roster forever, with nothing anywhere reporting it.
+    #[tokio::test]
+    async fn a_departure_reaches_the_remaining_member() {
+        let pair = invited_pair(60).await;
+        eventually(
+            "the founder sees both members",
+            Duration::from_secs(20),
+            || async { pair.alice.group_size().await == 2 },
+        )
+        .await;
+
+        pair.bob.leave().await.expect("bob leaves the workspace");
+
+        // `pair.bob` is deliberately still alive here. `leave` announces the
+        // departure and does not tear the transport down, because
+        // `GossipSender::broadcast` only enqueues and dropping the subscription
+        // discards the queue — a test that dropped the leaver immediately would
+        // be asserting that a race it created goes its way.
+        eventually(
+            "the founder sees the departure",
+            Duration::from_secs(20),
+            || async { pair.alice.group_size().await == 1 },
+        )
+        .await;
+    }
+
+    /// In a workspace with a single administrator, upon that administrator
+    /// trying to leave, we expect a refusal and a workspace that still works.
+    ///
+    /// The refusal has to leave the handle usable, which is why `leave` consumes
+    /// `self` only on success — a founder told "no" must still be able to
+    /// promote somebody and try again, and a consumed handle would have made the
+    /// error unrecoverable.
+    #[tokio::test]
+    async fn the_last_administrator_cannot_leave() {
+        let pair = invited_pair(61).await;
+        let err = pair
+            .alice
+            .leave()
+            .await
+            .expect_err("the only admin must not be able to strand the workspace");
+        assert_eq!(
+            pair.alice.group_size().await,
+            2,
+            "a refused departure changed the group anyway"
+        );
+        assert!(
+            err.to_string().contains("admin"),
+            "the refusal must name the reason, since the caller's remedy is to \
+             promote somebody first: {err}"
+        );
+    }
+
+    /// In a persistent node holding a workspace, upon deleting it, we expect it
+    /// to be gone from the listing and to stay gone.
+    #[tokio::test]
+    async fn a_deleted_workspace_does_not_come_back() {
+        let root = std::env::temp_dir().join(format!(
+            "iroh-beekem-delete-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let node = Node::spawn_persistent(&root)
+            .await
+            .expect("a persistent node binds");
+        let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(62));
+        let ws = Workspace::create(
+            node.clone(),
+            &identity,
+            info("disposable"),
+            &mut ChaCha20Rng::seed_from_u64(62),
+        )
+        .await
+        .expect("founding succeeds");
+        ws.create_file(PATH, "text/markdown").await.expect("a file");
+        assert_eq!(
+            Workspace::list(&node).expect("listing succeeds").len(),
+            1,
+            "the workspace was not stored, so deleting it would prove nothing"
+        );
+
+        ws.delete().await.expect("deletion succeeds");
+
+        // Never rather than eventually: nothing should be able to bring it back,
+        // and the pumps are aborted asynchronously — a snapshot written by a
+        // task that outlived the delete is exactly the failure worth excluding.
+        never(
+            "a deleted workspace reappears in the listing",
+            Duration::from_secs(3),
+            || async { !Workspace::list(&node).expect("listing succeeds").is_empty() },
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Keeps `WorkspaceInfo` imported for the helper above.
+    const _: fn() -> WorkspaceInfo = || info("");
+}

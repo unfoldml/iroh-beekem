@@ -25,9 +25,34 @@
 //!   and nothing here retracts data that was already synced.
 //! * **It hides nothing from a member in good standing**, and relays still
 //!   observe connection metadata either way.
+//! * **It does not isolate two workspaces on one node from each other.** See
+//!   below; this is a property of the transport, not a gap in the bookkeeping.
+//!
+//! # Per workspace, but admission is still a union
+//!
+//! [`Roster`] keys its admission sets by tree id, and that is load-bearing: a
+//! single flat set would be *replaced* by whichever workspace recomputed last,
+//! so two workspaces on one node would clobber each other's members on every
+//! refresh and admit them in alternation. Keying by workspace is what makes each
+//! recompute affect only its own members.
+//!
+//! What it does **not** buy is isolation. [`RosterGuard::on_accepting`] sees an
+//! [`EndpointId`] and nothing else: `iroh-gossip` multiplexes every topic and
+//! `iroh-docs` every namespace over one connection per ALPN, so there is no
+//! workspace to attribute the connection to at the moment the decision is made.
+//! [`Roster::admits`] therefore answers "is this peer a member of *any*
+//! workspace on this node", and a member of one may open a connection that
+//! carries traffic for another.
+//!
+//! That residual is not closable here. Closing it means one endpoint per
+//! workspace — a separate [`Node`](crate::Node) — which costs an `EndpointId`,
+//! a relay registration and a hole-punching path per workspace. It is worth
+//! knowing that the confidentiality boundary is unaffected either way: reaching
+//! a namespace is not reading it, and every chunk in it is encrypted to a CGKA
+//! this peer holds no leaf in.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -69,32 +94,44 @@ struct Allowed {
     bootstrap: HashSet<EndpointId>,
 }
 
-/// A shared handle to this node's admission list.
+/// A shared handle to this node's admission lists, one per workspace.
 ///
 /// Created by the node so the guard can exist before any workspace does, and
-/// populated by the workspace, which is what actually knows the membership.
+/// populated by each workspace, which is what actually knows its own membership.
 /// Until a workspace populates it the node accepts nothing — failing closed,
 /// because a node with no workspace has no data anybody could legitimately want
 /// and no way to tell a member from an outsider.
+///
+/// Keyed by tree id, and see the module documentation for both halves of what
+/// that does: it stops two workspaces overwriting each other's members, and it
+/// does not stop a member of one connecting to the other.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Roster {
-    allowed: Arc<RwLock<Allowed>>,
+    workspaces: Arc<RwLock<BTreeMap<[u8; 32], Allowed>>>,
 }
 
 impl Roster {
-    /// Replace the derived set with a freshly computed one.
+    /// Replace one workspace's derived set with a freshly computed one.
     ///
     /// Takes raw bytes because that is what `WorkspaceState::roster` produces;
     /// entries that are not valid endpoint ids are dropped rather than
     /// rejected, since the manifest they came from is remote input and one
     /// malformed record must not cost every other peer their access.
-    pub(crate) fn set_derived(&self, endpoints: impl IntoIterator<Item = [u8; 32]>) {
+    ///
+    /// Scoped to `workspace` so that a recompute driven by one workspace's
+    /// manifest cannot evict another's members — which a single shared set,
+    /// replaced wholesale, would do on every refresh.
+    pub(crate) fn set_derived(
+        &self,
+        workspace: [u8; 32],
+        endpoints: impl IntoIterator<Item = [u8; 32]>,
+    ) {
         let derived: HashSet<EndpointId> = endpoints
             .into_iter()
             .filter_map(|bytes| EndpointId::from_bytes(&bytes).ok())
             .collect();
-        if let Ok(mut allowed) = self.allowed.write() {
-            allowed.derived = derived;
+        if let Ok(mut workspaces) = self.workspaces.write() {
+            workspaces.entry(workspace).or_default().derived = derived;
         } else {
             // A poisoned lock means a previous holder panicked while updating
             // the set. Leaving the stale set in place is the safe failure: it
@@ -103,31 +140,60 @@ impl Roster {
         }
     }
 
-    /// Admit one endpoint unconditionally, for the bootstrap case only.
-    pub(crate) fn add_bootstrap(&self, endpoint: EndpointId) {
-        if let Ok(mut allowed) = self.allowed.write() {
-            allowed.bootstrap.insert(endpoint);
+    /// Admit one endpoint to one workspace unconditionally, for bootstrap only.
+    pub(crate) fn add_bootstrap(&self, workspace: [u8; 32], endpoint: EndpointId) {
+        if let Ok(mut workspaces) = self.workspaces.write() {
+            workspaces
+                .entry(workspace)
+                .or_default()
+                .bootstrap
+                .insert(endpoint);
         } else {
             // Same reasoning as `set_derived`: fail closed. The joiner will
             // retry, and a refused handshake is recoverable.
         }
     }
 
+    /// Drop one workspace's admission set entirely.
+    ///
+    /// Called when a workspace is deleted or left. Without it the departed
+    /// workspace's members would keep being admitted for the lifetime of the
+    /// node, since [`Self::admits`] is a union and nothing else ever shrinks a
+    /// workspace's entry to nothing.
+    pub(crate) fn forget(&self, workspace: [u8; 32]) {
+        if let Ok(mut workspaces) = self.workspaces.write() {
+            workspaces.remove(&workspace);
+        } else {
+            // Fail closed in the other direction here: keeping a stale set
+            // admits peers of a workspace this node no longer holds, which costs
+            // an accepted connection that then finds nothing to sync.
+        }
+    }
+
     /// Whether a connection from `peer` should be accepted.
+    ///
+    /// A union over every workspace on this node, because the decision has to be
+    /// made from an `EndpointId` alone — see the module documentation.
     fn admits(&self, peer: EndpointId) -> bool {
-        match self.allowed.read() {
-            Ok(allowed) => allowed.derived.contains(&peer) || allowed.bootstrap.contains(&peer),
+        match self.workspaces.read() {
+            Ok(workspaces) => workspaces.values().any(|allowed| {
+                allowed.derived.contains(&peer) || allowed.bootstrap.contains(&peer)
+            }),
             Err(_) => false,
         }
     }
 
-    /// How many endpoints are currently admitted, bootstrap included.
+    /// How many distinct endpoints are admitted across every workspace.
     ///
     /// Only tests ask; the policy itself never counts.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        match self.allowed.read() {
-            Ok(allowed) => allowed.derived.union(&allowed.bootstrap).count(),
+        match self.workspaces.read() {
+            Ok(workspaces) => workspaces
+                .values()
+                .flat_map(|allowed| allowed.derived.union(&allowed.bootstrap))
+                .collect::<HashSet<_>>()
+                .len(),
             Err(_) => 0,
         }
     }
@@ -200,6 +266,12 @@ mod tests {
 
     use super::*;
 
+    /// The workspace these single-workspace tests all speak about.
+    const WS: [u8; 32] = [1u8; 32];
+
+    /// A second workspace, for the tests that need two.
+    const OTHER_WS: [u8; 32] = [2u8; 32];
+
     /// A real endpoint id.
     ///
     /// Generated rather than byte-filled: an `EndpointId` is a compressed
@@ -263,13 +335,13 @@ mod tests {
         let roster = Roster::default();
         let (member, other) = (endpoint(), endpoint());
 
-        roster.set_derived([*member.as_bytes(), *other.as_bytes()]);
+        roster.set_derived(WS, [*member.as_bytes(), *other.as_bytes()]);
         assert!(
             roster.admits(member),
             "an endpoint that was just derived into the roster was not admitted"
         );
 
-        roster.set_derived([*other.as_bytes()]);
+        roster.set_derived(WS, [*other.as_bytes()]);
         assert!(
             !roster.admits(member),
             "an endpoint omitted from the recomputed roster was still admitted, \
@@ -293,8 +365,8 @@ mod tests {
         let roster = Roster::default();
         let inviter = endpoint();
 
-        roster.add_bootstrap(inviter);
-        roster.set_derived(Vec::new());
+        roster.add_bootstrap(WS, inviter);
+        roster.set_derived(WS, Vec::new());
 
         assert!(
             roster.admits(inviter),
@@ -315,7 +387,7 @@ mod tests {
         let good = endpoint();
         let malformed = not_an_endpoint();
 
-        roster.set_derived([malformed, *good.as_bytes()]);
+        roster.set_derived(WS, [malformed, *good.as_bytes()]);
 
         assert!(
             roster.admits(good),
@@ -325,6 +397,104 @@ mod tests {
             roster.len(),
             1,
             "the malformed entry was admitted rather than dropped"
+        );
+    }
+
+    /// Given two workspaces on one node, when the second recomputes its derived
+    /// set, we expect the first's members to stay admitted.
+    ///
+    /// This is the defect that keying by workspace exists to fix. `set_derived`
+    /// *replaces* rather than merges — it has to, or removal would never take
+    /// effect — so with one shared set the two workspaces would evict each
+    /// other's members on every refresh, and since both refresh on every
+    /// manifest arrival, membership would flap for as long as the node ran.
+    #[test]
+    fn one_workspaces_recompute_does_not_evict_anothers_members() {
+        let roster = Roster::default();
+        let (theirs, mine) = (endpoint(), endpoint());
+
+        roster.set_derived(WS, [*theirs.as_bytes()]);
+        roster.set_derived(OTHER_WS, [*mine.as_bytes()]);
+
+        assert!(
+            roster.admits(theirs),
+            "a second workspace's recompute evicted the first workspace's member, \
+             so two workspaces on one node would flap each other's admission"
+        );
+        assert!(
+            roster.admits(mine),
+            "the workspace that recomputed last did not admit its own member"
+        );
+    }
+
+    /// Given a member of one workspace only, when a second workspace recomputes
+    /// without them, we expect them to remain admitted — admission is a union.
+    ///
+    /// Asserted rather than left implicit because it is a *limitation* being
+    /// pinned, not a feature: `on_accepting` sees an `EndpointId` and no
+    /// workspace, so this is the strongest answer the guard can give. Writing it
+    /// down means a future reader finds the residual here rather than assuming
+    /// the per-workspace keying bought isolation it does not.
+    #[test]
+    fn admission_is_a_union_across_workspaces() {
+        let roster = Roster::default();
+        let outsider_to_ws = endpoint();
+
+        roster.set_derived(OTHER_WS, [*outsider_to_ws.as_bytes()]);
+        roster.set_derived(WS, Vec::new());
+
+        assert!(
+            roster.admits(outsider_to_ws),
+            "a member of one workspace was refused although it is admitted to \
+             another on the same node; admission cannot be workspace-scoped, so \
+             this must hold or the guard would refuse legitimate peers"
+        );
+    }
+
+    /// Given two workspaces, when one is forgotten, we expect only its members
+    /// to stop being admitted.
+    ///
+    /// This is what `delete` and `leave` rely on. `admits` is a union, so a
+    /// workspace whose entry is merely emptied of *derived* members would still
+    /// admit its bootstrap inviter forever.
+    #[test]
+    fn forgetting_a_workspace_evicts_only_its_own_members() {
+        let roster = Roster::default();
+        let (leaving, staying) = (endpoint(), endpoint());
+
+        roster.add_bootstrap(WS, leaving);
+        roster.set_derived(WS, [*leaving.as_bytes()]);
+        roster.set_derived(OTHER_WS, [*staying.as_bytes()]);
+
+        roster.forget(WS);
+
+        assert!(
+            !roster.admits(leaving),
+            "a member of a deleted workspace was still admitted, including via the              bootstrap set that a derived recompute deliberately never prunes"
+        );
+        assert!(
+            roster.admits(staying),
+            "forgetting one workspace evicted another's members"
+        );
+    }
+
+    /// Given a workspace whose derived set is emptied, when nothing else has
+    /// admitted the peer, we expect it to be refused.
+    ///
+    /// The counterweight to the union test above: without this, `admits`
+    /// returning `true` unconditionally would satisfy that one.
+    #[test]
+    fn emptying_the_last_workspace_refuses_everyone_again() {
+        let roster = Roster::default();
+        let member = endpoint();
+
+        roster.set_derived(WS, [*member.as_bytes()]);
+        roster.set_derived(WS, Vec::new());
+
+        assert!(
+            !roster.admits(member),
+            "a member remained admitted after the only workspace admitting it \
+             recomputed to empty, so removal would not stop it connecting"
         );
     }
 }

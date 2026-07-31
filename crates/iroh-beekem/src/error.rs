@@ -47,4 +47,40 @@ pub enum WorkspaceError {
     /// The manifest has no document at the requested path.
     #[error("no document at path: {0}")]
     NoSuchPath(String),
+
+    /// An operation that needs durable storage was asked of an in-memory node.
+    ///
+    /// Reported rather than silently doing nothing, because the two nodes differ
+    /// in exactly the property the caller is relying on. A `list` that returned
+    /// an empty vector for a [`Node::spawn`](crate::Node::spawn) node would read
+    /// as "this node holds no workspaces" when the truth is "this node cannot
+    /// hold any across a restart".
+    #[error("this node has no persistent store; use Node::spawn_persistent")]
+    NotPersistent,
+
+    /// This node holds no snapshot for the requested workspace.
+    #[error("no stored workspace with tree id {}", hex(tree_id))]
+    NoSuchWorkspace {
+        /// The tree id that was asked for.
+        tree_id: [u8; 32],
+    },
+
+    /// The stored workspace belongs to a different device than the one opening
+    /// it.
+    ///
+    /// A snapshot carries its own signing key, so opening it under the wrong
+    /// identity would otherwise succeed and quietly act as its owner — writing
+    /// entries under their author id and issuing operations under their
+    /// capabilities. Refusing is the only way the mistake is visible.
+    #[error("this snapshot belongs to a different device")]
+    IdentityMismatch,
+}
+
+/// Lowercase hex, for naming a workspace in an error message.
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }

@@ -59,6 +59,7 @@ use crate::{
     capability::{CapabilityStore, Certificate, DeviceBinding, Grant, Role},
     content::{Chunk, ChunkRef},
     error::CoreError,
+    snapshot::{CgkaSnapshot, member_from_bytes},
     sync_poll::now_or_never,
 };
 
@@ -458,10 +459,103 @@ impl CgkaController {
         Ok(this)
     }
 
+    /// Capture the whole cryptographic state as a serializable value.
+    ///
+    /// Everything needed to resume: the tree (with `owner_sks` and every cached
+    /// PCS key), the signing key, the leaf secret, both member sets and the
+    /// certificate store. `parked` is excluded — see the
+    /// [module documentation](crate::snapshot) for why a recoverable cache is
+    /// not state.
+    #[must_use]
+    pub fn snapshot(&self) -> CgkaSnapshot {
+        CgkaSnapshot {
+            cgka: self.cgka.clone(),
+            signer: self.signer.0.to_bytes(),
+            share_secret: self.share_secret,
+            known_members: self.known_members.iter().map(MemberId::to_bytes).collect(),
+            current_members: self
+                .current_members
+                .iter()
+                .map(MemberId::to_bytes)
+                .collect(),
+            founder: self.certs.founder(),
+            certificates: self.certs.certificates(),
+            evicted_ops: self.evicted_ops,
+        }
+    }
+
+    /// Resume from a snapshot taken by [`Self::snapshot`].
+    ///
+    /// The capability closure is *recomputed* from the stored certificates
+    /// rather than restored from a stored derivation, which is what keeps a
+    /// resumed node's verdicts identical to a peer that never restarted.
+    ///
+    /// `share_key` is likewise recomputed from `share_secret`: storing both
+    /// would create a pair that a corrupted file could make inconsistent, and an
+    /// inconsistent pair fails at the first encryption rather than at load.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::MalformedKey`] if any stored identity is not a valid
+    /// Ed25519 verifying key.
+    pub fn from_snapshot(snapshot: CgkaSnapshot) -> Result<Self, CoreError> {
+        let CgkaSnapshot {
+            cgka,
+            signer,
+            share_secret,
+            known_members,
+            current_members,
+            founder,
+            certificates,
+            evicted_ops,
+        } = snapshot;
+
+        let signer = MemorySigner(ed25519_dalek::SigningKey::from_bytes(&signer));
+        let member_id = MemberId::from(signer.verifying_key());
+
+        let known_members = known_members
+            .into_iter()
+            .map(member_from_bytes)
+            .collect::<Result<HashSet<_>, _>>()?;
+        let current_members = current_members
+            .into_iter()
+            .map(member_from_bytes)
+            .collect::<Result<HashSet<_>, _>>()?;
+
+        let mut certs = CapabilityStore::new(founder);
+        certs.extend(certificates);
+
+        Ok(Self {
+            cgka,
+            signer,
+            member_id,
+            share_secret,
+            share_key: share_secret.share_key(),
+            known_members,
+            current_members,
+            certs,
+            // Empty by design: parked operations return with the next log
+            // exchange, and a snapshot is not the place to preserve a queue of
+            // operations whose predecessors may already have arrived.
+            parked: VecDeque::new(),
+            evicted_ops,
+        })
+    }
+
     /// This member's identity in the CGKA tree.
     #[must_use]
     pub fn member_id(&self) -> MemberId {
         self.member_id
+    }
+
+    /// The tree this controller belongs to.
+    ///
+    /// Read back off the founding `Add` rather than kept as a field, because
+    /// that operation is the one piece of state every member agrees on by
+    /// construction — a stored copy could disagree with the tree it labels.
+    #[must_use]
+    pub fn tree_id(&self) -> TreeId {
+        *self.cgka.init_add_op().payload.doc_id()
     }
 
     /// The number of members currently holding a leaf.

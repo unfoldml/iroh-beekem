@@ -42,6 +42,9 @@ adversarial-testing = []
 
 [dev-dependencies]
 rand_chacha = "0.3"
+# Snapshot round-tripping is a data transformation, so it is specified as a
+# property over generated workspace histories rather than as example states.
+proptest = "1"
 # Tests only, and pinned to the major version `keyhive_crypto` uses, because
 # `the_signed_payload_types_cannot_share_an_encoding` is only meaningful if it
 # serializes the way `Signed` does. bincode 2 has a different default config; if

@@ -8,6 +8,7 @@ pub mod identity;
 pub mod invite;
 pub mod node;
 mod roster;
+mod store;
 pub mod wire;
 pub mod workspace;
 
@@ -36,4 +37,4 @@ pub use iroh_beekem_core::Role;
 pub use keyhive_crypto::share_key::ShareKey;
 pub use node::Node;
 pub use wire::ControlMsg;
-pub use workspace::Workspace;
+pub use workspace::{Workspace, WorkspaceSummary};

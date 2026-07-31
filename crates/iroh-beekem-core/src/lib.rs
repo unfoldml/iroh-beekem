@@ -31,6 +31,7 @@ pub mod content;
 pub mod error;
 pub mod keys;
 pub mod manifest;
+pub mod snapshot;
 pub mod state;
 pub mod sync_poll;
 
@@ -40,4 +41,5 @@ pub use content::{Chunk, ChunkRef};
 pub use error::CoreError;
 pub use keys::{AuthorizedOp, CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome};
 pub use manifest::{DeviceDisplay, DeviceRecord, FileEntry, Manifest, UserRecord, WorkspaceInfo};
+pub use snapshot::{CgkaSnapshot, SNAPSHOT_VERSION, WorkspaceSnapshot};
 pub use state::{Effect, Event, NamespaceEpoch, RepairTarget, WorkspaceState};

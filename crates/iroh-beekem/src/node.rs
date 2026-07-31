@@ -22,19 +22,24 @@
 //! learned the namespace.
 
 use std::{
-    collections::HashSet,
     ops::Deref,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
-use iroh_blobs::{BlobsProtocol, store::mem::MemStore};
+use iroh_blobs::{
+    BlobsProtocol,
+    api::Store as BlobStore,
+    store::{fs::FsStore, mem::MemStore},
+};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::net::Gossip;
 
 use crate::{
     error::WorkspaceError,
     roster::{Roster, RosterGuard},
+    store::{BLOBS_DIR, DOCS_DIR, SpentNonces, Store},
 };
 
 /// A bound endpoint with all three workspace protocols running.
@@ -42,7 +47,13 @@ use crate::{
 pub struct Node {
     endpoint: Endpoint,
     router: Router,
-    blobs: MemStore,
+    /// The blob store, in-memory or filesystem-backed.
+    ///
+    /// Typed as the API-level `Store` rather than as either concrete backend so
+    /// that [`Self::spawn`] and [`Self::spawn_persistent`] produce the same
+    /// `Node`. `MemStore` and `FsStore` both `Deref` to this, so the router
+    /// registration and every caller are identical either way.
+    blobs: BlobStore,
     gossip: Gossip,
     docs: Docs,
     /// Who this node accepts connections from.
@@ -62,13 +73,17 @@ pub struct Node {
     /// lookup and an insert with no await inside it, so an async lock would buy
     /// nothing and cost a scheduler round trip on the join path.
     redeemed: RedeemedInvites,
+    /// Where this node persists, if it does.
+    ///
+    /// `None` for [`Self::spawn`], which is entirely in memory. Its presence is
+    /// what [`Workspace`](crate::Workspace) consults to decide whether to write a
+    /// snapshot after each change, so an in-memory node pays nothing for the
+    /// existence of the persistent one.
+    store: Option<Store>,
 }
 
-/// Invite nonces already spent, keyed by `(tree id, nonce)`.
-///
-/// A named type only because the nesting is otherwise unreadable; the tree id is
-/// part of the key so two workspaces on one node cannot collide.
-type RedeemedInvites = Arc<Mutex<HashSet<([u8; 32], [u8; 16])>>>;
+/// The spent-nonce ledger as the node holds it: shared, and mutable in place.
+type RedeemedInvites = Arc<Mutex<SpentNonces>>;
 
 impl Node {
     /// Bind an endpoint and start the blobs, gossip and docs protocols.
@@ -92,12 +107,99 @@ impl Node {
 
         // Every ALPN behind the same roster. Adding a fourth protocol without
         // wrapping it would silently reopen the hole this closes, which is why
-        // the guard is applied here rather than inside each protocol.
+        // registration goes through one shared helper rather than being spelled
+        // out once per constructor.
         let admission = Roster::default();
-        let router = Router::builder(endpoint.clone())
+        let blobs = blobs.deref().clone();
+        let router = Self::route(&endpoint, &blobs, &gossip, &docs, &admission);
+
+        Ok(Self {
+            endpoint,
+            router,
+            blobs,
+            gossip,
+            docs,
+            roster: admission,
+            redeemed: Arc::new(Mutex::new(SpentNonces::new())),
+            store: None,
+        })
+    }
+
+    /// Bind an endpoint backed by `root`, resuming whatever it already holds.
+    ///
+    /// Everything a restart needs lives under `root`: the endpoint secret key,
+    /// the spent-invite ledger, the blob and docs stores, and one snapshot per
+    /// workspace. See [`crate::store`] for the layout and for what each file
+    /// exposes.
+    ///
+    /// The endpoint key is the part that is easy to underrate. An `EndpointId`
+    /// *is* the peer's public key and *is* its entry on every peer's roster, so a
+    /// node that generated a new one on each start would be refused at the
+    /// connection level by the workspace it still cryptographically belongs to.
+    /// Persistence and admission control are one problem, and this is where they
+    /// meet.
+    ///
+    /// Workspaces are not opened here — the node knows only that snapshots
+    /// exist. Use [`Workspace::list`](crate::Workspace::list) to enumerate them
+    /// and [`Workspace::open`](crate::Workspace::open) to resume one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Storage`] if `root` cannot be prepared, if the
+    /// stored endpoint key is unreadable, or if either backing store fails to
+    /// open; [`WorkspaceError::Bind`] if the endpoint cannot bind.
+    pub async fn spawn_persistent(root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+        let store = Store::open(root)?;
+
+        // Bound to the stored key rather than a fresh one. This is the single
+        // line that makes a restart a restart rather than a new node.
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(store.endpoint_key()?)
+            .bind()
+            .await
+            .map_err(|e| WorkspaceError::Bind(e.to_string()))?;
+
+        let blobs = FsStore::load(store.subdir(BLOBS_DIR))
+            .await
+            .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let docs = Docs::persistent(store.subdir(DOCS_DIR))
+            .spawn(endpoint.clone(), blobs.deref().clone(), gossip.clone())
+            .await
+            .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+
+        let redeemed = store.load_redeemed()?;
+        let admission = Roster::default();
+        let router = Self::route(&endpoint, &blobs, &gossip, &docs, &admission);
+
+        Ok(Self {
+            endpoint,
+            router,
+            blobs: blobs.deref().clone(),
+            gossip,
+            docs,
+            roster: admission,
+            redeemed: Arc::new(Mutex::new(redeemed)),
+            store: Some(store),
+        })
+    }
+
+    /// Register all three protocols behind the roster guard.
+    ///
+    /// Shared by both constructors so that a protocol added to one is never
+    /// missing from the other, and so that no future ALPN can be registered
+    /// unguarded on one path only.
+    fn route(
+        endpoint: &Endpoint,
+        blobs: &BlobStore,
+        gossip: &Gossip,
+        docs: &Docs,
+        admission: &Roster,
+    ) -> Router {
+        Router::builder(endpoint.clone())
             .accept(
                 iroh_blobs::ALPN,
-                RosterGuard::new(admission.clone(), BlobsProtocol::new(&blobs, None)),
+                RosterGuard::new(admission.clone(), BlobsProtocol::new(blobs, None)),
             )
             .accept(
                 iroh_gossip::ALPN,
@@ -107,17 +209,7 @@ impl Node {
                 iroh_docs::ALPN,
                 RosterGuard::new(admission.clone(), docs.clone()),
             )
-            .spawn();
-
-        Ok(Self {
-            endpoint,
-            router,
-            blobs,
-            gossip,
-            docs,
-            roster: admission,
-            redeemed: Arc::new(Mutex::new(HashSet::new())),
-        })
+            .spawn()
     }
 
     /// Record an invite nonce as redeemed, and say whether it was fresh.
@@ -136,23 +228,41 @@ impl Node {
     /// case are the roster, which refuses the thief's endpoint, and namespace
     /// rotation, which abandons the replica the ticket points at.
     ///
-    /// # In memory only, and a restart un-consumes every nonce
+    /// # Durable on a persistent node, in memory otherwise
     ///
-    /// Stated rather than implied, because it is a real gap: this set does not
-    /// survive a process restart, so a ticket redeemed before a crash is
-    /// redeemable again after one — for as long as it has not expired, which is
-    /// the bound that still holds. Phase 7 persists it alongside the node's
-    /// endpoint secret key.
+    /// A node from [`Self::spawn_persistent`] writes the ledger through on every
+    /// claim, so a ticket redeemed before a crash stays spent after one. A node
+    /// from [`Self::spawn`] keeps it in memory only, and a restart un-consumes
+    /// every nonce — bounded by the invite's one-hour expiry, which is the
+    /// guarantee that holds either way.
+    ///
+    /// The write happens *after* the in-memory insert and its failure is logged
+    /// rather than returned, and the order is deliberate. Refusing the join
+    /// because the ledger could not be written would deny a legitimate invitee
+    /// over a full disk; accepting it leaves this node in exactly the position an
+    /// in-memory node is always in, which is a state the design already tolerates.
     ///
     /// Returns `false` if the lock is poisoned, which is the safe direction: a
     /// node that cannot consult its ledger must refuse the join rather than
     /// assume the nonce is fresh.
     #[must_use]
     pub fn claim_invite(&self, tree_id: [u8; 32], nonce: [u8; 16]) -> bool {
-        match self.redeemed.lock() {
-            Ok(mut redeemed) => redeemed.insert((tree_id, nonce)),
-            Err(_) => false,
+        let Ok(mut redeemed) = self.redeemed.lock() else {
+            return false;
+        };
+        if !redeemed.insert((tree_id, nonce)) {
+            return false;
         }
+        if let Some(store) = &self.store
+            && let Err(e) = store.store_redeemed(&redeemed)
+        {
+            tracing::warn!(
+                %e,
+                "an invite nonce was spent but could not be recorded; a restart \
+                 before it expires would make the ticket redeemable again"
+            );
+        }
+        true
     }
 
     /// This node's endpoint.
@@ -163,8 +273,13 @@ impl Node {
 
     /// The blob store holding encrypted chunk payloads.
     #[must_use]
-    pub fn blobs(&self) -> &MemStore {
+    pub fn blobs(&self) -> &BlobStore {
         &self.blobs
+    }
+
+    /// Where this node persists, or `None` if it is entirely in memory.
+    pub(crate) fn store(&self) -> Option<&Store> {
+        self.store.as_ref()
     }
 
     /// The gossip instance carrying the control plane.

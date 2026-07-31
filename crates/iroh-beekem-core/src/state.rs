@@ -38,11 +38,15 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use beekem::{id::MemberId, operation::CgkaOperation};
+use beekem::{
+    id::{MemberId, TreeId},
+    operation::CgkaOperation,
+};
 use keyhive_crypto::{share_key::ShareKey, signed::Signed};
 use loro::{ExportMode, LoroDoc};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
@@ -51,6 +55,7 @@ use crate::{
     error::CoreError,
     keys::{AuthorizedOp, CgkaController, DecryptOutcome, EpochId, MergeOutcome},
     manifest::{DeviceRecord, FileEntry, Manifest, WorkspaceInfo},
+    snapshot::{SNAPSHOT_VERSION, WorkspaceSnapshot, member_from_bytes},
 };
 
 /// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
@@ -266,6 +271,24 @@ pub enum Event {
         /// The member to remove.
         member: MemberId,
     },
+    /// The local user is walking away from the workspace.
+    ///
+    /// Removes every device of the *local* user, and nobody else's. Distinct
+    /// from [`Self::RemoveMember`] in two ways that both matter:
+    ///
+    /// * it needs no administrative role, because removing your own leaf is not
+    ///   an act of administration — `CgkaController::authorize` already admits a
+    ///   same-user `Remove`; and
+    /// * it emits **no** [`Effect::RotateNamespace`]. A leaver that rotated
+    ///   would mint the very capability it is walking away from and announce it
+    ///   to the group under a key the leaver still holds, which is a strictly
+    ///   worse position than not rotating at all.
+    ///
+    /// The consequence is worth stating plainly: **leaving is a courtesy, not a
+    /// security boundary.** It unlearns nothing the leaver could already read
+    /// and withdraws nothing it was given. An admin who wants the guarantees of
+    /// a removal must issue one.
+    Leave,
     /// The local user rotated their leaf key for post-compromise security.
     Rotate,
     /// An encrypted manifest replica arrived on the data plane.
@@ -688,14 +711,19 @@ impl Clone for WorkspaceState {
     /// against that snapshot would be reading live state. Round-tripping
     /// through a snapshot gives a genuinely independent copy.
     fn clone(&self) -> Self {
+        // Shares its mechanism with [`Self::export`] and differs only in error
+        // policy, which is forced: `Clone` cannot fail, so a document whose
+        // export errors becomes an empty copy here where `export` refuses. That
+        // is tolerable for a clone — the simulator's world snapshot loses one
+        // document's text — and would not be for a snapshot, where it would
+        // silently discard content the node is responsible for.
         let docs = self
             .docs
             .iter()
             .map(|(uuid, doc)| {
-                let copy = LoroDoc::new();
-                if let Ok(bytes) = doc.export(ExportMode::Snapshot) {
-                    let _ = copy.import(&bytes);
-                }
+                let copy = snapshot_doc(doc)
+                    .and_then(|bytes| restore_doc(&bytes))
+                    .unwrap_or_else(|_| LoroDoc::new());
                 (*uuid, copy)
             })
             .collect();
@@ -819,10 +847,157 @@ impl WorkspaceState {
         Ok(this)
     }
 
+    /// Capture this node's entire resumable state.
+    ///
+    /// See the [snapshot module documentation](crate::snapshot) for what is left
+    /// out and why, and for the warning that this value *is* the read capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the manifest or any document cannot be
+    /// exported. Unlike `Clone`, which cannot fail and so substitutes an empty
+    /// document, this refuses — a snapshot that silently dropped a document
+    /// would lose content on the next restart with nothing to indicate it.
+    pub fn snapshot(&self) -> Result<WorkspaceSnapshot, CoreError> {
+        // Both maps are iterated in sorted order rather than hash order, so that
+        // identical state encodes to identical bytes. That is what lets a test
+        // compare two snapshots directly, and what stops a storage backend from
+        // rewriting an unchanged file every time it is asked to save.
+        let mut docs: Vec<(DocumentUuid, Vec<u8>)> = self
+            .docs
+            .iter()
+            .map(|(uuid, doc)| snapshot_doc(doc).map(|bytes| (*uuid, bytes)))
+            .collect::<Result<_, _>>()?;
+        docs.sort_unstable_by_key(|(uuid, _)| *uuid);
+
+        let mut last_ref: Vec<(DocumentUuid, ChunkRef)> =
+            self.last_ref.iter().map(|(k, v)| (*k, *v)).collect();
+        last_ref.sort_unstable_by_key(|(uuid, _)| *uuid);
+
+        Ok(WorkspaceSnapshot {
+            version: SNAPSHOT_VERSION,
+            cgka: self.cgka.snapshot(),
+            secret: self.secret.to_bytes(),
+            manifest: self.manifest.export_snapshot()?,
+            docs,
+            last_ref,
+            endpoint_id: self.endpoint_id,
+            namespace: self.namespace,
+            namespace_ticket: self.namespace_ticket.clone(),
+            published_up_to: Vec::new(),
+        })
+    }
+
+    /// Encode [`Self::snapshot`] for storage.
+    ///
+    /// The result is wrapped in [`Zeroizing`] because these bytes are the local
+    /// signing key, the leaf secret, every cached PCS key and the blinding
+    /// secret. Storing them is the caller's job and so is protecting them; this
+    /// crate does no I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the state cannot be captured, or
+    /// [`CoreError::Serialization`] if it cannot be encoded.
+    pub fn export(&self) -> Result<Zeroizing<Vec<u8>>, CoreError> {
+        Ok(Zeroizing::new(postcard::to_stdvec(&self.snapshot()?)?))
+    }
+
+    /// Resume from a snapshot, reconstructing every observable it recorded.
+    ///
+    /// Neither [`Self::found`] nor [`Self::joined`] is involved, and that is the
+    /// point: `found` would mint a second set of founding certificates for a
+    /// workspace that already has them, and `joined` would start the node at an
+    /// empty manifest and a zero namespace generation. A restart is neither of
+    /// those events.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::SnapshotVersion`] if the layout is from another
+    /// build, [`CoreError::MalformedKey`] if a stored identity is not a valid
+    /// verifying key, or [`CoreError::Manifest`] if a stored document cannot be
+    /// read back.
+    pub fn from_snapshot(snapshot: WorkspaceSnapshot) -> Result<Self, CoreError> {
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(CoreError::SnapshotVersion {
+                found: snapshot.version,
+                expected: SNAPSHOT_VERSION,
+            });
+        }
+
+        let manifest = Manifest::new();
+        manifest.import(&snapshot.manifest)?;
+
+        let docs = snapshot
+            .docs
+            .into_iter()
+            .map(|(uuid, bytes)| restore_doc(&bytes).map(|doc| (uuid, doc)))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        Ok(Self {
+            cgka: CgkaController::from_snapshot(snapshot.cgka)?,
+            secret: WorkspaceSecret::new(snapshot.secret),
+            manifest,
+            docs,
+            // The parking areas start empty and the counters start at zero: both
+            // queues refill from the ordinary log exchange and resync, and a
+            // counter carried across a restart would describe a process that no
+            // longer exists. `evicted_ops` is the exception and is restored,
+            // because it counts a fault worth watching accumulate.
+            pending_chunks: VecDeque::new(),
+            pending_bytes: 0,
+            evicted_chunks: 0,
+            unreadable_chunks: 0,
+            corrupt_chunks: 0,
+            repairs_answered: 0,
+            last_ref: snapshot.last_ref.into_iter().collect(),
+            endpoint_id: snapshot.endpoint_id,
+            namespace: snapshot.namespace,
+            namespace_ticket: snapshot.namespace_ticket,
+        })
+    }
+
+    /// Decode and resume from [`Self::export`] bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Serialization`] if the bytes are not a snapshot, and
+    /// anything [`Self::from_snapshot`] returns.
+    pub fn import(bytes: &[u8]) -> Result<Self, CoreError> {
+        Self::from_snapshot(postcard::from_bytes(bytes)?)
+    }
+
     /// This node's CGKA identity.
     #[must_use]
     pub fn member_id(&self) -> MemberId {
         self.cgka.member_id()
+    }
+
+    /// The tree this workspace is, which is also the root of its capability
+    /// closure and the seed of its gossip topic.
+    ///
+    /// Needed by a storage backend to name what it is storing: a node may hold
+    /// several workspaces and the snapshot itself does not say which one it is.
+    #[must_use]
+    pub fn tree_id(&self) -> TreeId {
+        self.cgka.tree_id()
+    }
+
+    /// The blinding secret this workspace's storage keys are derived from.
+    ///
+    /// Exposed because a backend resuming from a snapshot has to rebuild its own
+    /// copy, and the snapshot is the only place it survives. It is not a new
+    /// disclosure: an [`Invite`] already carries the same 32 bytes to every
+    /// admitted device, and [`Self::export`] carries them to disk.
+    ///
+    /// It does not rotate, so a member who ever held it can always recognise
+    /// which blinded key belongs to a document UUID they knew — see the blinding
+    /// module for why rotating it is not free.
+    ///
+    /// [`Invite`]: https://docs.rs/iroh-beekem
+    #[must_use]
+    pub fn workspace_secret(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// The workspace manifest: the directory index and display data.
@@ -1123,6 +1298,7 @@ impl WorkspaceState {
                 self.on_add_device(member, share_key, &user, &label, endpoint, csprng)
             }
             Event::RemoveMember { member } => self.on_remove_member(member),
+            Event::Leave => self.on_leave(),
             Event::Rotate => {
                 let op = self.cgka.rotate(csprng)?;
                 Ok(vec![Effect::broadcast(op)])
@@ -1430,6 +1606,75 @@ impl WorkspaceState {
                 epoch: self.namespace.epoch,
             },
         ])
+    }
+
+    /// Retract every leaf belonging to the local user.
+    ///
+    /// # Why this is not `on_remove_member` in a loop
+    ///
+    /// Three differences, and each one would be a defect if it went the other
+    /// way.
+    ///
+    /// **No `require_admin`.** Leaving is not administration. `require_admin`
+    /// would make a workspace's viewers unable to leave it, which is both
+    /// absurd and unenforceable — `CgkaController::authorize` admits a same-user
+    /// `Remove` from any member, so every peer would accept the operation the
+    /// local guard had refused to emit.
+    ///
+    /// **No rotation.** `on_remove_member` mints a fresh namespace so the
+    /// removed device cannot follow the group. A leaver doing that would encrypt
+    /// the new capability under a group key it still holds and announce it to
+    /// everyone — handing itself the replica it is leaving. Rotation after a
+    /// departure is the *group's* job, and a departing member cannot be trusted
+    /// to have done it.
+    ///
+    /// **Every device at once.** Leaving with one of three devices still in the
+    /// tree is not leaving. The group is enumerated by user, so a partial
+    /// departure would show the leaver as still present while it had lost the
+    /// ability to act.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LastAdmin`] if this user is the only administrator.
+    /// A workspace that lost its last admin can never gain another — promotion
+    /// is itself an admin action — so the departure has to be refused rather
+    /// than allowed to strand everybody else.
+    fn on_leave(&mut self) -> Result<Vec<Effect>, CoreError> {
+        let me = self.member_id().to_bytes();
+        let user = self.capabilities().user_of(&me).unwrap_or(me);
+        self.require_not_last_admin(&user)?;
+
+        // Sorted so that the operations a leaver broadcasts are a function of
+        // its membership rather than of iteration order — two runs of the same
+        // scenario must put the same bytes on the wire.
+        let mut devices = self.capabilities().devices_of(&user);
+        devices.sort_unstable();
+        // A device with no binding stands in for itself, which is the case
+        // before this user's certificates have synced anywhere.
+        if devices.is_empty() {
+            devices.push(me);
+        } else {
+            // Certified devices found; the binding is authoritative.
+        }
+
+        let mut effects = Vec::new();
+        for device in devices {
+            let Ok(member) = member_from_bytes(device) else {
+                // A certificate carrying an off-curve device id cannot name a
+                // leaf, so there is nothing to remove. Skipped rather than
+                // fatal: one malformed record must not trap a user in a
+                // workspace they are trying to leave.
+                continue;
+            };
+            // `None` means the leaf is already gone — removed by an admin while
+            // this departure was in flight, or listed twice by two certificates.
+            if let Some(op) = self.cgka.remove_member(member)? {
+                effects.push(Effect::broadcast(op));
+            } else {
+                // Already not a member; nothing to broadcast for this device.
+            }
+        }
+        Ok(effects)
     }
 
     /// Encrypt a freshly minted namespace capability for the group.
@@ -2020,6 +2265,39 @@ impl WorkspaceState {
             ChunkVerdict::AwaitingDeps
         }
     }
+}
+
+/// Serialize one CRDT document for local copying or storage.
+///
+/// `ExportMode::Snapshot` rather than `all_updates()`, and the difference is not
+/// cosmetic: `all_updates()` is what makes a *published* chunk self-sufficient
+/// under loss, which nothing downstream of this needs — both callers hand the
+/// bytes straight to `restore_doc` on the same machine.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Manifest`], which is this crate's catch-all for a Loro
+/// failure whatever container it came from.
+fn snapshot_doc(doc: &LoroDoc) -> Result<Vec<u8>, CoreError> {
+    doc.commit();
+    doc.export(ExportMode::Snapshot)
+        .map_err(|e| CoreError::Manifest(e.to_string()))
+}
+
+/// Rebuild a CRDT document from [`snapshot_doc`] bytes.
+///
+/// Always a *fresh* [`LoroDoc`], because `LoroDoc::clone` returns another handle
+/// onto the same document — the aliasing hazard that makes
+/// [`WorkspaceState`]'s `Clone` hand-written in the first place.
+///
+/// # Errors
+///
+/// Returns [`CoreError::Manifest`] if the bytes are not a readable snapshot.
+fn restore_doc(bytes: &[u8]) -> Result<LoroDoc, CoreError> {
+    let doc = LoroDoc::new();
+    doc.import(bytes)
+        .map_err(|e| CoreError::Manifest(e.to_string()))?;
+    Ok(doc)
 }
 
 /// A fresh nonce, so two otherwise identical certificates have distinct digests.

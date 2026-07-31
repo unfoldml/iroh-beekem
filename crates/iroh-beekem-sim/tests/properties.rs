@@ -1465,3 +1465,469 @@ mod a_stolen_invite_buys_only_visibility {
         .run(deterministic());
     }
 }
+
+/// Story 2, `OfflineEdit` — "offline" in the two senses it can mean.
+///
+/// A node can be offline because it cannot *reach* anybody, or because it is not
+/// *running*. Both variants converge afterwards, and only the second says
+/// anything about persistence — which is why they are separate plans rather than
+/// one plan with more faults.
+///
+/// Both use [`Faults::scripted`] rather than the swarm plan every other module
+/// here runs under, and the choice costs something worth naming. Scripted and
+/// swarm specs are mutually exclusive in propsim, so these plans get no
+/// `latency_ms` or `reorder` from `Faults`; what they still get is
+/// `InMemory::unordered_lossy`, which supplies delay, reordering, two percent
+/// loss and one percent duplication at the transport layer regardless. What
+/// scripting buys in exchange is the one thing the swarm plan cannot do: place
+/// the fault at a chosen instant, so the run is guaranteed to contain the window
+/// the properties are about.
+mod an_offline_node_catches_up {
+    use propsim::prelude::*;
+
+    use super::{Duration, Honest, NODES, SEEDS, WorkspaceNode, joined};
+
+    /// When the fault lands, and when it is undone.
+    ///
+    /// Late enough that the group has formed and written something — the first
+    /// edit fires at 300ms and the first resync at 600ms — and early enough to
+    /// leave the rest of the horizon for catching up. The horizon is
+    /// `last scripted event + 10s`, so healing at four seconds gives a fourteen
+    /// second run and ten seconds of settling.
+    const FAULT_AT: Duration = Duration::from_millis(1500);
+    const REPAIR_AT: Duration = Duration::from_secs(4);
+
+    /// The ordinary member that goes away in the partition and crash variants.
+    const VICTIM: u64 = 2;
+
+    /// The founder, which gets a crash variant of its own.
+    ///
+    /// Both are needed, and the reason is that they fail differently. A crashed
+    /// *member* that resumed wrongly would re-run the join handshake — except
+    /// that `on_welcome` refuses to act on a node that already has state, so a
+    /// harness that forgot to branch on a restart would still look correct from
+    /// the member's side. A crashed *founder* has no such guard:
+    /// `on_start`'s founding branch is unconditional, so it would overwrite the
+    /// live workspace with a brand-new tree and fork the group under a second
+    /// root. Only this variant can catch that, which makes it the one that keeps
+    /// `no_node_ever_initialises_the_workspace_more_than_once` from being
+    /// vacuous.
+    const FOUNDER_VICTIM: u64 = 0;
+
+    fn scripted_plan(
+        faults: Faults,
+        properties: Vec<Property<WorkspaceNode<Honest>>>,
+    ) -> TestPlan<WorkspaceNode<Honest>> {
+        Simulation::plan::<WorkspaceNode<Honest>>()
+            .nodes(NODES)
+            .transport(InMemory::unordered_lossy())
+            .faults(faults)
+            .state_machine()
+            .check(properties)
+            .seeds(SEEDS)
+            .finish()
+    }
+
+    /// The disconnected variant: node 2 is severed, then reconnected.
+    fn partitioned(
+        properties: Vec<Property<WorkspaceNode<Honest>>>,
+    ) -> TestPlan<WorkspaceNode<Honest>> {
+        scripted_plan(
+            Faults::scripted()
+                .at(FAULT_AT)
+                .partition(&[0, 1], &[VICTIM])
+                .at(REPAIR_AT)
+                .heal_all(),
+            properties,
+        )
+    }
+
+    /// The shut-down variant: one node stops, then starts again.
+    fn crashed_node(
+        victim: u64,
+        properties: Vec<Property<WorkspaceNode<Honest>>>,
+    ) -> TestPlan<WorkspaceNode<Honest>> {
+        scripted_plan(
+            Faults::scripted()
+                .at(FAULT_AT)
+                .crash(victim)
+                .at(REPAIR_AT)
+                .restart(victim),
+            properties,
+        )
+    }
+
+    /// An ordinary member stops and starts again.
+    fn crashed(
+        properties: Vec<Property<WorkspaceNode<Honest>>>,
+    ) -> TestPlan<WorkspaceNode<Honest>> {
+        crashed_node(VICTIM, properties)
+    }
+
+    /// The group's only admin stops and starts again.
+    fn crashed_founder(
+        properties: Vec<Property<WorkspaceNode<Honest>>>,
+    ) -> TestPlan<WorkspaceNode<Honest>> {
+        crashed_node(FOUNDER_VICTIM, properties)
+    }
+
+    /// The multiset of characters in a node's every document.
+    ///
+    /// Compared rather than the string itself because Loro's ordering of
+    /// concurrent inserts is an implementation detail; what convergence claims
+    /// is that no node holds a character another does not.
+    fn shape(node: &WorkspaceNode<Honest>) -> Vec<char> {
+        let mut chars: Vec<char> = node.all_text().concat().chars().collect();
+        chars.sort_unstable();
+        chars
+    }
+
+    /// In a group partitioned in two and later healed, upon the network
+    /// settling, we expect every node to hold the same content.
+    ///
+    /// The severed node keeps editing throughout — nothing suppresses its
+    /// timers — so this is a genuine two-sided reconciliation and not a
+    /// catch-up by an idle peer.
+    #[test]
+    fn every_document_converges_after_the_partition_heals() {
+        partitioned(vec![
+            property::eventually_within(
+                "every node holds the same content after the partition heals",
+                Duration::from_secs(9),
+                |w: &World<'_, WorkspaceNode<Honest>>| {
+                    let nodes = joined(w);
+                    // Guarded on the count: at t=0 only the founder has joined, and
+                    // a one-element set agrees with itself trivially.
+                    nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+                },
+            )
+            .after(Event::NetworkHealed),
+        ])
+        .run(deterministic());
+    }
+
+    /// In a partitioned group, upon a node writing on either side of the split,
+    /// we expect that node to be able to read its own write immediately.
+    ///
+    /// Local-first means a partition costs reachability, never local progress. A
+    /// node that could not read back what it just wrote while cut off would have
+    /// made the write conditional on the network, which is the property this
+    /// whole design exists to avoid.
+    #[test]
+    fn a_nodes_own_writes_are_readable_locally_throughout_the_partition() {
+        partitioned(vec![property::always(
+            "every joined node can read its own contributions at all times",
+            |w: &World<'_, WorkspaceNode<Honest>>| {
+                joined(w).iter().all(|n| {
+                    let text = n.document_text();
+                    n.contributed().iter().all(|frag| text.contains(frag))
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a partitioned group, upon healing, we expect the derived rosters and
+    /// the role assignments to agree again.
+    ///
+    /// Content converging is not enough on its own: the roster and the
+    /// capability closure travel on the control plane, and a heal that restored
+    /// the data plane while leaving membership split would look like success
+    /// from every text-only property.
+    #[test]
+    fn membership_and_roles_converge_after_the_partition_heals() {
+        partitioned(vec![
+            property::eventually_within(
+                "every node derives the same roster after the partition heals",
+                Duration::from_secs(9),
+                |w: &World<'_, WorkspaceNode<Honest>>| {
+                    let nodes = joined(w);
+                    nodes.len() == NODES
+                        && nodes
+                            .windows(2)
+                            .all(|p| p[0].derived_roster() == p[1].derived_roster())
+                        && nodes.iter().all(|n| n.admin_count() == 1)
+                },
+            )
+            .after(Event::NetworkHealed),
+        ])
+        .run(deterministic());
+    }
+
+    /// In a group where one node crashes and restarts, upon the node rejoining,
+    /// we expect every node to hold the same content again.
+    #[test]
+    fn every_document_converges_after_the_crashed_node_restarts() {
+        crashed(vec![
+            property::eventually_within(
+                "every node holds the same content after the restart",
+                Duration::from_secs(9),
+                |w: &World<'_, WorkspaceNode<Honest>>| {
+                    let nodes = joined(w);
+                    nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+                },
+            )
+            .after(Event::NodeRejoined),
+        ])
+        .run(deterministic());
+    }
+
+    /// In a group where a node restarts, upon it coming back, we expect it never
+    /// to have founded or joined the workspace a second time.
+    ///
+    /// **This is the property that keeps the harness honest**, and without it
+    /// every other property in this module would pass against a restart that was
+    /// really a re-invitation. propsim freezes a crashed node rather than
+    /// destroying it, so a node that did nothing on its second `on_start` would
+    /// still hold all its state and still converge; and a node that re-ran
+    /// `on_start`'s founding branch would fork the group under a second root
+    /// while *also* still converging on the honest path, because there is only
+    /// one node that founds.
+    #[test]
+    fn no_node_ever_initialises_the_workspace_more_than_once() {
+        crashed_founder(vec![property::always(
+            "no node founds or joins the workspace twice",
+            |w: &World<'_, WorkspaceNode<Honest>>| w.nodes().all(|n| n.initialisations() <= 1),
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group where a node restarts, upon it coming back, we expect the
+    /// writes it had acknowledged before the crash to still be in its own view.
+    ///
+    /// This is what "written before acknowledged" buys. The simulated disk is
+    /// updated inside `on_client_op` before the response is returned, exactly as
+    /// `Workspace::drive` writes before returning `Ok`, so a fragment this node
+    /// promised to keep must survive its own amnesia.
+    #[test]
+    fn a_restarted_node_still_holds_the_writes_it_acknowledged() {
+        crashed(vec![property::always(
+            "a node's acknowledged writes are in its own view even after a restart",
+            |w: &World<'_, WorkspaceNode<Honest>>| {
+                w.nodes().filter(|n| n.has_joined()).all(|n| {
+                    let text = n.document_text();
+                    n.contributed().iter().all(|frag| text.contains(frag))
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the scripted crash firing, we expect a node to have
+    /// actually restarted from a disk it had actually written.
+    ///
+    /// The anti-vacuity guard for the four properties above. Every one of them
+    /// is satisfied by a run in which nothing ever crashed, and three of them by
+    /// a run in which the crashed node had never written a snapshot — so without
+    /// this the module could go green while testing none of what it names.
+    #[test]
+    fn the_run_really_does_crash_a_node_that_had_something_to_lose() {
+        crashed(vec![property::sometimes(
+            "some node restarts from a disk it had written",
+            |w: &World<'_, WorkspaceNode<Honest>>| {
+                w.nodes().any(|n| n.reboots() > 0 && n.has_disk())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon a node restarting, we expect it to be a member again.
+    ///
+    /// Separate from convergence on purpose. A restarted node that came back
+    /// with no state would trivially satisfy every `always` above — it
+    /// contributes nothing to compare — and would be filtered out of `joined`
+    /// entirely. This is the property that says the disk was actually read.
+    #[test]
+    fn a_restarted_node_is_a_member_again_without_being_re_invited() {
+        crashed(vec![
+            property::eventually_within(
+                "every node is joined again after the restart",
+                Duration::from_secs(9),
+                |w: &World<'_, WorkspaceNode<Honest>>| joined(w).len() == NODES,
+            )
+            .after(Event::NodeRejoined),
+        ])
+        .run(deterministic());
+    }
+
+    /// In a group whose founder crashes and restarts, upon the network settling,
+    /// we expect every node to hold the same content.
+    ///
+    /// The second of the two properties that catch a founder resuming as a fresh
+    /// start, and it catches it by a different route than
+    /// `no_node_ever_initialises_the_workspace_more_than_once`: a re-founded
+    /// node holds an empty workspace over a second tree, so it converges with
+    /// nobody.
+    ///
+    /// Worth recording what does *not* catch it, because it looks like it
+    /// should: asserting `admin_count() == 1` everywhere. A re-founded node is
+    /// the sole admin of its own new tree, so it reports exactly one
+    /// administrator, and so does everybody else. The fork is invisible to any
+    /// property that asks each node about itself rather than comparing them.
+    #[test]
+    fn every_document_converges_after_the_founder_restarts() {
+        crashed_founder(vec![
+            property::eventually_within(
+                "every node holds the same content after the founder restarts",
+                Duration::from_secs(9),
+                |w: &World<'_, WorkspaceNode<Honest>>| {
+                    let nodes = joined(w);
+                    nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+                },
+            )
+            .after(Event::NodeRejoined),
+        ])
+        .run(deterministic());
+    }
+
+    /// Reproducibility, as every other scenario asserts it.
+    #[test]
+    fn the_restart_run_is_reproducible() {
+        assert_deterministic(|| crashed(Vec::new()), Seed(0x0DEA_D515));
+    }
+}
+
+/// A member that walks away, as distinct from one the group throws out.
+///
+/// Every other membership change in this suite is issued by the founder. A
+/// departure is issued by the departing member, needs no administrative role,
+/// and — the part that is easy to get wrong — rotates nothing. Getting it wrong
+/// is silent: a `leave` built as a self-issued `RemoveMember` would rotate the
+/// namespace, every convergence property would still pass, and the leaver would
+/// have minted and then received the capability for the replica it was leaving.
+mod a_member_leaves_of_its_own_accord {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{Departure, WorkspaceNode};
+    use propsim::prelude::*;
+
+    use super::{NODES, joined, plan};
+
+    /// The nodes that are staying.
+    fn remaining<'a>(
+        w: &'a World<'a, WorkspaceNode<Departure>>,
+    ) -> Vec<&'a WorkspaceNode<Departure>> {
+        joined(w)
+            .into_iter()
+            .filter(|n| !n.is_departing())
+            .collect()
+    }
+
+    /// In a group one of whose members leaves, upon the network settling, we
+    /// expect the remaining members to stop counting it.
+    #[test]
+    fn a_departing_member_eventually_leaves_every_remaining_members_group() {
+        plan::<Departure>(vec![property::eventually_within(
+            "every remaining member's group has shrunk by one",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Departure>>| {
+                let staying = remaining(w);
+                staying.len() == NODES - 1
+                    && staying
+                        .iter()
+                        .all(|n| u32::try_from(NODES - 1) == Ok(n.group_size()))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group one of whose members leaves, upon the departure, we expect no
+    /// node to move to a new namespace.
+    ///
+    /// The behavioural difference from a removal, stated as the property that
+    /// would catch it collapsing. A leaver cannot usefully rotate: it would mint
+    /// the capability and announce it under a group key it still holds, giving
+    /// itself the replica it had just walked away from. Rotation after a
+    /// departure is the group's job, and this scenario deliberately has nobody
+    /// do it.
+    #[test]
+    fn a_departure_never_rotates_the_namespace() {
+        plan::<Departure>(vec![property::always(
+            "no node ever adopts a rotated namespace",
+            |w: &World<'_, WorkspaceNode<Departure>>| w.nodes().all(|n| !n.has_rotated()),
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group one of whose members leaves, upon the network settling, we
+    /// expect every *remaining* member to still be on every other remaining
+    /// member's roster.
+    ///
+    /// `Event::Leave` retracts every device of the *local* user and no others.
+    /// A version that removed by role, or that iterated the wrong certificate
+    /// map, would let a departing viewer take the administrator with it — and
+    /// every peer would accept it, since a `Remove` naming a member of the
+    /// issuer's own user is authorised without any role at all.
+    ///
+    /// Stated as an eventual claim about *who* is left, not as an invariant
+    /// about how many. `group_size` legitimately climbs from one as the group
+    /// onboards, so an `always` bound on it is false at t=0 for reasons that
+    /// have nothing to do with departures — the "guard the length" hazard this
+    /// suite runs into whenever a count is asserted before the group has formed.
+    #[test]
+    fn a_departure_never_retracts_anybody_elses_leaf() {
+        plan::<Departure>(vec![property::eventually_within(
+            "every remaining member derives a roster containing every other one",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Departure>>| {
+                let staying = remaining(w);
+                staying.len() == NODES - 1
+                    && staying.iter().all(|n| {
+                        staying
+                            .iter()
+                            .all(|other| n.is_on_roster(NodeId(other.id())))
+                            && n.admin_count() == 1
+                    })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group one of whose members leaves, upon the network settling, we
+    /// expect the remaining members to hold identical content.
+    ///
+    /// A departure removes leaves from the tree, which forces a re-key on
+    /// everyone still in it. Convergence through that is the liveness half of
+    /// the story: the safety properties above are all satisfied by a group that
+    /// simply stopped.
+    #[test]
+    fn the_remaining_members_converge_through_the_departure() {
+        plan::<Departure>(vec![property::eventually_within(
+            "the remaining members hold the same content",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Departure>>| {
+                let staying = remaining(w);
+                staying.len() == NODES - 1 && staying.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// The multiset of characters across every document.
+    fn shape(node: &WorkspaceNode<Departure>) -> Vec<char> {
+        let mut chars: Vec<char> = node.all_text().concat().chars().collect();
+        chars.sort_unstable();
+        chars
+    }
+
+    /// In this plan, upon the run finishing, we expect the departure to have
+    /// actually happened.
+    ///
+    /// The anti-vacuity guard. `a_departure_never_rotates_the_namespace` and
+    /// `a_departure_never_retracts_anybody_elses_leaf` are both satisfied by a
+    /// run in which nobody ever left.
+    #[test]
+    fn somebody_really_does_leave_in_this_run() {
+        plan::<Departure>(vec![property::sometimes(
+            "the departing node has issued its departure",
+            |w: &World<'_, WorkspaceNode<Departure>>| w.nodes().any(WorkspaceNode::has_left),
+        )])
+        .run(deterministic());
+    }
+
+    /// Reproducibility, as every other scenario asserts it.
+    #[test]
+    fn the_departure_run_is_reproducible() {
+        assert_deterministic(|| plan::<Departure>(Vec::new()), Seed(0x0DEA_2712));
+    }
+}

@@ -141,15 +141,17 @@ impl WorkspaceSecret {
     /// * **Distinct across members**, from `member`. The workspace secret is
     ///   shared by everyone — it travels in the invite — so deriving from it
     ///   alone would hand every member of a workspace *the same* author id.
-    ///   That would collapse [`Manifest::author_may_write`] into a single map
-    ///   entry that each member overwrites in turn, and with it every
+    ///   That would collapse [`WorkspaceState::author_may_write`] into a single
+    ///   map entry that each member overwrites in turn, and with it every
     ///   per-author decision the data plane makes.
     ///
     /// It must also be stable across restarts: an author id that changes when
     /// the process does is one whose entries every peer rejects until an admin
-    /// grants a role to an identity nobody has seen.
+    /// grants a role to an identity nobody has seen. That is what makes this a
+    /// derivation rather than a stored random value — `Workspace::assemble` calls
+    /// it on every start and gets the same author back.
     ///
-    /// [`Manifest::author_may_write`]: crate::manifest::Manifest::author_may_write
+    /// [`WorkspaceState::author_may_write`]: crate::state::WorkspaceState::author_may_write
     #[must_use]
     pub fn author_seed(&self, member: &[u8; 32]) -> [u8; 32] {
         // Concatenated rather than chained: BLAKE3's key material is a byte

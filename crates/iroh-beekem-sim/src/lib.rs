@@ -174,6 +174,13 @@ pub const POST_REVOCATION_DOC: DocumentUuid = DOCS[2];
 /// eviction.
 const WRITE_AFTER_REVOKE_AT: Duration = Duration::from_secs(6);
 
+/// When the departing member of a `Departure` run walks away.
+///
+/// After the first edits and the first few resyncs, so the leaver is a settled,
+/// fully-synced member when it goes — and early enough that the rest of the
+/// horizon shows what the remaining members do about it.
+const LEAVE_AT: Duration = Duration::from_secs(3);
+
 /// How often a forging node emits an operation signed by a non-member key.
 const FORGE_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -257,6 +264,20 @@ pub trait Scenario: Clone + Default + 'static {
     /// would. Modelling it as honouring the check would make every property below
     /// pass for the wrong reason.
     const INVITE_THIEF: Option<u64> = None;
+
+    /// A node that walks away of its own accord partway through the run.
+    ///
+    /// Distinct from [`Self::REVOKE`] in who acts and in what it costs. A
+    /// revocation is issued by an admin and rotates the namespace, so the target
+    /// is locked out of the replica as well as the tree. A departure is issued
+    /// by the member itself, needs no role, and rotates nothing — the leaver
+    /// keeps every key it ever derived and every entry it already synced.
+    ///
+    /// Modelled because that difference is exactly what a property can get
+    /// wrong: a `leave` implemented as a self-issued `RemoveMember` would rotate,
+    /// and every convergence property would still pass while the departing
+    /// member quietly minted and received the capability it was leaving.
+    const LEAVE: Option<u64> = None;
 }
 
 /// The base protocol: joins, edits and anti-entropy, nothing adversarial.
@@ -353,6 +374,24 @@ impl Scenario for Revenant {
 /// and a rotation that did nothing at all would pass.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StolenInvite;
+
+/// A member that leaves the workspace of its own accord.
+///
+/// Node 2 joins, participates, and then issues `Event::Leave`. Nobody removes
+/// it, nothing rotates, and the remaining members have to converge through a
+/// membership change that arrived from an unexpected direction — every other
+/// scenario's membership changes are issued by the founder.
+///
+/// The founder does not rotate here either (`ROTATE` stays false), and that is
+/// deliberate: a concurrent rotation would give the remaining members a second
+/// reason to re-key, and `a_departure_never_rotates_the_namespace` could then
+/// pass or fail according to which one they observed first.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Departure;
+
+impl Scenario for Departure {
+    const LEAVE: Option<u64> = Some(2);
+}
 impl Scenario for StolenInvite {
     const INVITE_THIEF: Option<u64> = Some(3);
     const REVOKE: Option<u64> = Some(2);
@@ -641,6 +680,8 @@ pub enum Tick {
     Forge,
     /// Time for a member to act beyond the role it was granted.
     Overreach,
+    /// Time for a member to leave the workspace of its own accord.
+    Leave,
 }
 
 /// One simulated workspace participant.
@@ -710,6 +751,13 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// any node could apply anything — and a real client queues an edit made
     /// while it is still connecting rather than discarding it.
     deferred_ops: Vec<(OpToken, WsOp)>,
+    /// Whether this node has walked away from the workspace.
+    ///
+    /// Recorded rather than inferred from [`Scenario::LEAVE`], because the
+    /// constant is true from `on_start` and the departure happens seconds later.
+    /// A property about what a departure changes is vacuous before it has
+    /// happened, so it asserts on this and not on the scenario.
+    left: bool,
     /// Whether this node has redeemed a ticket issued to somebody else.
     ///
     /// Only ever true for [`Scenario::INVITE_THIEF`]. Recorded rather than
@@ -718,7 +766,62 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// a property that could not tell the two apart would pass in a run where the
     /// ticket never arrived.
     stolen_invite: bool,
+    /// This node's simulated disk, or `None` if it has never written one.
+    ///
+    /// The one field a reboot deliberately keeps. Everything else a restarted
+    /// node has, it has because it read it back from here.
+    disk: Option<Disk>,
+    /// Whether [`Node::on_start`] has already run once on this node.
+    ///
+    /// propsim calls `on_start` a second time on the *same object* when a
+    /// crashed node restarts — it does not rebuild the node, and there is no
+    /// `on_crash` hook — so this flag is the only way a node can tell a restart
+    /// from a first start, and authoring the amnesia is entirely up to it.
+    started: bool,
+    /// How many times this node has restarted.
+    ///
+    /// Observable so that a `sometimes` property can prove a run actually
+    /// crashed somebody. Swarm faults omit each enabled kind with probability
+    /// one half per seed, so without this guard the whole restart suite could
+    /// pass on seeds where nothing ever went down.
+    reboots: u32,
+    /// How many times this node has founded or joined the workspace.
+    ///
+    /// Must never exceed one. It is the guard against the harness quietly
+    /// degenerating into what it replaced: `on_start` re-running `found` would
+    /// fork the group under the founder, and re-running the join handshake would
+    /// make "a restart" mean "a re-invitation" — under which every convergence
+    /// property below would still pass while testing nothing about persistence.
+    initialisations: u32,
     _scenario: PhantomData<S>,
+}
+
+/// What a simulated node keeps across a crash.
+///
+/// The modelled filesystem. Its contents mirror what a real persistent node
+/// writes: [`WorkspaceState::export`] bytes plus the facade-level state that
+/// lives outside the core — here, the modelled `iroh-docs` replica and the
+/// bookkeeping a property reads.
+///
+/// Written at the same instant the real one is: **before** a client operation is
+/// acknowledged (see [`WorkspaceNode::apply_op`]), which is what makes "an
+/// acknowledged write survives a restart" a claim the harness can actually
+/// falsify rather than one it assumes.
+#[derive(Clone, Debug)]
+struct Disk {
+    /// The core snapshot.
+    state: Vec<u8>,
+    /// The modelled replica, which is redb-backed in production and so durable.
+    index: BTreeMap<StorageKey, EntryMeta>,
+    /// Peers accepted on faith. Durable because the real bootstrap entry comes
+    /// from the invite, and a restarting node has no invite to re-read.
+    bootstrap: BTreeSet<NodeId>,
+    /// Text this node acknowledged writing.
+    ///
+    /// Durable because it is the *record* of acknowledgement: a property that
+    /// compared a restarted node's text against a list of writes it never
+    /// promised to keep would be asserting something the library never claimed.
+    contributed: Vec<String>,
 }
 
 impl<S: Scenario> std::fmt::Debug for WorkspaceNode<S> {
@@ -846,6 +949,49 @@ impl<S: Scenario> WorkspaceNode<S> {
     #[must_use]
     pub fn is_invite_thief(&self) -> bool {
         S::INVITE_THIEF == Some(self.me)
+    }
+
+    /// Whether this node has left the workspace of its own accord.
+    #[must_use]
+    pub fn has_left(&self) -> bool {
+        self.left
+    }
+
+    /// Whether this node is the one the scenario has walk away.
+    #[must_use]
+    pub fn is_departing(&self) -> bool {
+        S::LEAVE == Some(self.me)
+    }
+
+    /// How many times this node has restarted from its simulated disk.
+    ///
+    /// Read by the `sometimes` guard that proves a run actually crashed
+    /// somebody: swarm faults omit each enabled kind with probability one half
+    /// per seed, so a restart suite with no such guard can pass entirely on
+    /// seeds where nothing ever went down.
+    #[must_use]
+    pub fn reboots(&self) -> u32 {
+        self.reboots
+    }
+
+    /// How many times this node has founded or joined the workspace.
+    ///
+    /// Must never exceed one, and the property asserting so is what stops the
+    /// restart harness degenerating into a re-invitation test — see
+    /// [`WorkspaceNode::reboot`] for the two ways that happens.
+    #[must_use]
+    pub fn initialisations(&self) -> u32 {
+        self.initialisations
+    }
+
+    /// Whether this node holds a simulated disk it could restart from.
+    ///
+    /// The counterweight to [`Self::reboots`]: a run in which every crash hit a
+    /// node that had never written anything would satisfy "somebody restarted"
+    /// while proving nothing about resumption.
+    #[must_use]
+    pub fn has_disk(&self) -> bool {
+        self.disk.is_some()
     }
 
     /// Whether a stolen ticket has actually reached this node yet.
@@ -1307,6 +1453,140 @@ impl<S: Scenario> WorkspaceNode<S> {
         WsResp::Applied
     }
 
+    /// Arm this node's scenario timers.
+    ///
+    /// Shared by a first start and a restart so that a resumed node keeps
+    /// participating: a restarted node that never re-armed `Tick::Resync` would
+    /// go silent, and the convergence it then failed to reach would be an
+    /// artefact of the harness rather than a fact about the protocol.
+    ///
+    /// The one-shot timers are re-armed too, and that is safe rather than
+    /// merely convenient: a second `Tick::Revoke` removes a member who is
+    /// already gone, which `on_remove_member` answers with no effects at all
+    /// precisely so that repeating a removal cannot churn the group's namespace.
+    fn arm_timers(&mut self, cx: &mut dyn Ctx<Self>) {
+        let me = cx.me();
+        cx.set_timer(Tick::Edit, FIRST_EDIT);
+        cx.set_timer(Tick::Resync, RESYNC_INTERVAL);
+
+        // The victim does not rotate: an operation it issued after its own
+        // removal could never be applied by anyone, and would sit parked on
+        // every honest node forever — a property failure about the scenario
+        // rather than about the protocol.
+        if S::ROTATE && !self.is_revocation_target() {
+            cx.set_timer(Tick::Rotate, FIRST_ROTATE);
+        }
+        if me.0 == FOUNDER && S::REVOKE.is_some() {
+            cx.set_timer(Tick::Revoke, REVOKE_AT);
+        }
+        if me.0 == FOUNDER && S::WRITE_AFTER_REVOKE {
+            cx.set_timer(Tick::LateEdit, WRITE_AFTER_REVOKE_AT);
+        }
+        if S::INSIDER == Some(me.0) {
+            // Deliberately *after* the first edits, so the insider is a settled
+            // member of a working group before it misbehaves. An attack that ran
+            // during onboarding would be indistinguishable from a joiner whose
+            // certificates had not arrived, and the properties would not be able
+            // to say which they had caught.
+            cx.set_timer(Tick::Overreach, OVERREACH_INTERVAL * 3);
+        } else {
+            // Not the insider, or no insider in this scenario.
+        }
+        if S::FORGE && me.0 != FOUNDER {
+            cx.set_timer(Tick::Forge, FORGE_INTERVAL);
+        }
+        if S::LEAVE == Some(me.0) {
+            // Late enough that the leaver has joined, edited and been seen by
+            // everybody. A departure during onboarding would be
+            // indistinguishable from a join that never completed, and the
+            // properties could not say which they had observed.
+            cx.set_timer(Tick::Leave, LEAVE_AT);
+        } else {
+            // Not the leaver, or nobody leaves in this scenario.
+        }
+    }
+
+    /// Write this node's simulated disk.
+    ///
+    /// Called at the boundaries where a batch of work finishes — one per
+    /// message, timer or client operation — which is the same rule
+    /// `Workspace::persist` follows and for the same reason: a write per effect
+    /// batch would cost O(documents) per arriving chunk.
+    ///
+    /// A node with no state writes nothing rather than writing an empty disk, so
+    /// that a node crashed before it ever joined comes back as one that never
+    /// joined rather than as one that joined and lost everything.
+    fn save(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let Ok(bytes) = state.export() else {
+            // Matching the facade, which logs and keeps running: a snapshot that
+            // cannot be captured must not turn an applied local edit into a
+            // failure the caller might retry.
+            return;
+        };
+        self.disk = Some(Disk {
+            state: bytes.to_vec(),
+            index: self.index.clone(),
+            bootstrap: self.bootstrap.clone(),
+            contributed: self.contributed.clone(),
+        });
+    }
+
+    /// Come back from a crash: discard everything volatile, then read the disk.
+    ///
+    /// **The discarding is the point.** propsim freezes a crashed node rather
+    /// than destroying it — `dispatch_start` hands `on_start` the same object,
+    /// with `state`, `index` and every counter intact — so a harness that only
+    /// *restored* from disk would be testing a node that never forgot anything.
+    /// Every convergence property would pass, and none of them would be about
+    /// persistence. The wipe below is what makes the disk load-bearing.
+    ///
+    /// Kept across the boundary: the disk itself, this node's identity, and the
+    /// per-scenario budget counters. Those last are harness bookkeeping — how
+    /// much of the scripted workload has already run — not node state, and
+    /// resetting them would let a restarted node edit, rotate and forge all over
+    /// again, changing the scenario rather than restarting a participant.
+    fn reboot(&mut self) {
+        self.reboots += 1;
+
+        // Volatile by nature: buffered and deferred work, the repair rate
+        // limiter, and the derived roster. Each is rebuilt from what arrives
+        // next, and none of it is anything a real node writes down.
+        self.inbox.clear();
+        self.deferred_ops.clear();
+        self.repair_sent.clear();
+        self.roster.clear();
+        self.observed_ops = 0;
+
+        // Volatile because the disk is authoritative for all three. Clearing
+        // them first means a node whose disk is absent or unreadable comes back
+        // genuinely empty rather than half-remembering.
+        self.state = None;
+        self.index.clear();
+        self.bootstrap.clear();
+        self.contributed.clear();
+        self.namespace = NamespaceEpoch::INITIAL;
+
+        let Some(disk) = self.disk.clone() else {
+            // Crashed before it ever wrote anything. Correct, and not the same
+            // as a fresh node: it does not re-run the join handshake, so it
+            // stays out of the group. A node in this state is exactly what
+            // `no_node_ever_initialises_more_than_once` is protecting.
+            return;
+        };
+        let Ok(state) = WorkspaceState::import(&disk.state) else {
+            return;
+        };
+        self.namespace = state.namespace();
+        self.state = Some(state);
+        self.index = disk.index;
+        self.bootstrap = disk.bootstrap;
+        self.contributed = disk.contributed;
+        self.refresh_roster();
+    }
+
     /// Re-announce every document this node holds.
     ///
     /// The simulator's counterpart to the facade's republish-on-neighbour-up.
@@ -1672,6 +1952,7 @@ impl<S: Scenario> WorkspaceNode<S> {
         let Ok(cgka) = CgkaController::join(tree_id(), signer, share_secret, log, certs) else {
             return;
         };
+        self.initialisations += 1;
         self.state = Some(WorkspaceState::joined(
             cgka,
             WorkspaceSecret::new(secret),
@@ -1759,15 +2040,29 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         self.signer = Some(signer.clone());
         self.share_secret = Some(share_secret);
 
+        if self.started {
+            // A restart, not a start. Neither branch below may run: re-founding
+            // would give the group a second root and fork it, and re-sending a
+            // `Hello` would make this a re-invitation rather than a resumption.
+            // The founder is genuinely reachable here — a swarm `crash_restart`
+            // picks its victim uniformly over every node, node zero included.
+            self.reboot();
+            self.arm_timers(cx);
+            return;
+        }
+        self.started = true;
+
         if me.0 == FOUNDER {
             if let Ok(cgka) = CgkaController::create(tree_id(), signer, &mut node_rng(me, 0xC3))
                 && let Ok(state) =
                     WorkspaceState::found(cgka, WorkspaceSecret::new(workspace_secret_bytes()))
             {
                 self.state = Some(state);
+                self.initialisations += 1;
                 // The founder already holds its own device record, so this
                 // lands immediately and puts it on its own derived roster.
                 self.announce_endpoint(cx);
+                self.save();
             }
         } else if S::OUTSIDER == Some(me.0) {
             // Deliberately silent, and deliberately given no bootstrap peer: an
@@ -1799,35 +2094,7 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
             cx.set_timer(Tick::Join, JOIN_RETRY);
         }
 
-        cx.set_timer(Tick::Edit, FIRST_EDIT);
-        cx.set_timer(Tick::Resync, RESYNC_INTERVAL);
-
-        // The victim does not rotate: an operation it issued after its own
-        // removal could never be applied by anyone, and would sit parked on
-        // every honest node forever — a property failure about the scenario
-        // rather than about the protocol.
-        if S::ROTATE && !self.is_revocation_target() {
-            cx.set_timer(Tick::Rotate, FIRST_ROTATE);
-        }
-        if me.0 == FOUNDER && S::REVOKE.is_some() {
-            cx.set_timer(Tick::Revoke, REVOKE_AT);
-        }
-        if me.0 == FOUNDER && S::WRITE_AFTER_REVOKE {
-            cx.set_timer(Tick::LateEdit, WRITE_AFTER_REVOKE_AT);
-        }
-        if S::INSIDER == Some(me.0) {
-            // Deliberately *after* the first edits, so the insider is a settled
-            // member of a working group before it misbehaves. An attack that ran
-            // during onboarding would be indistinguishable from a joiner whose
-            // certificates had not arrived, and the properties would not be able
-            // to say which they had caught.
-            cx.set_timer(Tick::Overreach, OVERREACH_INTERVAL * 3);
-        } else {
-            // Not the insider, or no insider in this scenario.
-        }
-        if S::FORGE && me.0 != FOUNDER {
-            cx.set_timer(Tick::Forge, FORGE_INTERVAL);
-        }
+        self.arm_timers(cx);
     }
 
     fn on_msg(&mut self, from: NodeId, msg: Msg, cx: &mut dyn Ctx<Self>) {
@@ -1839,6 +2106,32 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         if !self.admits(from, &msg) {
             return;
         }
+        self.apply_msg(from, msg, cx);
+        // One write per message, not per effect batch: a `Msg::Log` replays a
+        // whole operation history, and a save inside that loop would be
+        // quadratic in the log. Mirrors `handle_control_msg` in the facade.
+        self.save();
+    }
+
+    fn on_timer(&mut self, timer: Tick, cx: &mut dyn Ctx<Self>) {
+        self.apply_timer(&timer, cx);
+        self.save();
+    }
+
+    fn on_client_op(
+        &mut self,
+        op: WsOp,
+        token: OpToken,
+        cx: &mut dyn Ctx<Self>,
+    ) -> OpOutcome<WsResp> {
+        self.apply_client_op(op, token, cx)
+    }
+}
+
+impl<S: Scenario> WorkspaceNode<S> {
+    /// The protocol half of [`Node::on_msg`], split out so that persistence
+    /// happens exactly once however many effect batches a message produced.
+    fn apply_msg(&mut self, from: NodeId, msg: Msg, cx: &mut dyn Ctx<Self>) {
         match msg {
             Msg::Hello { member, share_key } => self.on_hello(from, member, share_key, cx),
             // The thief first, because the two paths differ in exactly the way
@@ -1910,7 +2203,8 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         }
     }
 
-    fn on_client_op(
+    /// The protocol half of [`Node::on_client_op`].
+    fn apply_client_op(
         &mut self,
         op: WsOp,
         token: OpToken,
@@ -1926,10 +2220,17 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
             return OpOutcome::Pending;
         }
         let resp = self.apply_op(&op, cx);
+        // Before the response, exactly as `Workspace::drive` writes before
+        // returning `Ok`. Acknowledging first and saving afterwards would make
+        // "an acknowledged write survives a restart" true only most of the time,
+        // and the harness would be modelling a weaker library than the one that
+        // ships.
+        self.save();
         OpOutcome::Done(resp)
     }
 
-    fn on_timer(&mut self, timer: Tick, cx: &mut dyn Ctx<Self>) {
+    /// The protocol half of [`Node::on_timer`].
+    fn apply_timer(&mut self, timer: &Tick, cx: &mut dyn Ctx<Self>) {
         match timer {
             Tick::Join => {
                 if self.state.is_none() {
@@ -2026,6 +2327,15 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
                     let member = MemberId::from(victim_signer.verifying_key());
                     self.drive(Event::RemoveMember { member }, cx, 0xBEEF);
                 }
+            }
+            Tick::Leave => {
+                // Driven once and never re-armed. `Event::Leave` retracts every
+                // device of this user in one batch, so a second firing would
+                // find nothing to remove and broadcast nothing — but arming it
+                // again would still be a claim that leaving is repeatable, and
+                // it is not.
+                self.drive(Event::Leave, cx, 0x1EA7);
+                self.left = true;
             }
             Tick::LateEdit => {
                 // A document nothing has written to before, so every entry

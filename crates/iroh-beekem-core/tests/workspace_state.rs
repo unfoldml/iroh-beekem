@@ -2538,3 +2538,464 @@ mod authorization_is_verified_by_the_receiver {
         );
     }
 }
+
+/// Restarting a node must be indistinguishable from never having stopped.
+///
+/// These are the properties that make persistence worth having. A snapshot that
+/// round-trips the manifest but loses `owner_sks` produces a node that loads
+/// cleanly and then cannot read a word of its own workspace, so the decryption
+/// properties here matter more than the equality ones.
+mod a_snapshot_restores_the_whole_node {
+    use iroh_beekem_core::{Chunk, FileEntry, WorkspaceInfo};
+    use proptest::prelude::*;
+
+    use super::{Bus, DOC, Effect, Event, MemberId, Role, WorkspaceState, rng, two_node_workspace};
+
+    /// A second document, so a history can exercise more than one CRDT.
+    const OTHER: iroh_beekem_core::DocumentUuid = iroh_beekem_core::DocumentUuid([7u8; 16]);
+
+    /// One step of a generated workspace history.
+    ///
+    /// Deliberately drawn only from actions the founder can take without new key
+    /// material: generating a `MemberId` or a `ShareKey` inside a proptest
+    /// strategy would put key generation on the shrinking path, where it is both
+    /// slow and meaningless to minimise.
+    #[derive(Debug, Clone)]
+    enum Step {
+        Edit { doc: bool, text: String },
+        Insert { doc: bool, pos: usize, text: String },
+        Remove { doc: bool, pos: usize, len: usize },
+        Upsert { doc: bool, path: String },
+        Rename { doc: bool, path: String },
+        Delete { doc: bool },
+        Info { name: String },
+        DisplayName { name: String },
+        Rotate,
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        // Offsets and lengths are allowed to exceed the document, because the
+        // state machine clamps rather than rejects and a generator that stayed
+        // in range would never exercise that.
+        prop_oneof![
+            (any::<bool>(), "[a-z ]{0,12}").prop_map(|(doc, text)| Step::Edit { doc, text }),
+            (any::<bool>(), 0usize..16, "[a-z]{0,6}").prop_map(|(doc, pos, text)| Step::Insert {
+                doc,
+                pos,
+                text
+            }),
+            (any::<bool>(), 0usize..16, 0usize..16).prop_map(|(doc, pos, len)| Step::Remove {
+                doc,
+                pos,
+                len
+            }),
+            (any::<bool>(), "/[a-z]{1,6}").prop_map(|(doc, path)| Step::Upsert { doc, path }),
+            (any::<bool>(), "/[a-z]{1,6}").prop_map(|(doc, path)| Step::Rename { doc, path }),
+            any::<bool>().prop_map(|doc| Step::Delete { doc }),
+            "[a-z ]{0,10}".prop_map(|name| Step::Info { name }),
+            "[a-z]{0,8}".prop_map(|name| Step::DisplayName { name }),
+            Just(Step::Rotate),
+        ]
+    }
+
+    fn uuid(second: bool) -> iroh_beekem_core::DocumentUuid {
+        if second { OTHER } else { DOC }
+    }
+
+    /// Replay a generated history onto the founder, delivering everything to bob.
+    ///
+    /// Errors are swallowed on purpose: a `Rename` of a deleted document is a
+    /// legitimate refusal, and a generator that could not produce refusals would
+    /// only ever snapshot states reached by a happy path.
+    fn replay(bus: &mut Bus, steps: &[Step]) {
+        for (i, s) in steps.iter().enumerate() {
+            let seed = 9000 + i as u64;
+            let event = match s.clone() {
+                Step::Edit { doc, text } => Event::LocalEdit {
+                    doc: uuid(doc),
+                    text,
+                },
+                Step::Insert { doc, pos, text } => Event::InsertText {
+                    doc: uuid(doc),
+                    pos,
+                    text,
+                },
+                Step::Remove { doc, pos, len } => Event::RemoveText {
+                    doc: uuid(doc),
+                    pos,
+                    len,
+                },
+                Step::Upsert { doc, path } => Event::UpsertFile {
+                    entry: FileEntry {
+                        uuid: uuid(doc),
+                        logical_path: path,
+                        mime_type: "text/plain".into(),
+                    },
+                },
+                Step::Rename { doc, path } => Event::RenameFile {
+                    doc: uuid(doc),
+                    path,
+                },
+                Step::Delete { doc } => Event::DeleteFile { doc: uuid(doc) },
+                Step::Info { name } => Event::SetInfo {
+                    info: WorkspaceInfo {
+                        name,
+                        description: String::new(),
+                    },
+                },
+                Step::DisplayName { name } => Event::SetDisplayName { display_name: name },
+                Step::Rotate => Event::Rotate,
+            };
+            let effects = bus.alice.handle(event, &mut rng(seed)).unwrap_or_default();
+            bus.queue_for_bob(effects);
+        }
+        bus.deliver_all_to_bob();
+    }
+
+    /// Every observable a caller can read off a node, as one comparable value.
+    ///
+    /// Collected into one struct rather than asserted field by field so that
+    /// adding an observable to `WorkspaceState` and forgetting to persist what
+    /// backs it fails here, rather than passing because nobody thought to
+    /// compare the new field.
+    #[derive(Debug, PartialEq)]
+    struct Observables {
+        member: [u8; 32],
+        group_size: u32,
+        namespace: iroh_beekem_core::NamespaceEpoch,
+        roster: Vec<[u8; 32]>,
+        first_doc: String,
+        second_doc: String,
+        files: Vec<FileEntry>,
+        users: Vec<iroh_beekem_core::UserRecord>,
+        info: WorkspaceInfo,
+        devices: Vec<iroh_beekem_core::DeviceRecord>,
+        roles: Vec<([u8; 32], Role)>,
+        certificates: Vec<[u8; 32]>,
+        log_len: usize,
+    }
+
+    fn observables(state: &WorkspaceState) -> Observables {
+        Observables {
+            member: state.member_id().to_bytes(),
+            group_size: state.group_size(),
+            namespace: state.namespace(),
+            roster: state.roster(),
+            first_doc: state.document_text(DOC),
+            second_doc: state.document_text(OTHER),
+            files: state.manifest().files(),
+            users: state.manifest().users(),
+            info: state.manifest().info(),
+            devices: state.devices(),
+            roles: state.capabilities().roles(),
+            certificates: state
+                .capabilities()
+                .certificates()
+                .iter()
+                .map(iroh_beekem_core::Certificate::digest)
+                .collect(),
+            log_len: state
+                .op_log()
+                .expect("a workspace built by replay has a sortable operation graph")
+                .len(),
+        }
+    }
+
+    proptest! {
+        /// In a workspace driven through an arbitrary history, upon exporting and
+        /// re-importing a node's snapshot, we expect the restored node to report
+        /// every observable identically to the node it was taken from.
+        #[test]
+        fn a_restored_node_reports_what_the_original_reported(steps in prop::collection::vec(step(), 0..12)) {
+            let mut bus = two_node_workspace();
+            replay(&mut bus, &steps);
+
+            let bytes = bus.alice.export().expect("a replayed workspace can be exported");
+            let restored = WorkspaceState::import(&bytes).expect("its own export can be imported");
+
+            prop_assert_eq!(
+                observables(&restored),
+                observables(&bus.alice),
+                "a restarted node differed from the one it resumed, so persistence \
+                 silently drops state the caller can observe"
+            );
+        }
+
+        /// In a workspace driven through an arbitrary history, upon restoring the
+        /// joiner from a snapshot, we expect it to still hold the certificates
+        /// that authorise its own writes — a node that lost them would either
+        /// re-accept uncertified state or lock itself out.
+        #[test]
+        fn a_restored_node_keeps_the_capabilities_it_was_acting_under(steps in prop::collection::vec(step(), 0..12)) {
+            let mut bus = two_node_workspace();
+            replay(&mut bus, &steps);
+
+            let bytes = bus.bob.export().expect("the joiner can be exported");
+            let restored = WorkspaceState::import(&bytes).expect("the joiner can be imported");
+
+            let me = restored.member_id().to_bytes();
+            prop_assert_eq!(
+                restored.capabilities().role_of_member(&me),
+                bus.bob.capabilities().role_of_member(&me),
+                "the restored joiner no longer resolves its own role, so its writes \
+                 would be refused by every peer"
+            );
+            prop_assert!(
+                restored.capabilities().is_certified_device(&me),
+                "the restored joiner is no longer a certified device, so it would \
+                 contribute nothing to any peer's roster"
+            );
+        }
+    }
+
+    /// In a workspace where content was published before the snapshot, upon
+    /// restoring from that snapshot, we expect the restored node to still decrypt
+    /// a chunk it had already received.
+    ///
+    /// This is the property the whole module exists for. `owner_sks` and the
+    /// cached PCS keys live inside beekem's `Cgka`; a snapshot that stored the
+    /// manifest and the tree but lost either would import cleanly, report the
+    /// right file list, and never read another byte of content.
+    #[test]
+    fn a_restored_node_can_still_decrypt_content_published_before_the_snapshot() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "before the snapshot".into(),
+            },
+            700,
+        );
+        bus.deliver_all_to_bob();
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            "before the snapshot",
+            "the bus must actually deliver, or the restore below proves nothing"
+        );
+
+        // Capture a chunk alice publishes *after* bob's snapshot is taken, then
+        // hand it to the restored bob. Re-reading already-applied text would only
+        // prove the Loro document was stored; decrypting a new chunk proves the
+        // key material came back.
+        let bytes = bus.bob.export().expect("bob can be exported");
+        let effects = bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " and after".into(),
+            },
+            701,
+        );
+        let chunk: Chunk = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::StoreChunk { chunk, .. } => Some((**chunk).clone()),
+                _ => None,
+            })
+            .expect("an edit publishes a chunk");
+
+        let mut restored = WorkspaceState::import(&bytes).expect("bob can be imported");
+        restored
+            .handle(
+                Event::ChunkArrived {
+                    doc: DOC,
+                    chunk: Box::new(chunk),
+                },
+                &mut rng(702),
+            )
+            .expect("the restored node accepts the chunk");
+
+        assert_eq!(
+            restored.document_text(DOC),
+            "before the snapshot and after",
+            "the restored node could not decrypt a chunk keyed under an epoch it \
+             held before the snapshot, so the CGKA secrets did not survive the \
+             round trip"
+        );
+        assert_eq!(
+            restored.pending_len(),
+            0,
+            "the chunk was parked rather than applied, which is what a lost PCS \
+             key looks like from the outside"
+        );
+    }
+
+    /// In a workspace whose founder has admitted a member, upon restoring the
+    /// founder, we expect it to still be able to remove that member — the
+    /// certificate store and both member sets survived, not merely the tree.
+    #[test]
+    fn a_restored_admin_can_still_administer() {
+        let bus = two_node_workspace();
+        let bob: MemberId = bus.bob.member_id();
+
+        let bytes = bus.alice.export().expect("alice can be exported");
+        let mut restored = WorkspaceState::import(&bytes).expect("alice can be imported");
+
+        assert_eq!(
+            restored
+                .capabilities()
+                .role_of_member(&restored.member_id().to_bytes()),
+            Some(Role::Admin),
+            "the founder's self-signed admin grant did not survive the round trip"
+        );
+        let effects = restored
+            .handle(Event::RemoveMember { member: bob }, &mut rng(710))
+            .expect("a restored admin may still remove a member");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RotateNamespace { .. })),
+            "a removal by a restored admin did not rotate the namespace, so the \
+             restored node did not recognise the target as a current member"
+        );
+    }
+}
+
+/// Leaving is what a member does for itself; removal is what the group does to
+/// it. The two differ in exactly three respects, and all three are asserted here
+/// because each one is silent if it regresses.
+mod a_member_can_walk_away {
+    use super::{Effect, Event, Role, rng, two_node_workspace};
+
+    /// In a two-member workspace, upon a non-admin member leaving, we expect its
+    /// leaf to be retracted on the admin's node.
+    ///
+    /// The role check is the point: `on_remove_member` demands `Admin`, so a
+    /// `leave` routed through it would make a workspace's viewers unable to
+    /// leave it — while every peer would still accept the operation, since
+    /// `authorize` admits a same-user `Remove` from anybody.
+    #[test]
+    fn a_member_with_no_administrative_role_can_still_leave() {
+        let mut bus = two_node_workspace();
+        assert_eq!(
+            bus.bob
+                .capabilities()
+                .role_of_member(&bus.bob.member_id().to_bytes()),
+            Some(Role::Editor),
+            "this test is only meaningful if bob cannot administer"
+        );
+
+        let effects = bus.bob.handle(Event::Leave, &mut rng(800)).expect(
+            "a member that cannot administer must still be able to leave; refusing \
+             would trap every viewer in every workspace they were ever invited to",
+        );
+        bus.queue_from_bob_to_alice(effects);
+        bus.deliver_all_to_alice();
+
+        assert_eq!(
+            bus.alice.group_size(),
+            1,
+            "the departing member's leaf was still in the admin's tree, so the \
+             group never learned it had gone"
+        );
+    }
+
+    /// In a workspace a member is leaving, upon handling the departure, we
+    /// expect no namespace rotation.
+    ///
+    /// The difference from a removal, and the reason `Leave` is a separate
+    /// handler rather than `RemoveMember` with a relaxed guard. A leaver that
+    /// rotated would mint the capability it is walking away from and announce it
+    /// to the group under a key it still holds — handing itself the replica it
+    /// had just left.
+    #[test]
+    fn leaving_never_rotates_the_namespace() {
+        let mut bus = two_node_workspace();
+        let effects = bus
+            .bob
+            .handle(Event::Leave, &mut rng(801))
+            .expect("bob leaves");
+
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RotateNamespace { .. })),
+            "a departure rotated the namespace, so the leaver would mint and then \
+             receive the capability for the replica it was walking away from"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastOp { .. })),
+            "a departure emitted no removal at all, so the group would never learn \
+             of it — this assertion is what stops the one above passing vacuously"
+        );
+    }
+
+    /// In a workspace with a single administrator, upon that administrator
+    /// trying to leave, we expect a refusal.
+    ///
+    /// Promotion is itself an administrative act, so a workspace that lost its
+    /// last admin could never appoint another. Every remaining member would keep
+    /// reading and writing and none could ever admit or remove anybody.
+    #[test]
+    fn the_last_administrator_cannot_leave() {
+        let mut bus = two_node_workspace();
+        let err = bus
+            .alice
+            .handle(Event::Leave, &mut rng(802))
+            .expect_err("the only admin must not be able to strand the workspace");
+        assert!(
+            matches!(err, iroh_beekem_core::CoreError::LastAdmin),
+            "the refusal must name the reason, since the caller's remedy is to \
+             promote somebody first: {err}"
+        );
+    }
+
+    /// In a workspace where a user holds two devices, upon that user leaving, we
+    /// expect both leaves to be retracted.
+    ///
+    /// A user is what the group enumerates, so leaving with one of two devices
+    /// still in the tree is not leaving: the departed user would still be listed
+    /// as present while having lost the ability to act as itself.
+    #[test]
+    fn leaving_retracts_every_device_of_the_departing_user() {
+        use beekem::id::MemberId;
+        use keyhive_crypto::{
+            share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+        };
+
+        let mut bus = two_node_workspace();
+        let bob_user = bus.bob.member_id().to_bytes();
+
+        // A second device for bob, enrolled by bob — not an administrative act,
+        // which is why bob can do it at all.
+        let phone_signer = MemorySigner::generate(&mut rng(803));
+        let phone_secret = ShareSecretKey::generate(&mut rng(804));
+        let phone = MemberId::from(phone_signer.verifying_key());
+        let effects = bus
+            .bob
+            .handle(
+                Event::AddDevice {
+                    member: phone,
+                    share_key: phone_secret.share_key(),
+                    user: bob_user,
+                    label: "phone".into(),
+                    endpoint: None,
+                },
+                &mut rng(805),
+            )
+            .expect("bob enrols a second device of his own");
+        bus.queue_from_bob_to_alice(effects);
+        bus.deliver_all_to_alice();
+        assert_eq!(
+            bus.alice.group_size(),
+            3,
+            "the second device never entered the tree, so this test cannot pose \
+             its question"
+        );
+
+        let effects = bus
+            .bob
+            .handle(Event::Leave, &mut rng(806))
+            .expect("bob leaves with both devices");
+        bus.queue_from_bob_to_alice(effects);
+        bus.deliver_all_to_alice();
+
+        assert_eq!(
+            bus.alice.group_size(),
+            1,
+            "a departing user left a device behind in the tree, so it would still \
+             be enumerated as present while unable to act"
+        );
+    }
+}

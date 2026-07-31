@@ -19,9 +19,9 @@ use iroh_beekem_core::{
     AuthorizedOp, CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
     NamespaceEpoch, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
 };
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::api::Store as BlobStore;
 use iroh_docs::{
-    AuthorId, NamespaceId,
+    Author, AuthorId, NamespaceId,
     api::{
         Doc,
         protocol::{AddrInfoOptions, ShareMode},
@@ -47,6 +47,7 @@ use crate::{
     invite::{INVITE_DOMAIN, Invite, InviteError, InviteTerms, unix_now},
     node::Node,
     roster::Roster,
+    store::WorkspaceRecord,
     wire::{ControlMsg, NamespaceCapability, decode_chunk, encode_chunk},
 };
 
@@ -78,7 +79,7 @@ fn member_id_from_bytes(bytes: &[u8; 32]) -> Option<MemberId> {
 /// Shared state behind the pump loops.
 struct Inner {
     state: Mutex<WorkspaceState>,
-    blobs: MemStore,
+    blobs: BlobStore,
     /// The replicated index this node currently syncs.
     ///
     /// Behind a lock because it is *replaced* on a namespace rotation, not
@@ -157,12 +158,34 @@ struct Inner {
     /// which sees every membership change — can update it without needing the
     /// whole node.
     roster: Roster,
+    /// Which workspace's entry in that list this pump owns.
+    ///
+    /// The roster is keyed by tree id because two workspaces on one node share a
+    /// [`Roster`], and `set_derived` replaces rather than merges: without a key,
+    /// each workspace's refresh would evict the other's members. Kept as raw
+    /// bytes because that is what the registry is keyed on.
+    workspace_key: [u8; 32],
     /// The node this workspace runs on.
     ///
     /// Cloned onto `Inner` because minting and importing a namespace happen in
     /// the effect pump, which sees only `Inner`. `Node` is a handle, so this is
     /// a second reference to the same endpoint and router rather than a copy.
     node: Node,
+}
+
+/// One stored workspace, as [`Workspace::list`] reports it.
+///
+/// Enough to choose which workspace to [`open`](Workspace::open) and no more:
+/// listing must not require decrypting content or contacting a peer, because its
+/// whole purpose is to run before either is possible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSummary {
+    /// The workspace's identity, and the argument [`Workspace::open`] takes.
+    pub tree_id: TreeId,
+    /// Its name and description, as the manifest records them.
+    pub info: WorkspaceInfo,
+    /// The `iroh-docs` replica it was on when the snapshot was taken.
+    pub namespace: NamespaceId,
 }
 
 /// A running, networked workspace.
@@ -449,6 +472,256 @@ impl Workspace {
         Ok(workspace)
     }
 
+    /// Resume a workspace this node already holds a snapshot for.
+    ///
+    /// The counterpart to [`Self::create`] and [`Self::join`], and distinct from
+    /// both: neither `found` nor `joined` runs, because a restart is neither of
+    /// those events. `found` would mint a second set of founding certificates
+    /// for a workspace that already has them, and `joined` would restart the
+    /// node at an empty manifest and namespace generation zero, walking it onto
+    /// a replica the group abandoned long ago.
+    ///
+    /// `identity` is checked against the snapshot rather than used to rebuild
+    /// it. The snapshot is self-sufficient — it carries the signing key and the
+    /// leaf secret — so the argument exists to catch the caller opening somebody
+    /// else's snapshot, which would otherwise succeed and quietly act as them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::NotPersistent`] if `node` has no store,
+    /// [`WorkspaceError::NoSuchWorkspace`] if it holds no snapshot for
+    /// `tree_id`, [`WorkspaceError::IdentityMismatch`] if the snapshot belongs
+    /// to another device, and propagates storage failures.
+    pub async fn open(
+        node: Node,
+        tree_id: TreeId,
+        identity: &Identity,
+    ) -> Result<Self, WorkspaceError> {
+        let store = node.store().ok_or(WorkspaceError::NotPersistent)?;
+        let key = tree_id.to_bytes();
+        let record = store
+            .load_workspace(key)?
+            .ok_or(WorkspaceError::NoSuchWorkspace { tree_id: key })?;
+
+        let state = WorkspaceState::import(&record.core)?;
+        if state.member_id() != identity.member_id() {
+            return Err(WorkspaceError::IdentityMismatch);
+        }
+        // A snapshot names the tree it came from, so a file renamed to another
+        // tree's id would otherwise resume as a workspace it is not.
+        if state.tree_id() != tree_id {
+            return Err(WorkspaceError::NoSuchWorkspace { tree_id: key });
+        }
+
+        let secret = WorkspaceSecret::new(state.workspace_secret());
+
+        // `open` rather than `import`: the replica is already in this node's docs
+        // store, put there by the run that took the snapshot. Re-importing would
+        // need a ticket, and a founder has none — nobody ever announced the
+        // namespace it created.
+        let doc = node
+            .docs()
+            .api()
+            .open(record.namespace)
+            .await
+            .map_err(|e| WorkspaceError::Storage(e.to_string()))?
+            .ok_or_else(|| {
+                WorkspaceError::Storage(format!(
+                    "workspace {} names replica {} but the docs store does not hold it",
+                    tree_id, record.namespace
+                ))
+            })?;
+
+        // A restarting member needs bootstrap peers just as a joiner does, and
+        // for the same reason: `Gossip::subscribe` with an empty peer list forms
+        // an overlay of one. Nothing else would ever reconnect it — a joiner is
+        // dialled into the group by its inviter, and a restart has no inviter.
+        //
+        // Where a joiner is handed one peer in its ticket, a restarting member
+        // already knows the whole group: its own manifest records every device's
+        // endpoint, and `roster` is exactly that list intersected with current,
+        // certified membership. Dialling all of them rather than one also means
+        // a restart survives any single peer being offline.
+        let me = *node.endpoint().id().as_bytes();
+        let peers: Vec<EndpointId> = state
+            .roster()
+            .into_iter()
+            .filter(|endpoint| *endpoint != me)
+            .filter_map(|endpoint| EndpointId::from_bytes(&endpoint).ok())
+            .collect();
+
+        let workspace = Self::assemble(
+            node,
+            state,
+            secret,
+            doc,
+            tree_id,
+            identity.signer(),
+            peers.clone(),
+        )
+        .await?;
+
+        // Index sync as well as the gossip overlay, and both are needed: gossip
+        // carries the control plane, `sync_with` starts the docs reconciliation
+        // that carries content. Failures are logged rather than fatal — a peer
+        // that has gone away must not stop a workspace from opening, and the
+        // remaining peers still bring it up to date.
+        for peer in peers {
+            if let Err(e) = workspace.sync_with(peer).await {
+                tracing::debug!(%peer, %e, "a known peer could not be reached on reopen");
+            }
+        }
+        Ok(workspace)
+    }
+
+    /// Withdraw this user's devices from the group.
+    ///
+    /// Broadcasts a CGKA `Remove` for every device of the local user and stops
+    /// reconciling the replica. The local copy is left in place — call
+    /// [`delete`](Self::delete) for that, and see below for why the two are
+    /// separate.
+    ///
+    /// # This is a courtesy, not a security boundary
+    ///
+    /// Worth being explicit about, because "leave" sounds like it revokes
+    /// something and it revokes nothing:
+    ///
+    /// * It **does not rotate the namespace.** A removal by an admin does; a
+    ///   departure cannot, because the leaver would be minting the capability it
+    ///   is walking away from and announcing it under a key it still holds.
+    /// * It **unlearns nothing.** The leaver keeps every key it ever derived,
+    ///   the blinding secret, and whatever it already synced.
+    /// * It is **self-reported.** A departing member cannot be trusted to have
+    ///   done it, and a hostile one simply will not.
+    ///
+    /// An administrator who wants any of those guarantees must follow a `leave`
+    /// with [`remove_user`](Self::remove_user), which rotates the namespace and
+    /// evicts the departed device from every peer's roster. Until they do, the
+    /// group has lost a member's leaf and gained nothing else.
+    ///
+    /// # This announces the departure; it does not stop the workspace
+    ///
+    /// Deliberately `&self`, and the reason is a property of `iroh-gossip` rather
+    /// than a preference. `GossipSender::broadcast` enqueues a command on a
+    /// channel the topic actor drains: it returns when the message is *accepted*,
+    /// not when it has reached anybody, and there is no flush and no
+    /// acknowledgement to wait on. Dropping the subscription discards whatever is
+    /// still queued.
+    ///
+    /// So a `leave` that consumed `self` and tore the transport down would be
+    /// racing its own announcement, and losing often enough to matter — with no
+    /// second chance, because a `Remove` has no anti-entropy behind it and the
+    /// one node that would re-announce it is the one that just left. Bounding
+    /// that race with a sleep only turns a frequent failure into an occasional
+    /// one; keeping the workspace alive removes it, and puts the lifetime
+    /// decision where the caller can actually see it.
+    ///
+    /// The usual sequence is therefore:
+    ///
+    /// ```ignore
+    /// workspace.leave().await?;   // announce
+    /// // ... the workspace keeps running, which is what lets the announcement out
+    /// workspace.delete().await?;  // when the local copy is no longer wanted
+    /// ```
+    ///
+    /// A departure that never reaches a peer simply did not happen, which is one
+    /// more reason an admin should follow it with
+    /// [`remove_user`](Self::remove_user).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::LastAdmin`](iroh_beekem_core::CoreError::LastAdmin)
+    /// if this user is the workspace's only administrator — a workspace that
+    /// lost its last admin could never appoint another.
+    pub async fn leave(&self) -> Result<(), WorkspaceError> {
+        self.drive(Event::Leave).await?;
+
+        // Stop reconciling the index. Distinct from `drop_doc` in `delete`,
+        // which removes the replica: this stops the exchange, so a peer that has
+        // not yet merged the removal stops receiving from us immediately rather
+        // than at whatever point it works out we are gone.
+        if let Err(e) = doc(&self.inner).await.leave().await {
+            tracing::debug!(%e, "the replica could not be left cleanly");
+        }
+        Ok(())
+    }
+
+    /// Stop holding this workspace on this node, locally and completely.
+    ///
+    /// Drops the replica, the snapshot and this workspace's entry in the
+    /// admission registry, then shuts the pumps down. Consumes `self` because
+    /// every one of those makes the handle unusable, and returning one that
+    /// silently fails on its next call would be worse than not returning one.
+    ///
+    /// # This is a local action, not a membership one
+    ///
+    /// The group is not told and does not change: this device keeps its leaf,
+    /// stays on every peer's roster, and still appears in
+    /// [`users`](Self::users) everywhere else. Deleting is "I no longer keep a
+    /// copy", not "I am no longer a member" — for the latter an admin must
+    /// [`remove_user`](Self::remove_user), which is what rotates the namespace
+    /// and actually withdraws reading.
+    ///
+    /// The blinding secret is dropped here and is `ZeroizeOnDrop`, but that
+    /// buys less than it looks: every other member holds the same 32 bytes, and
+    /// anything already synced into the blobs store stays there.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage failures. The snapshot is removed *last*, so a failure
+    /// to drop the replica leaves a workspace that still opens rather than one
+    /// whose files are orphaned with no way to name them.
+    pub async fn delete(self) -> Result<(), WorkspaceError> {
+        let namespace = self.namespace().await;
+        self.node
+            .docs()
+            .api()
+            .drop_doc(namespace)
+            .await
+            .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+
+        // Before the snapshot is removed: a peer admitted by this workspace and
+        // by no other must stop being admitted, and `admits` is a union over
+        // workspaces, so only forgetting the entry achieves that.
+        self.inner.roster.forget(self.inner.workspace_key);
+
+        if let Some(store) = self.node.store() {
+            store.remove_workspace(self.inner.workspace_key)?;
+        }
+        // `Drop` aborts the pumps; taking `self` by value is what guarantees it
+        // runs before the caller can drive this workspace again.
+        Ok(())
+    }
+
+    /// Every workspace this node holds a snapshot for.
+    ///
+    /// Each entry is decoded far enough to name itself, which means importing
+    /// the core snapshot — the display name lives in the encrypted manifest and
+    /// there is nowhere cheaper to read it from. A snapshot that cannot be
+    /// decoded is *skipped* rather than failing the listing, so one damaged
+    /// workspace does not hide the others from a caller trying to recover.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::NotPersistent`] if `node` has no store, and
+    /// propagates a failure to list the directory.
+    pub fn list(node: &Node) -> Result<Vec<WorkspaceSummary>, WorkspaceError> {
+        let store = node.store().ok_or(WorkspaceError::NotPersistent)?;
+        Ok(store
+            .list_workspaces()?
+            .into_iter()
+            .filter_map(|key| {
+                let record = store.load_workspace(key).ok().flatten()?;
+                let state = WorkspaceState::import(&record.core).ok()?;
+                Some(WorkspaceSummary {
+                    tree_id: state.tree_id(),
+                    info: state.manifest().info(),
+                    namespace: record.namespace,
+                })
+            })
+            .collect())
+    }
+
     /// Wire up the pump loops shared by [`Self::create`] and [`Self::join`].
     #[allow(
         clippy::too_many_arguments,
@@ -467,13 +740,26 @@ impl Workspace {
     ) -> Result<Self, WorkspaceError> {
         let topic = topic_for(tree_id);
 
-        // A per-workspace author, not the node's global identity: `AuthorId`
-        // syncs in the clear on every entry, so reusing one identity across
-        // workspaces would let a syncing peer link them to the same device.
-        let author = node
-            .docs()
+        // A per-workspace author, *derived* rather than random, and both halves
+        // of that matter.
+        //
+        // Per-workspace: `AuthorId` syncs in the clear on every entry, so reusing
+        // one identity across workspaces would let a syncing peer link them to
+        // the same device. `author_seed` is keyed on the workspace secret, so two
+        // workspaces on one device get unrelated authors.
+        //
+        // Derived: a random author is a new identity on every start. After a
+        // restart every peer's `author_may_write` would reject this node's
+        // entries — the author→member mapping they hold names an id that no
+        // longer writes — and it would stay mute until an admin noticed and
+        // granted a role to an identity nobody had ever seen. The seed is a
+        // function of the workspace secret and this member id, both of which
+        // survive a restart, so the identity does too.
+        let author = Author::from_bytes(&secret.author_seed(&state.member_id().to_bytes()));
+        let author_id = author.id();
+        node.docs()
             .api()
-            .author_create()
+            .author_import(author)
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
@@ -481,8 +767,9 @@ impl Workspace {
         // must be able to reach its inviter before it holds the manifest that
         // would derive a roster, and the inviter's guard must let it back in.
         // Seeding both from the same list is what keeps the two in step.
+        let workspace_key = *tree_id.as_bytes();
         for peer in &bootstrap {
-            node.roster().add_bootstrap(*peer);
+            node.roster().add_bootstrap(workspace_key, *peer);
         }
 
         let gossip_topic = node
@@ -498,7 +785,7 @@ impl Workspace {
             blobs: node.blobs().clone(),
             doc: RwLock::new(doc.clone()),
             data_task: Mutex::new(None),
-            author,
+            author: author_id,
             gossip_tx,
             secret,
             signer,
@@ -509,6 +796,7 @@ impl Workspace {
             eviction_cooldown: Mutex::new(Cooldown::new(EVICTION_COOLDOWN)),
             republish_wanted: Notify::new(),
             roster: node.roster().clone(),
+            workspace_key,
             node: node.clone(),
         });
 
@@ -526,7 +814,7 @@ impl Workspace {
             let mut state = inner.state.lock().await;
             let mut effects = report_rejection(state.handle(
                 Event::AnnounceAuthor {
-                    author: author.to_bytes(),
+                    author: author_id.to_bytes(),
                 },
                 &mut rand::rngs::OsRng,
             ));
@@ -557,6 +845,13 @@ impl Workspace {
         // a bounded rate but never discarded.
         let republish = Arc::clone(&inner);
         let republish_task = tokio::spawn(republish_loop(republish));
+
+        // The first snapshot, so that a workspace created or joined and then
+        // immediately shut down is still there on the next start. Without it the
+        // earliest durable point would be the first edit, and a founder that
+        // crashed before writing anything would have lost the founding
+        // certificates that make it the root of its own capability closure.
+        persist(&inner).await;
 
         Ok(Self {
             node,
@@ -665,6 +960,9 @@ impl Workspace {
         if membership_moved {
             refresh_roster(&self.inner).await;
         }
+        // Before `Ok`, not after: a caller told its write succeeded must find
+        // that write again after a restart.
+        persist(&self.inner).await;
         Ok(())
     }
 
@@ -1256,6 +1554,16 @@ async fn control_loop<E>(
 /// together and the seam is the natural one: everything here takes the state lock,
 /// nothing here touches the gossip stream.
 async fn handle_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
+    apply_control_msg(inner, decoded).await;
+    // One write per message rather than one per effect batch: a `Log` exchange
+    // replays the whole operation history under a single lock, and this is the
+    // boundary at which that history has finished being applied.
+    persist(inner).await;
+}
+
+/// The protocol half of [`handle_control_msg`], separated so persistence happens
+/// exactly once however many effect batches the message produced.
+async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
     match decoded {
         ControlMsg::Op { op, proof } => {
             let effects = {
@@ -1515,6 +1823,10 @@ async fn republish(inner: &Arc<Inner>) {
         };
         apply_effects(inner, effects).await;
     }
+    // A resync republishes rather than mutating, but `Keying::Current` can still
+    // make beekem re-key — and a re-key this node forgot would leave it unable to
+    // read its own next publish after a restart.
+    persist(inner).await;
 }
 
 /// Perform the effects the core asked for.
@@ -1844,7 +2156,7 @@ async fn refresh_roster(inner: &Inner) {
         let state = inner.state.lock().await;
         state.roster()
     };
-    inner.roster.set_derived(endpoints);
+    inner.roster.set_derived(inner.workspace_key, endpoints);
 }
 
 /// Write one encrypted chunk to blobs and index it in docs.
@@ -1872,6 +2184,72 @@ async fn store_chunk(
         let _ = inner.gossip_tx.broadcast(Bytes::from(msg)).await;
     }
     Ok(())
+}
+
+/// Write this workspace's snapshot, if the node it runs on persists at all.
+///
+/// A no-op for a [`Node::spawn`](crate::Node::spawn) node, so the in-memory path
+/// pays nothing for the existence of the persistent one.
+///
+/// # Where this is called from, and why not from `apply_effects`
+///
+/// At the five boundaries where a *batch* of work finishes: [`Workspace::drive`],
+/// [`handle_control_msg`], [`ingest_all`], [`republish`] and [`Workspace::assemble`].
+/// Not inside `apply_effects`, which looks like the obvious place and is not:
+/// `ingest_all` calls it once per document and `evict_uncertified` re-enters it,
+/// so a write there would be O(documents) per gossip message rather than O(1).
+///
+/// Not gated on the effect batch being non-empty either, which is the other
+/// tempting shortcut. `on_certs_arrived` absorbs certificates — durable state —
+/// and returns no effects at all when nothing was waiting on them, so "the batch
+/// was empty" does not mean "nothing changed".
+///
+/// # Written before the caller is told the write succeeded
+///
+/// `drive` awaits this before returning `Ok`, so a `create_file` or an `append`
+/// that has been acknowledged is on disk. That is what makes "a node's own
+/// acknowledged writes survive a restart" a fact rather than a likelihood, and it
+/// is why the cost — one snapshot per event — is accepted here. Phase 9's delta
+/// publishing is what makes that cost proportional to the change rather than to
+/// the workspace.
+///
+/// # Failure is logged, not propagated
+///
+/// A full disk must not turn an accepted local edit into an error the caller
+/// might respond to by retrying, because the edit *is* applied in memory and a
+/// retry would duplicate it. The node keeps running against the last snapshot
+/// that landed; the operator sees the warning.
+async fn persist(inner: &Arc<Inner>) {
+    let Some(store) = inner.node.store().cloned() else {
+        return;
+    };
+    let namespace = doc(inner).await.id();
+    let tree_id = inner.workspace_key;
+
+    let core = {
+        let state = inner.state.lock().await;
+        match state.export() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(%e, "could not capture the workspace snapshot");
+                return;
+            }
+        }
+    };
+
+    // The encode-and-write is blocking file I/O, so it goes to the blocking pool
+    // rather than stalling the reactor that is also driving gossip and docs.
+    let record = WorkspaceRecord {
+        core: core.to_vec(),
+        namespace,
+    };
+    let written =
+        tokio::task::spawn_blocking(move || store.store_workspace(tree_id, &record)).await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(%e, "could not write the workspace snapshot"),
+        Err(e) => tracing::warn!(%e, "the snapshot writer panicked or was cancelled"),
+    }
 }
 
 /// Read every entry under this workspace's blinded key and feed it to the core.
@@ -1925,6 +2303,11 @@ async fn ingest_all(inner: &Arc<Inner>) {
             apply_effects(inner, effects).await;
         }
     }
+
+    // Once per pass, not once per document: an ingest touches every document the
+    // manifest knows about, and a write inside the loop would make persistence
+    // cost O(documents) per arriving chunk.
+    persist(inner).await;
 }
 
 /// Read and decode every locally-available payload stored under one blinded key.

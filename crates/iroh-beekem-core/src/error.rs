@@ -111,6 +111,33 @@ pub enum CoreError {
     #[error("serialization failed: {0}")]
     Serialization(#[from] postcard::Error),
 
+    /// Thirty-two bytes that are not a valid Ed25519 verifying key.
+    ///
+    /// Reachable only from [`crate::snapshot`], where member identities are
+    /// stored as raw bytes: `MemberId` wraps an *expanded* point, so restoring
+    /// one is a decompression that can fail on a corrupted or truncated file.
+    /// Everywhere else in the crate a `MemberId` arrives already decompressed
+    /// from the caller, which is why no other path can produce this.
+    #[error("stored identity is not a valid Ed25519 verifying key: {}", hex(key))]
+    MalformedKey {
+        /// The bytes that failed to decompress.
+        key: [u8; 32],
+    },
+
+    /// A snapshot was written by a different, incompatible version of the core.
+    ///
+    /// Refused rather than best-effort decoded. A snapshot holds the CGKA tree
+    /// and every cached PCS key; silently accepting a layout this build does not
+    /// understand would produce a node that appears to load and then cannot
+    /// decrypt, which is far harder to diagnose than a refusal at open time.
+    #[error("snapshot format version {found} cannot be read by this build (expects {expected})")]
+    SnapshotVersion {
+        /// The version recorded in the snapshot.
+        found: u16,
+        /// The version this build writes and reads.
+        expected: u16,
+    },
+
     /// A manifest (Loro) operation failed.
     #[error("manifest operation failed: {0}")]
     Manifest(String),
