@@ -50,7 +50,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
-    capability::{CapabilityStore, Certificate, Role},
+    capability::{AdminAction, CapabilityStore, Certificate, DEFAULT_THRESHOLD, Role},
     content::{Chunk, ChunkRef},
     error::CoreError,
     keys::{AuthorizedOp, CgkaController, DecryptOutcome, EpochId, MergeOutcome},
@@ -270,6 +270,42 @@ pub enum Event {
     RemoveMember {
         /// The member to remove.
         member: MemberId,
+    },
+    /// The local user proposed an administrative action for a quorum to approve.
+    ///
+    /// Costs nothing and grants nothing on its own: a proposal is data, and the
+    /// action happens only once enough distinct admins have approved it.
+    Propose {
+        /// What is being proposed.
+        action: AdminAction,
+        /// When the proposal stops being offered, in absolute milliseconds.
+        ///
+        /// Carried on the wire and **not** evaluated here — the core has no
+        /// clock, and an expiry inside the quorum predicate would make two peers
+        /// with skewed clocks execute different sets of proposals. A caller with
+        /// a clock may decline to *approve* something expired.
+        expires: Option<u64>,
+    },
+    /// Anti-entropy for the certificate store: re-announce everything it holds.
+    ///
+    /// Certificates are the one kind of state with **no write behind them**. A
+    /// document lost in transit is carried by the next edit; a manifest chunk by
+    /// [`Self::ResyncManifest`]; a rotation by [`Self::ResyncNamespace`]. A
+    /// grant, a proposal or an approval is broadcast exactly once and has nothing
+    /// following it, so a single dropped gossip message strands it until a
+    /// neighbour happens to reappear and trigger a whole-log exchange — which on
+    /// a stable overlay may be never.
+    ///
+    /// That is survivable for a grant, which costs its subject a role until the
+    /// next membership change. It is **not** survivable for an approval: a quorum
+    /// that formed on one node and reached no other leaves an action performed
+    /// there and refused everywhere else, which is exactly the divergence the
+    /// receiver-side check exists to prevent.
+    ResyncCertificates,
+    /// The local user approved a proposal, naming it by digest.
+    Approve {
+        /// The digest of the proposal certificate being approved.
+        proposal: [u8; 32],
     },
     /// The local user is walking away from the workspace.
     ///
@@ -692,6 +728,13 @@ pub struct WorkspaceState {
     /// function of the values, so it converges without depending on how the
     /// updates happened to be ordered.
     namespace: NamespaceEpoch,
+    /// Quorum proposals this node has already performed.
+    ///
+    /// Local dedup, so an executable proposal is not re-run on every certificate
+    /// arrival. Deliberately *not* persisted: re-running after a restart is
+    /// idempotent, and a stored copy would be one more thing that could disagree
+    /// with the certificates it summarises.
+    executed_here: HashSet<[u8; 32]>,
     /// The capability for [`Self::namespace`], kept so it can be re-announced.
     ///
     /// A rotation is published once and has nothing behind it, so a peer that
@@ -748,6 +791,7 @@ impl Clone for WorkspaceState {
             endpoint_id: self.endpoint_id,
             namespace: self.namespace,
             namespace_ticket: self.namespace_ticket.clone(),
+            executed_here: self.executed_here.clone(),
         }
     }
 }
@@ -809,6 +853,7 @@ impl WorkspaceState {
                 ..NamespaceEpoch::INITIAL
             },
             namespace_ticket: Vec::new(),
+            executed_here: HashSet::new(),
         }
     }
 
@@ -823,7 +868,11 @@ impl WorkspaceState {
     /// # Errors
     ///
     /// Returns [`CoreError::Manifest`] if the initial role cannot be recorded.
-    pub fn found(cgka: CgkaController, secret: WorkspaceSecret) -> Result<Self, CoreError> {
+    pub fn found(
+        cgka: CgkaController,
+        secret: WorkspaceSecret,
+        threshold: u32,
+    ) -> Result<Self, CoreError> {
         // Generation zero by definition: the founder *is* the first namespace,
         // so there is no earlier one it could be told about.
         let mut this = Self::joined(cgka, secret, NamespaceEpoch::INITIAL.epoch);
@@ -844,6 +893,12 @@ impl WorkspaceState {
         // root granted nothing.
         this.cgka.certify_device(me, me, [0u8; 16])?;
         this.cgka.certify_role(me, Role::Admin, [0u8; 16])?;
+        // Minted here and nowhere else. The threshold is a constant of the
+        // workspace precisely so that no member can ever be behind on it: this
+        // certificate ships in the same bundle as the grant above, without which
+        // nobody could have joined at all. See `Policy` for why a mutable
+        // threshold cannot be enforced by a receiver without splitting the group.
+        this.cgka.certify_policy(threshold, [0u8; 16])?;
         Ok(this)
     }
 
@@ -954,6 +1009,7 @@ impl WorkspaceState {
             endpoint_id: snapshot.endpoint_id,
             namespace: snapshot.namespace,
             namespace_ticket: snapshot.namespace_ticket,
+            executed_here: HashSet::new(),
         })
     }
 
@@ -1251,30 +1307,10 @@ impl WorkspaceState {
             Event::ControlOp(op) => self.on_control_op(op),
             Event::CertsArrived(certs) => self.on_certs_arrived(certs),
             Event::ChunkArrived { doc, chunk } => self.on_chunk_arrived(doc, *chunk),
-            Event::LocalEdit { doc, text } => self.on_text_edit(doc, csprng, |content| {
-                let at = content.len_unicode();
-                content.insert(at, &text)
-            }),
-            // `update` diffs against the current contents rather than clearing
-            // and re-inserting, so replacing one word stays a one-word change
-            // in the CRDT — and merges with a concurrent edit elsewhere in the
-            // document instead of clobbering it.
-            Event::WriteFile { doc, text } => self.on_text_edit(doc, csprng, |content| {
-                content
-                    .update(&text, loro::UpdateOptions::default())
-                    .map_err(|e| loro::LoroError::Unknown(e.to_string().into()))
-            }),
-            // Positions are clamped rather than rejected: they come from a
-            // caller holding a view that a concurrent remote edit may already
-            // have shortened, which is ordinary in a CRDT rather than a fault.
-            Event::InsertText { doc, pos, text } => self.on_text_edit(doc, csprng, |content| {
-                content.insert(pos.min(content.len_unicode()), &text)
-            }),
-            Event::RemoveText { doc, pos, len } => self.on_text_edit(doc, csprng, |content| {
-                let end = content.len_unicode();
-                let at = pos.min(end);
-                content.delete(at, len.min(end - at))
-            }),
+            Event::LocalEdit { doc, text } => self.on_append(doc, &text, csprng),
+            Event::WriteFile { doc, text } => self.on_write(doc, &text, csprng),
+            Event::InsertText { doc, pos, text } => self.on_insert(doc, pos, &text, csprng),
+            Event::RemoveText { doc, pos, len } => self.on_delete(doc, pos, len, csprng),
             Event::DeleteFile { doc } => self.on_delete_file(doc, csprng),
             Event::Resync { doc } => self.on_resync(doc, csprng),
             Event::AddUser {
@@ -1299,6 +1335,15 @@ impl WorkspaceState {
             }
             Event::RemoveMember { member } => self.on_remove_member(member),
             Event::Leave => self.on_leave(),
+            Event::Propose { action, expires } => self.on_propose(action, expires, csprng),
+            Event::Approve { proposal } => self.on_approve(proposal, csprng),
+            // Unconditional rather than diffed against what peers might hold:
+            // there is nothing to diff against, since a broadcast has no
+            // recipient list. Receivers absorb it idempotently and
+            // `on_certs_arrived` returns early when nothing was new.
+            Event::ResyncCertificates => Ok(vec![Effect::BroadcastCerts(
+                self.capabilities().certificates(),
+            )]),
             Event::Rotate => {
                 let op = self.cgka.rotate(csprng)?;
                 Ok(vec![Effect::broadcast(op)])
@@ -1398,6 +1443,173 @@ impl WorkspaceState {
         Err(CoreError::NotAnAdmin)
     }
 
+    /// Refuse an administrative action that has not been authorised by a quorum.
+    ///
+    /// Replaces the bare [`Self::require_admin`] on the actions a threshold
+    /// governs, and degenerates to exactly it at [`DEFAULT_THRESHOLD`] — so a
+    /// workspace that never raises the threshold behaves as it always did, and
+    /// the whole of this machinery costs it one comparison.
+    ///
+    /// # Which actions this governs, and which it does not
+    ///
+    /// Only what [`AdminAction`] can express: removals, role changes, and the
+    /// threshold itself. `AddUser` and `AddDevice` stay single-admin because
+    /// their enrolment data — a leaf key, an endpoint — cannot travel in a
+    /// certificate, so no replica could perform them from a proposal alone. The
+    /// asymmetry is defensible rather than merely convenient: admitting somebody
+    /// is undone by removing them, and removing is the side a quorum protects.
+    ///
+    /// # Still local, still advisory
+    ///
+    /// Like `require_admin` before it, this constrains what a well-behaved node
+    /// *emits*. What constrains a malicious one is the receiver-side check in
+    /// `CgkaController::merge` — and, for the quorum specifically, the fact that
+    /// every replica computes `is_executable` for itself from the same
+    /// certificates. A node that skipped this check would put an operation on
+    /// the wire that its peers merge, so the guarantee here is weaker than the
+    /// role checks it sits beside; see the module notes on the standing plan to
+    /// carry a quorum proof in the operation bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAnAdmin`] if the local device cannot administer
+    /// at all, and [`CoreError::QuorumRequired`] if it can but no matching
+    /// proposal has reached the threshold.
+    fn require_quorum(&self, action: &AdminAction) -> Result<(), CoreError> {
+        self.require_admin()?;
+        let required = self.capabilities().threshold();
+        if required <= DEFAULT_THRESHOLD {
+            return Ok(());
+        }
+        let authorised = self
+            .capabilities()
+            .executable()
+            .iter()
+            .any(|(_, executed)| executed == action);
+        if authorised {
+            Ok(())
+        } else {
+            Err(CoreError::QuorumRequired {
+                required,
+                held: self.matching_approvals(action),
+            })
+        }
+    }
+
+    /// The best approval count any proposal for this exact action has reached.
+    ///
+    /// Reported in the error so a caller can tell "nobody has proposed this"
+    /// from "two of the three approvals are in", which are different situations
+    /// with different remedies.
+    fn matching_approvals(&self, action: &AdminAction) -> u32 {
+        self.capabilities()
+            .proposals()
+            .iter()
+            .filter(|status| status.action == *action)
+            .map(|status| u32::try_from(status.approvals).unwrap_or(u32::MAX))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Mint and broadcast a proposal.
+    ///
+    /// Proposing is itself an administrative act — a member with no role has no
+    /// business filling the group's proposal list — but it is *not* a quorum
+    /// action, or proposing would need a proposal and nothing could ever start.
+    fn on_propose<R: CryptoRng + RngCore>(
+        &mut self,
+        action: AdminAction,
+        expires: Option<u64>,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_admin()?;
+        let seq = self.capabilities().next_proposal_seq();
+        let cert = self
+            .cgka
+            .certify_proposal(action, seq, expires, random_nonce(csprng))?;
+        Ok(vec![Effect::BroadcastCerts(vec![cert])])
+    }
+
+    /// Mint and broadcast an approval, then perform anything it just carried.
+    ///
+    /// The second half is what makes a quorum happen without coordination: the
+    /// approver that tips a proposal over the threshold executes it immediately,
+    /// and so does every peer the moment the certificate reaches them. Duplicate
+    /// removals merge as `MergeOutcome::Duplicate`, which is the same property
+    /// the revenant eviction path already depends on.
+    fn on_approve<R: CryptoRng + RngCore>(
+        &mut self,
+        proposal: [u8; 32],
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_admin()?;
+        let cert = self.cgka.certify_approval(proposal, random_nonce(csprng))?;
+        let mut effects = vec![Effect::BroadcastCerts(vec![cert])];
+        effects.extend(self.run_quorum_actions()?);
+        Ok(effects)
+    }
+
+    /// Whether this device speaks for the founding user.
+    ///
+    /// The founder is the axiom of the capability closure — `tree_id` *is* its
+    /// key — so this is a fact every peer already agrees on, not a role anybody
+    /// granted. It is consulted only where a bootstrap needs it; see
+    /// [`Self::on_set_role`].
+    fn is_founder_device(&self) -> bool {
+        let me = self.member_id().to_bytes();
+        self.capabilities().user_of(&me) == Some(self.capabilities().founder())
+    }
+
+    /// The certificates a receiver needs to verify this action's quorum.
+    ///
+    /// Empty at a threshold of one, where no quorum is required and the bundle
+    /// would be dead weight on every removal.
+    fn quorum_proof(&self, action: &AdminAction) -> Vec<Certificate> {
+        if self.capabilities().threshold() <= DEFAULT_THRESHOLD {
+            return Vec::new();
+        }
+        self.capabilities().proof_of(action)
+    }
+
+    /// Perform every proposal that has reached quorum and has not run here yet.
+    ///
+    /// Deterministic given the certificate set, so every replica reaches the
+    /// same list independently. `executed_here` is local dedup only: it is not
+    /// persisted, because re-running an action after a restart is harmless —
+    /// `remove_member` returns `None` for somebody already gone and a repeated
+    /// grant is superseded by `seq` — and persisting it would be one more thing
+    /// that could disagree with the certificates.
+    fn run_quorum_actions(&mut self) -> Result<Vec<Effect>, CoreError> {
+        let pending: Vec<([u8; 32], AdminAction)> = self
+            .capabilities()
+            .executable()
+            .into_iter()
+            .filter(|(digest, _)| !self.executed_here.contains(digest))
+            .collect();
+
+        let mut effects = Vec::new();
+        for (digest, action) in pending {
+            self.executed_here.insert(digest);
+            // Marked done *before* the attempt: an action that fails here — a
+            // removal of somebody an admin already removed, say — must not be
+            // retried on every subsequent certificate arrival.
+            match action {
+                AdminAction::RemoveMember { member } => {
+                    let Ok(member) = member_from_bytes(member) else {
+                        continue;
+                    };
+                    effects.extend(self.perform_removal(member)?);
+                }
+                // Nothing to perform. An executed `SetRole` proposal *is* the
+                // role — `CapabilityStore` reads it straight out of the closure
+                // — and minting a grant on top would have every replica sign a
+                // different certificate for one decision.
+                AdminAction::SetRole { .. } => {}
+            }
+        }
+        Ok(effects)
+    }
+
     /// Refuse to enrol a device for a user the local device may not act for.
     ///
     /// Adding a device to *your own* user is not an administrative act — it is
@@ -1475,7 +1687,25 @@ impl WorkspaceState {
         role: Role,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.require_admin()?;
+        // The founder may set a role alone whatever the threshold, and the
+        // exemption is what makes a quorum reachable at all: a workspace founded
+        // at a threshold of two has one admin, so without this no proposal could
+        // ever collect two approvals and the group would be deadlocked from
+        // birth. It is narrow on purpose — it covers *roles*, never removals —
+        // and the founder is already the root of every chain here, so it grants
+        // no authority that `tree_id` did not.
+        if self.is_founder_device() {
+            self.require_admin()?;
+        } else {
+            self.require_quorum(&AdminAction::SetRole { user: *user, role })?;
+            if self.capabilities().threshold() > DEFAULT_THRESHOLD {
+                // The executed proposal already *is* the role, on every replica,
+                // so there is nothing left to mint. Returning early rather than
+                // minting a redundant grant keeps one decision represented by
+                // one certificate.
+                return Ok(Vec::new());
+            }
+        }
         if role.can_administer() {
             // Promoting cannot leave the group without an admin.
         } else {
@@ -1509,6 +1739,18 @@ impl WorkspaceState {
         // A new user's id is their first device's member id; see the manifest
         // module documentation for why that identifier rather than a fresh one.
         let user = member.to_bytes();
+        // Admitting somebody *assigns them a role*, so above a threshold of one
+        // it is governed exactly as `SetRole` is: by the founder, or by a
+        // quorum. Refused up front rather than allowed to half-succeed — without
+        // this the `Add` would land and the grant would be inadmissible, leaving
+        // a member in the tree whom nobody can attribute a role to and no error
+        // anywhere saying why.
+        if self.capabilities().threshold() > DEFAULT_THRESHOLD && !self.is_founder_device() {
+            self.require_quorum(&AdminAction::SetRole { user, role })?;
+        } else {
+            // At a threshold of one, or as the founder, the ordinary admin check
+            // inside `admit` is the whole of it.
+        }
         let certs = vec![
             self.cgka
                 .certify_device(member.to_bytes(), user, random_nonce(csprng))?,
@@ -1573,7 +1815,19 @@ impl WorkspaceState {
 
     /// Revoke one device's leaf.
     fn on_remove_member(&mut self, member: MemberId) -> Result<Vec<Effect>, CoreError> {
-        self.require_admin()?;
+        self.require_quorum(&AdminAction::RemoveMember {
+            member: member.to_bytes(),
+        })?;
+        self.perform_removal(member)
+    }
+
+    /// Retract one leaf, with the authorisation decision already made.
+    ///
+    /// Split from [`Self::on_remove_member`] so that a quorum execution and a
+    /// direct call run *identical* code: a second copy of the removal-then-rotate
+    /// ordering would be a second place to get it wrong, and getting it wrong is
+    /// silent — the removed device simply follows the group.
+    fn perform_removal(&mut self, member: MemberId) -> Result<Vec<Effect>, CoreError> {
         // Guard on the device's *user*: removing one of an admin's three
         // devices is fine, removing their last one is not, and the difference
         // is invisible if you look at the leaf alone. A device with no record
@@ -1600,12 +1854,86 @@ impl WorkspaceState {
         // the new capability, and follow the group into the very namespace the
         // rotation existed to keep it out of.
         self.namespace.epoch = self.namespace.epoch.saturating_add(1);
+        // The proof travels with the operation, exactly as a `Grant` does for an
+        // `Add`. A receiver checks the quorum before merging, so a removal that
+        // arrived ahead of the certificates authorising it would be *refused,
+        // not parked* — and no later certificate brings it back.
+        let proof = self.quorum_proof(&AdminAction::RemoveMember {
+            member: member.to_bytes(),
+        });
         Ok(vec![
-            Effect::broadcast(op),
+            Effect::BroadcastOp {
+                op: Box::new(op),
+                proof,
+            },
             Effect::RotateNamespace {
                 epoch: self.namespace.epoch,
             },
         ])
+    }
+
+    /// Append text to the end of a document.
+    fn on_append<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        text: &str,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.on_text_edit(doc, csprng, |content| {
+            let at = content.len_unicode();
+            content.insert(at, text)
+        })
+    }
+
+    /// Replace a document's whole contents.
+    ///
+    /// `update` diffs against the current contents rather than clearing and
+    /// re-inserting, so replacing one word stays a one-word change in the CRDT —
+    /// and merges with a concurrent edit elsewhere in the document instead of
+    /// clobbering it.
+    fn on_write<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        text: &str,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.on_text_edit(doc, csprng, |content| {
+            content
+                .update(text, loro::UpdateOptions::default())
+                .map_err(|e| loro::LoroError::Unknown(e.to_string().into()))
+        })
+    }
+
+    /// Insert text at a character offset.
+    ///
+    /// Positions are clamped rather than rejected: they come from a caller
+    /// holding a view that a concurrent remote edit may already have shortened,
+    /// which is ordinary in a CRDT rather than a fault.
+    fn on_insert<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        pos: usize,
+        text: &str,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.on_text_edit(doc, csprng, |content| {
+            content.insert(pos.min(content.len_unicode()), text)
+        })
+    }
+
+    /// Delete a run of characters, clamped as [`Self::on_insert`] is.
+    fn on_delete<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        pos: usize,
+        len: usize,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.on_text_edit(doc, csprng, |content| {
+            let end = content.len_unicode();
+            let at = pos.min(end);
+            content.delete(at, len.min(end - at))
+        })
     }
 
     /// Retract every leaf belonging to the local user.
@@ -2084,12 +2412,19 @@ impl WorkspaceState {
     /// bothering when something was new keeps a re-sent store from costing a full
     /// drain on every log exchange.
     fn on_certs_arrived(&mut self, certs: Vec<Certificate>) -> Result<Vec<Effect>, CoreError> {
-        if self.cgka.absorb_certificates(certs) > 0 {
-            self.cgka.merge_pending()?;
-            self.drain_pending()
-        } else {
-            Ok(Vec::new())
+        if self.cgka.absorb_certificates(certs) == 0 {
+            return Ok(Vec::new());
         }
+        self.cgka.merge_pending()?;
+        let mut effects = self.drain_pending()?;
+        // Newly arrived approvals may have tipped a proposal over the threshold.
+        // Performed here rather than only in `on_approve` because the approval
+        // that completes a quorum is usually somebody *else's*: without this, a
+        // proposal would execute only on the node that happened to cast the last
+        // vote, and every other replica would wait for an announcement that the
+        // design deliberately does not send.
+        effects.extend(self.run_quorum_actions()?);
+        Ok(effects)
     }
 
     /// Ask for the removal of a leaf a non-member introduced.

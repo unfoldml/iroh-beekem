@@ -6,7 +6,7 @@
 //! `iroh-beekem-core`, where it can be simulated and property-tested.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,8 +16,9 @@ use beekem::id::{MemberId, TreeId};
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    AuthorizedOp, CgkaController, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
-    NamespaceEpoch, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
+    AdminAction, AuthorizedOp, CgkaController, DEFAULT_THRESHOLD, DeviceRecord, DocumentUuid,
+    Effect, EpochId, Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, Role,
+    WorkspaceInfo, WorkspaceSecret, WorkspaceState,
 };
 use iroh_blobs::api::Store as BlobStore;
 use iroh_docs::{
@@ -365,6 +366,41 @@ impl Workspace {
         info: WorkspaceInfo,
         csprng: &mut R,
     ) -> Result<Self, WorkspaceError> {
+        Self::create_with_quorum(node, identity, info, DEFAULT_THRESHOLD, csprng).await
+    }
+
+    /// Found a workspace in which administrative actions need `threshold`
+    /// distinct admins to agree.
+    ///
+    /// # The threshold is fixed here and can never be changed
+    ///
+    /// Not an oversight, and not a limitation of the implementation: a threshold
+    /// that could move could not be *enforced by receivers*, which is the only
+    /// place enforcement means anything. The check is stricter the more a node
+    /// knows, so a peer holding the certificates that raised the bar would refuse
+    /// an operation that a peer still catching up had already merged, and the
+    /// group would split permanently. Pinning the threshold to the founding
+    /// certificate bundle — which every member holds before it can join —
+    /// removes that asymmetry entirely. See [`Policy`](iroh_beekem_core::Policy).
+    ///
+    /// # Bootstrapping above a threshold of one
+    ///
+    /// A workspace with a threshold of two starts with one admin, and no
+    /// proposal could ever reach quorum. The founder is therefore exempt: it may
+    /// appoint admins alone, as the root of every chain here already is. Everyone
+    /// else needs a quorum to change any role, which is what stops an admin
+    /// appointing a puppet and approving its own actions twice.
+    ///
+    /// # Errors
+    ///
+    /// Propagates endpoint, storage and CGKA failures.
+    pub async fn create_with_quorum<R: CryptoRng + RngCore>(
+        node: Node,
+        identity: &Identity,
+        info: WorkspaceInfo,
+        threshold: u32,
+        csprng: &mut R,
+    ) -> Result<Self, WorkspaceError> {
         let signer = identity.signer();
         let tree_id = TreeId::from(signer.verifying_key());
         let cgka = CgkaController::create(tree_id, signer, csprng)?;
@@ -377,7 +413,8 @@ impl Workspace {
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
-        let state = WorkspaceState::found(cgka, WorkspaceSecret::new(secret.to_bytes()))?;
+        let state =
+            WorkspaceState::found(cgka, WorkspaceSecret::new(secret.to_bytes()), threshold)?;
         let workspace = Self::assemble(
             node,
             state,
@@ -572,6 +609,83 @@ impl Workspace {
             }
         }
         Ok(workspace)
+    }
+
+    // ---- quorum ------------------------------------------------------------
+
+    /// Propose an administrative action for a quorum of admins to approve.
+    ///
+    /// Returns the proposal's digest, which is what [`approve`](Self::approve)
+    /// takes and what [`proposals`](Self::proposals) reports it under.
+    ///
+    /// Proposing needs an administrative role but is not itself a quorum action
+    /// — it could not be, or proposing would need a proposal and nothing could
+    /// ever begin. It grants nothing: a proposal is data until enough distinct
+    /// admins have approved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAnAdmin`](iroh_beekem_core::CoreError::NotAnAdmin)
+    /// if this device cannot administer.
+    pub async fn propose(
+        &self,
+        action: AdminAction,
+        expires: Option<u64>,
+    ) -> Result<[u8; 32], WorkspaceError> {
+        let before: HashSet<[u8; 32]> = self
+            .inner
+            .state
+            .lock()
+            .await
+            .capabilities()
+            .proposals()
+            .iter()
+            .map(|status| status.digest)
+            .collect();
+
+        self.drive(Event::Propose { action, expires }).await?;
+
+        // Identified by what appeared rather than by recomputing the digest
+        // here: the digest covers the signed bytes, and a second computation of
+        // them in the facade would be a second thing to keep in step with the
+        // core's encoding.
+        self.inner
+            .state
+            .lock()
+            .await
+            .capabilities()
+            .proposals()
+            .iter()
+            .find(|status| !before.contains(&status.digest))
+            .map(|status| status.digest)
+            .ok_or_else(|| WorkspaceError::Storage("the proposal was not recorded".into()))
+    }
+
+    /// Approve a proposal, and perform it if that completed its quorum.
+    ///
+    /// Every replica performs an executable proposal independently the moment
+    /// the approvals reach it, so there is nothing to coordinate and no leader.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAnAdmin`](iroh_beekem_core::CoreError::NotAnAdmin)
+    /// if this device cannot administer.
+    pub async fn approve(&self, proposal: [u8; 32]) -> Result<(), WorkspaceError> {
+        self.drive(Event::Approve { proposal }).await
+    }
+
+    /// Every proposal this node knows of, with how close each is to its quorum.
+    pub async fn proposals(&self) -> Vec<ProposalStatus> {
+        self.inner.state.lock().await.capabilities().proposals()
+    }
+
+    /// How many distinct admins an administrative action needs.
+    ///
+    /// Fixed by [`create_with_quorum`](Self::create_with_quorum) and never
+    /// changed; one for a workspace founded with [`create`](Self::create), which
+    /// is unaffected by this machinery existing.
+    pub async fn threshold(&self) -> u32 {
+        self.inner.state.lock().await.capabilities().threshold()
     }
 
     /// Withdraw this user's devices from the group.
@@ -1814,7 +1928,11 @@ async fn republish(inner: &Arc<Inner>) {
     // See `Workspace::resync`: the manifest needs re-announcing too, and this
     // is the path a neighbour appearing takes, which is exactly when a peer is
     // most likely to be missing it.
-    for event in [Event::ResyncManifest, Event::ResyncNamespace] {
+    for event in [
+        Event::ResyncManifest,
+        Event::ResyncNamespace,
+        Event::ResyncCertificates,
+    ] {
         let effects = {
             let mut state = inner.state.lock().await;
             state

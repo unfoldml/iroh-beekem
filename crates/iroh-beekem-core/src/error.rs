@@ -183,6 +183,20 @@ pub enum CoreError {
     #[error("this member's role does not permit writing")]
     NotAWriter,
 
+    /// An administrative action needs approvals this node has not collected.
+    ///
+    /// Distinct from [`Self::NotAnAdmin`], and the caller's remedy is different:
+    /// `NotAnAdmin` means "you may not do this at all", while this means "you
+    /// may, and so must enough of your colleagues". Retrying achieves nothing;
+    /// proposing and collecting approvals does.
+    #[error("this action needs {required} approving admins and has {held}")]
+    QuorumRequired {
+        /// How many distinct admins the threshold demands.
+        required: u32,
+        /// How many have approved a matching proposal, at best.
+        held: u32,
+    },
+
     /// The action would leave the workspace with no administrator.
     ///
     /// Promoting an admin is itself an admin action, so a workspace that loses

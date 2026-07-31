@@ -67,7 +67,7 @@ fn two_node_workspace() -> Bus {
 
     let alice_cgka =
         CgkaController::create(doc_id, alice_signer, &mut rng(10)).expect("alice founds workspace");
-    let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
+    let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()), 1)
         .expect("alice founds the workspace");
 
     // Admission through the real event rather than by poking the CGKA and the
@@ -1010,8 +1010,9 @@ mod repair_reaches_a_member_admitted_late {
 
         let alice_cgka = CgkaController::create(doc_id, alice_signer, &mut rng(10))
             .expect("alice founds the workspace");
-        let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
-            .expect("the founder records herself as the first admin");
+        let mut alice =
+            WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()), 1)
+                .expect("the founder records herself as the first admin");
 
         let effects = alice
             .handle(
@@ -2080,8 +2081,9 @@ mod authorization_is_verified_by_the_receiver {
         let alice_cgka = CgkaController::create(tree_id, alice_signer, &mut rng(105))
             .expect("alice founds the workspace");
         let alice_id = alice_cgka.member_id();
-        let mut alice = WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()))
-            .expect("alice records herself as the first admin");
+        let mut alice =
+            WorkspaceState::found(alice_cgka, WorkspaceSecret::new(secret.to_bytes()), 1)
+                .expect("alice records herself as the first admin");
 
         // Admission through the real event, so bob arrives with exactly the
         // certificates a genuine `add_user` would have minted for him.
@@ -2996,6 +2998,279 @@ mod a_member_can_walk_away {
             1,
             "a departing user left a device behind in the tree, so it would still \
              be enumerated as present while unable to act"
+        );
+    }
+}
+
+/// M-of-N: an administrative action needs several distinct admins to agree, and
+/// **every receiver** enforces that — not merely the node issuing it.
+///
+/// The receiver-side half is the whole point. `require_quorum` runs on the node
+/// taking the action and a malicious admin simply would not run it, so a
+/// threshold enforced only there would constrain honest nodes and nobody else.
+mod an_action_needs_a_quorum {
+    use beekem::id::{MemberId, TreeId};
+    use iroh_beekem_core::{
+        AdminAction, AuthorizedOp, CgkaController, CoreError, Effect, Event, Role, WorkspaceSecret,
+        WorkspaceState, capability::Certificate,
+    };
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
+
+    use super::rng;
+
+    /// A three-member workspace founded at a threshold of two.
+    ///
+    /// Alice founds and appoints Bob as a second admin — which only the founder
+    /// may do alone. Carol is an ordinary editor and the target of everything
+    /// proposed below, so neither approver is ever also the victim.
+    struct Quorum {
+        alice: WorkspaceState,
+        bob: WorkspaceState,
+        carol: MemberId,
+    }
+
+    fn two_of_two() -> Quorum {
+        let tree = TreeId::from(MemorySigner::generate(&mut rng(0)).verifying_key());
+        let alice_signer = MemorySigner::generate(&mut rng(1));
+        let bob_signer = MemorySigner::generate(&mut rng(2));
+        let carol_signer = MemorySigner::generate(&mut rng(3));
+        let bob_id = MemberId::from(bob_signer.verifying_key());
+        let carol_id = MemberId::from(carol_signer.verifying_key());
+        let secret = WorkspaceSecret::generate(&mut rng(5));
+
+        let cgka = CgkaController::create(tree, alice_signer, &mut rng(10)).expect("alice founds");
+        let mut alice = WorkspaceState::found(cgka, WorkspaceSecret::new(secret.to_bytes()), 2)
+            .expect("alice founds at a threshold of two");
+
+        // Both admitted by the founder, which its exemption permits and which is
+        // the only way a workspace above a threshold of one can ever acquire the
+        // admins a quorum is made of.
+        let bob_secret = ShareSecretKey::generate(&mut rng(20));
+        alice
+            .handle(
+                Event::AddUser {
+                    member: bob_id,
+                    share_key: bob_secret.share_key(),
+                    role: Role::Admin,
+                    display_name: "bob".into(),
+                    endpoint: None,
+                },
+                &mut rng(21),
+            )
+            .expect("the founder may appoint an admin alone");
+        let carol_secret = ShareSecretKey::generate(&mut rng(30));
+        alice
+            .handle(
+                Event::AddUser {
+                    member: carol_id,
+                    share_key: carol_secret.share_key(),
+                    role: Role::Editor,
+                    display_name: "carol".into(),
+                    endpoint: None,
+                },
+                &mut rng(31),
+            )
+            .expect("the founder admits carol");
+
+        let log = alice.op_log().expect("exporting the log");
+        let certs = alice.capabilities().certificates();
+        let bob_cgka =
+            CgkaController::join(tree, bob_signer, bob_secret, &log, &certs).expect("bob joins");
+
+        Quorum {
+            alice,
+            bob: WorkspaceState::joined(bob_cgka, secret, 0),
+            carol: carol_id,
+        }
+    }
+
+    /// Every certificate one node emitted, for handing to another.
+    fn certs_of(effects: &[Effect]) -> Vec<Certificate> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::BroadcastCerts(certs) => Some(certs.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// The digest of the proposal a `Propose` minted.
+    fn proposal_digest(effects: &[Effect]) -> [u8; 32] {
+        certs_of(effects)
+            .iter()
+            .find(|c| matches!(c, Certificate::Proposal(_)))
+            .map(Certificate::digest)
+            .expect("a proposal is broadcast as a certificate")
+    }
+
+    /// In a workspace founded at a threshold of two, upon the founder trying to
+    /// remove somebody alone, we expect a refusal.
+    #[test]
+    fn one_admin_cannot_remove_a_member_alone() {
+        let mut q = two_of_two();
+        let err = q
+            .alice
+            .handle(Event::RemoveMember { member: q.carol }, &mut rng(100))
+            .expect_err("one admin is not a quorum of two");
+        assert!(
+            matches!(err, CoreError::QuorumRequired { .. }),
+            "the refusal must say a quorum is missing, since the caller's remedy \
+             is to propose and collect approvals rather than to retry: {err}"
+        );
+        assert_eq!(q.alice.group_size(), 3, "a refused removal happened anyway");
+    }
+
+    /// In a workspace founded at a threshold of two, upon two distinct admins
+    /// approving, we expect the removal to be performed and accepted everywhere.
+    ///
+    /// The counterweight: an implementation that refused every removal would
+    /// satisfy both properties above.
+    #[test]
+    fn a_removal_two_admins_approved_is_performed_and_accepted() {
+        let mut q = two_of_two();
+        let action = AdminAction::RemoveMember {
+            member: q.carol.to_bytes(),
+        };
+
+        let effects = q
+            .alice
+            .handle(
+                Event::Propose {
+                    action,
+                    expires: None,
+                },
+                &mut rng(110),
+            )
+            .expect("an admin may propose");
+        let digest = proposal_digest(&effects);
+        let mut wire = certs_of(&effects);
+
+        let effects = q
+            .alice
+            .handle(Event::Approve { proposal: digest }, &mut rng(111))
+            .expect("alice approves");
+        wire.extend(certs_of(&effects));
+        assert!(
+            !q.alice.capabilities().is_executed_action(&action),
+            "one approval reached a threshold of two"
+        );
+
+        // Bob learns of the proposal and adds the second approval.
+        q.bob
+            .handle(Event::CertsArrived(wire), &mut rng(112))
+            .expect("bob absorbs the proposal and alice's approval");
+        let effects = q
+            .bob
+            .handle(Event::Approve { proposal: digest }, &mut rng(113))
+            .expect("bob approves");
+
+        assert!(
+            q.bob.capabilities().is_executed_action(&action),
+            "two distinct admins approved and the proposal still had no quorum"
+        );
+        assert_eq!(
+            q.bob.group_size(),
+            2,
+            "bob's own approval completed the quorum, so bob must have performed \
+             the removal itself rather than waiting to be told"
+        );
+
+        // And the operation bob emitted must be acceptable to alice, who has not
+        // yet seen bob's approval — which is what the proof bundle is for.
+        let op = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::BroadcastOp { op, proof } => {
+                    Some(AuthorizedOp::new((**op).clone(), proof.clone()))
+                }
+                _ => None,
+            })
+            .expect("performing a removal broadcasts the operation");
+        q.alice
+            .handle(Event::ControlOp(op), &mut rng(114))
+            .expect("alice accepts a removal a quorum authorised");
+        assert_eq!(
+            q.alice.group_size(),
+            2,
+            "the removal carried its own quorum proof, so a receiver that had not \
+             yet seen the approvals must still have accepted it"
+        );
+    }
+
+    /// In a workspace founded at a threshold of two, upon a non-founding admin
+    /// trying to appoint another admin alone, we expect a refusal.
+    ///
+    /// The way round a threshold that would otherwise make it decorative: an
+    /// admin who could appoint a second admin alone could appoint a puppet and
+    /// then approve its own actions twice. The founder's exemption does not
+    /// extend to anybody it appoints.
+    #[test]
+    fn a_non_founding_admin_cannot_appoint_a_puppet() {
+        let mut q = two_of_two();
+        let puppet = MemberId::from(MemorySigner::generate(&mut rng(40)).verifying_key());
+        let puppet_secret = ShareSecretKey::generate(&mut rng(41));
+
+        let err = q
+            .bob
+            .handle(
+                Event::AddUser {
+                    member: puppet,
+                    share_key: puppet_secret.share_key(),
+                    role: Role::Admin,
+                    display_name: "puppet".into(),
+                    endpoint: None,
+                },
+                &mut rng(42),
+            )
+            .expect_err("only the founder may appoint an admin alone");
+        assert!(
+            matches!(err, CoreError::QuorumRequired { .. }),
+            "appointing an admin above a threshold of one needs the founder or a \
+             quorum, and the refusal should say which is missing: {err}"
+        );
+    }
+
+    /// In a workspace founded at a threshold of two, upon a member leaving, we
+    /// expect no quorum to be required.
+    ///
+    /// A threshold governs what the group does *to* a member, never what a member
+    /// does about itself. Requiring a quorum to leave would let a group hold
+    /// somebody in a workspace against their will.
+    #[test]
+    fn leaving_needs_no_quorum() {
+        let mut q = two_of_two();
+        let effects = q
+            .bob
+            .handle(Event::Leave, &mut rng(120))
+            .expect("a member may always leave");
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastOp { .. })),
+            "the departure emitted no removal at all"
+        );
+
+        let op = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::BroadcastOp { op, proof } => {
+                    Some(AuthorizedOp::new((**op).clone(), proof.clone()))
+                }
+                _ => None,
+            })
+            .expect("a departure broadcasts its removal");
+        q.alice
+            .handle(Event::ControlOp(op), &mut rng(121))
+            .expect("alice accepts a self-removal");
+        assert_eq!(
+            q.alice.group_size(),
+            2,
+            "a receiver refused a member's own departure because no quorum had \
+             approved it"
         );
     }
 }

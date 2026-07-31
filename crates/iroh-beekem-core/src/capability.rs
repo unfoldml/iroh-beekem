@@ -185,6 +185,152 @@ pub struct Grant {
     pub nonce: [u8; 16],
 }
 
+/// Domain tag for [`AdminProposal`]. Sixteen bytes of printable ASCII.
+///
+/// Small fixed-size payloads are exactly the ones that collide, and a
+/// `RemoveMember` proposal encodes to very nearly the length of a [`Grant`] — so
+/// this tag is not hygiene here, it is the whole of what keeps an admin's
+/// routine grant from being lifted onto a proposal to remove somebody.
+pub const PROPOSAL_DOMAIN: [u8; 16] = *b"iroh-beekem/prop";
+
+/// Domain tag for [`Approval`]. Sixteen bytes of printable ASCII.
+pub const APPROVAL_DOMAIN: [u8; 16] = *b"iroh-beekem/aprv";
+
+/// Domain tag for [`Policy`]. Sixteen bytes of printable ASCII.
+pub const POLICY_DOMAIN: [u8; 16] = *b"iroh-beekem/plcy";
+
+/// The threshold a workspace has when its founder set none.
+///
+/// One, so that every workspace founded before quorum existed keeps behaving
+/// exactly as it did: a single admin acting alone *is* a quorum of one, and
+/// `require_quorum` degenerates to the `require_admin` it replaced.
+pub const DEFAULT_THRESHOLD: u32 = 1;
+
+/// The workspace's administrative threshold, fixed by its founder.
+///
+/// # Why this is immutable, and why it has to be
+///
+/// A quorum is only worth anything if **every receiver** refuses an action that
+/// did not reach it. That check is *stricter the more a node knows*: a peer
+/// holding the certificates that raised the bar rejects an operation that a peer
+/// still catching up would accept. If the threshold could change, those two peers
+/// would merge different sets of operations and the group would diverge
+/// permanently — the one failure this whole design is built to avoid, and the
+/// reason `known_members` is monotone and `roles` is not consulted on merge.
+///
+/// Fixing the threshold at founding removes the asymmetry entirely. The policy is
+/// minted by [`WorkspaceState::found`](crate::state::WorkspaceState::found),
+/// self-signed by the founder — valid for exactly the reason the founder's own
+/// admin grant is, because `tree_id` **is** that key — and it travels in the
+/// invite beside it. A member cannot be behind on it: it arrives with the
+/// certificates without which they could not have joined at all.
+///
+/// The cost is stated plainly rather than worked around: **a workspace's
+/// threshold cannot be changed after it is created.** Raising it later would be
+/// the unsound operation above; lowering it would let one compromised admin undo
+/// the protection the rest of the group is relying on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Policy {
+    /// Domain separation, always [`POLICY_DOMAIN`].
+    domain: [u8; 16],
+    /// How many distinct admins an administrative action needs.
+    ///
+    /// Clamped to at least one on read: zero would not mean "no quorum needed"
+    /// but "every proposal executes with no approvals at all".
+    pub threshold: u32,
+    /// Distinguishes two otherwise identical policies.
+    pub nonce: [u8; 16],
+}
+
+/// An administrative action that a quorum of admins can authorise.
+///
+/// Deliberately a small, closed set: every variant must be expressible in a
+/// certificate, because a proposal travels as one and a replica executes it from
+/// the certificate alone. That rules out `AddUser` and `AddDevice`, whose
+/// enrolment data — a leaf key, an endpoint — is not here and could not be
+/// reconstructed. Those stay single-admin, and the asymmetry is defensible:
+/// admitting somebody is reversible by removing them, whereas the actions below
+/// are the ones that take access away or hand it out.
+///
+/// There is no `Rotate` variant either, although namespace rotation is an
+/// administrative act. It is not independently proposable — `on_remove_member`
+/// emits it as a *consequence* of a removal — so gating the removal already gates
+/// the rotation, and a variant nobody could propose would be a wire format with
+/// no caller.
+///
+/// And there is no `SetThreshold`: the threshold is fixed at founding by
+/// [`Policy`], for the divergence reason recorded there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdminAction {
+    /// Retract one device's leaf.
+    RemoveMember {
+        /// The device to remove.
+        member: [u8; 32],
+    },
+    /// Assign a role to a user.
+    SetRole {
+        /// The user whose role changes.
+        user: [u8; 32],
+        /// The role to assign.
+        role: Role,
+    },
+}
+
+/// A proposed administrative action, awaiting approvals.
+///
+/// Data, not an instruction: proposing costs nothing and grants nothing. What
+/// makes it happen is [`Approval`]s from enough distinct admins, at which point
+/// **every** replica performs the action independently. Nobody coordinates, and
+/// nobody needs to: duplicate removals merge as `MergeOutcome::Duplicate`, which
+/// is the same property the revenant eviction path already relies on.
+///
+/// Build one with [`AdminProposal::new`]: the domain tag is not a field a caller
+/// fills.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminProposal {
+    /// Domain separation, always [`PROPOSAL_DOMAIN`]. First field, so it is the
+    /// first bytes of the signed encoding.
+    domain: [u8; 16],
+    /// What is being proposed.
+    pub action: AdminAction,
+    /// Which generation of proposal this is.
+    ///
+    /// Orders proposals against each other, with the digest breaking ties — the
+    /// same `(seq, digest)` total order [`Grant`] uses, and needed for the same
+    /// reason: a set has no order of its own, so two `SetRole` proposals naming
+    /// one user would otherwise have no defined winner and two peers holding the
+    /// same certificates could resolve that user's role differently.
+    pub seq: u64,
+    /// When this proposal stops being offered, in absolute milliseconds.
+    ///
+    /// **Carried, not enforced**, exactly as [`Grant::not_after`] is. The core
+    /// has no clock, and an expiry inside the quorum predicate would make two
+    /// peers with skewed clocks execute different sets of proposals. A caller
+    /// with a clock may refuse to *approve* an expired proposal, which is a local
+    /// decision by one device and diverges nobody.
+    pub expires: Option<u64>,
+    /// Distinguishes two otherwise identical proposals.
+    pub nonce: [u8; 16],
+}
+
+/// One admin's approval of a proposal.
+///
+/// Names the proposal by digest rather than repeating its contents, which is
+/// what makes an approval unambiguous: an approver signs over the exact bytes
+/// that will be executed, so there is no way to approve one action and have
+/// another performed.
+///
+/// Build one with [`Approval::new`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    /// Domain separation, always [`APPROVAL_DOMAIN`].
+    domain: [u8; 16],
+    /// The digest of the [`AdminProposal`] certificate being approved.
+    pub proposal: [u8; 32],
+    /// Distinguishes two otherwise identical approvals.
+    pub nonce: [u8; 16],
+}
+
 /// A statement that a CGKA leaf belongs to a particular user.
 ///
 /// This is the binding that makes a leaf attributable to a person, and therefore
@@ -219,6 +365,12 @@ pub enum Certificate {
     Grant(Signed<Grant>),
     /// A device's owner.
     Binding(Signed<DeviceBinding>),
+    /// An administrative action awaiting approvals.
+    Proposal(Signed<AdminProposal>),
+    /// One admin's approval of a proposal.
+    Approval(Signed<Approval>),
+    /// The workspace's administrative threshold, fixed by its founder.
+    Policy(Signed<Policy>),
 }
 
 impl Grant {
@@ -288,6 +440,80 @@ impl DeviceBinding {
     }
 }
 
+impl AdminProposal {
+    /// A proposal to perform `action`, stamped with its domain tag.
+    #[must_use]
+    pub fn new(action: AdminAction, seq: u64, expires: Option<u64>, nonce: [u8; 16]) -> Self {
+        Self {
+            domain: PROPOSAL_DOMAIN,
+            action,
+            seq,
+            expires,
+            nonce,
+        }
+    }
+
+    /// Sign a proposal with the proposing device's key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn sign(self, signer: &MemorySigner) -> Result<Certificate, CoreError> {
+        signer
+            .try_sign_sync(self)
+            .map(Certificate::Proposal)
+            .map_err(|e| CoreError::Signing(e.to_string()))
+    }
+}
+
+impl Approval {
+    /// An approval of the proposal with this digest, stamped with its tag.
+    #[must_use]
+    pub fn new(proposal: [u8; 32], nonce: [u8; 16]) -> Self {
+        Self {
+            domain: APPROVAL_DOMAIN,
+            proposal,
+            nonce,
+        }
+    }
+
+    /// Sign an approval with the approving device's key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn sign(self, signer: &MemorySigner) -> Result<Certificate, CoreError> {
+        signer
+            .try_sign_sync(self)
+            .map(Certificate::Approval)
+            .map_err(|e| CoreError::Signing(e.to_string()))
+    }
+}
+
+impl Policy {
+    /// A policy fixing the workspace threshold, stamped with its domain tag.
+    #[must_use]
+    pub fn new(threshold: u32, nonce: [u8; 16]) -> Self {
+        Self {
+            domain: POLICY_DOMAIN,
+            threshold,
+            nonce,
+        }
+    }
+
+    /// Sign a policy with the founding device's key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn sign(self, signer: &MemorySigner) -> Result<Certificate, CoreError> {
+        signer
+            .try_sign_sync(self)
+            .map(Certificate::Policy)
+            .map_err(|e| CoreError::Signing(e.to_string()))
+    }
+}
+
 impl Certificate {
     /// The device that issued this certificate, as raw verifying-key bytes.
     ///
@@ -299,6 +525,9 @@ impl Certificate {
         match self {
             Self::Grant(signed) => signed.issuer().to_bytes(),
             Self::Binding(signed) => signed.issuer().to_bytes(),
+            Self::Proposal(signed) => signed.issuer().to_bytes(),
+            Self::Approval(signed) => signed.issuer().to_bytes(),
+            Self::Policy(signed) => signed.issuer().to_bytes(),
         }
     }
 
@@ -308,6 +537,9 @@ impl Certificate {
         match self {
             Self::Grant(signed) => signed.digest().into(),
             Self::Binding(signed) => signed.digest().into(),
+            Self::Proposal(signed) => signed.digest().into(),
+            Self::Approval(signed) => signed.digest().into(),
+            Self::Policy(signed) => signed.digest().into(),
         }
     }
 
@@ -327,17 +559,39 @@ impl Certificate {
         let domain_ok = match self {
             Self::Grant(signed) => signed.payload().domain == GRANT_DOMAIN,
             Self::Binding(signed) => signed.payload().domain == BINDING_DOMAIN,
+            Self::Proposal(signed) => signed.payload().domain == PROPOSAL_DOMAIN,
+            Self::Approval(signed) => signed.payload().domain == APPROVAL_DOMAIN,
+            Self::Policy(signed) => signed.payload().domain == POLICY_DOMAIN,
         };
         if domain_ok {
             let verified = match self {
                 Self::Grant(signed) => signed.try_verify(),
                 Self::Binding(signed) => signed.try_verify(),
+                Self::Proposal(signed) => signed.try_verify(),
+                Self::Approval(signed) => signed.try_verify(),
+                Self::Policy(signed) => signed.try_verify(),
             };
             verified.map_err(|_| CoreError::BadSignature)
         } else {
             Err(CoreError::WrongDomain)
         }
     }
+}
+
+/// One proposal as an application sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProposalStatus {
+    /// Identifies the proposal; what [`Approval`] names and what a caller
+    /// passes to approve it.
+    pub digest: [u8; 32],
+    /// What would happen if it reached quorum.
+    pub action: AdminAction,
+    /// How many distinct admin users have approved so far.
+    pub approvals: usize,
+    /// How many distinct admins are needed. Constant for the workspace.
+    pub required: u32,
+    /// Whether it has reached quorum and is being performed.
+    pub executable: bool,
 }
 
 /// Every authorization statement this node has accepted, plus what they imply.
@@ -366,6 +620,21 @@ pub struct CapabilityStore {
     ever_admin: BTreeSet<[u8; 32]>,
     /// Derived: each user's current role, by `(seq, digest)`. Non-monotone.
     roles: BTreeMap<[u8; 32], Role>,
+    /// Accepted proposals, keyed by digest.
+    proposals: BTreeMap<[u8; 32], Signed<AdminProposal>>,
+    /// Accepted approvals, keyed by digest.
+    approvals: BTreeMap<[u8; 32], Signed<Approval>>,
+    /// Accepted policies, keyed by digest. Only the founder's is honoured.
+    policies: BTreeMap<[u8; 32], Signed<Policy>>,
+    /// Derived: the threshold, from the founder's policy. Constant per workspace.
+    threshold: u32,
+    /// Derived: proposals that have reached quorum, by proposal digest.
+    ///
+    /// **Monotone.** Approvers are counted with `ever_admin`, not `role_of`, so
+    /// gaining certificates can only add to this set — which is what makes the
+    /// receiver-side check in `CgkaController::authorize` safe: a peer that
+    /// knows more accepts more, never less.
+    executed: BTreeSet<[u8; 32]>,
 }
 
 impl CapabilityStore {
@@ -385,6 +654,11 @@ impl CapabilityStore {
             device_user: BTreeMap::new(),
             ever_admin: BTreeSet::new(),
             roles: BTreeMap::new(),
+            proposals: BTreeMap::new(),
+            approvals: BTreeMap::new(),
+            policies: BTreeMap::new(),
+            threshold: DEFAULT_THRESHOLD,
+            executed: BTreeSet::new(),
         };
         this.recompute();
         this
@@ -446,6 +720,9 @@ impl CapabilityStore {
         Ok(match cert {
             Certificate::Grant(signed) => self.grants.insert(digest, signed).is_none(),
             Certificate::Binding(signed) => self.bindings.insert(digest, signed).is_none(),
+            Certificate::Proposal(signed) => self.proposals.insert(digest, signed).is_none(),
+            Certificate::Approval(signed) => self.approvals.insert(digest, signed).is_none(),
+            Certificate::Policy(signed) => self.policies.insert(digest, signed).is_none(),
         })
     }
 
@@ -460,13 +737,20 @@ impl CapabilityStore {
             .cloned()
             .map(Certificate::Binding)
             .chain(self.grants.values().cloned().map(Certificate::Grant))
+            .chain(self.proposals.values().cloned().map(Certificate::Proposal))
+            .chain(self.approvals.values().cloned().map(Certificate::Approval))
+            .chain(self.policies.values().cloned().map(Certificate::Policy))
             .collect()
     }
 
     /// How many certificates are held.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.grants.len() + self.bindings.len()
+        self.grants.len()
+            + self.bindings.len()
+            + self.proposals.len()
+            + self.approvals.len()
+            + self.policies.len()
     }
 
     /// Whether the store holds no certificates beyond the founder axiom.
@@ -488,11 +772,16 @@ impl CapabilityStore {
     /// non-monotone input could retract an admission made in an earlier round and
     /// the fixpoint would not be well defined, never mind order-independent.
     fn recompute(&mut self) {
+        // The threshold first: it is a constant of the workspace, read straight
+        // off the founder's policy, so nothing below can move it.
+        let threshold = self.resolve_threshold();
+
         // The axiom: the founder is their own user, and is an admin. Seeded
         // before any certificate is considered, since every chain terminates
         // here and nothing can authorise it.
         let mut device_user = BTreeMap::from([(self.founder, self.founder)]);
         let mut ever_admin = BTreeSet::from([self.founder]);
+        let mut executed: BTreeSet<[u8; 32]> = BTreeSet::new();
 
         loop {
             let mut changed = false;
@@ -528,6 +817,38 @@ impl CapabilityStore {
                 }
             }
 
+            // Proposals that have collected enough approvals. Inside the loop
+            // because it feeds `ever_admin` and is fed by it: an approval only
+            // counts once its issuer's device is bound and their user is known
+            // to have been an admin, and a quorum can in turn admit a grant that
+            // makes somebody else one. Both sets only grow, so the loop still
+            // terminates in at most `len()` rounds.
+            for (digest, signed) in &self.proposals {
+                if executed.contains(digest) {
+                    continue;
+                }
+                // The proposer must be an admin. Without this, any member could
+                // fill the group's proposal list, and a quorum of admins who
+                // approved carelessly would execute an action nobody with
+                // authority ever put forward.
+                let Some(issuer_user) = device_user.get(&signed.issuer().to_bytes()).copied()
+                else {
+                    continue;
+                };
+                if !ever_admin.contains(&issuer_user) {
+                    continue;
+                }
+                let approvers =
+                    Self::approving_users(&self.approvals, &device_user, &ever_admin, digest);
+                if approvers.len() >= threshold as usize {
+                    executed.insert(*digest);
+                    changed = true;
+                } else {
+                    // Not enough distinct admins yet. May become enough in a
+                    // later round, or when more certificates arrive.
+                }
+            }
+
             for signed in self.grants.values() {
                 let grant = signed.payload();
                 if !grant.capability.can_administer() {
@@ -539,11 +860,23 @@ impl CapabilityStore {
                 else {
                     continue;
                 };
-                if ever_admin.contains(&issuer_user) && ever_admin.insert(grant.subject) {
+                if !ever_admin.contains(&issuer_user) {
+                    continue;
+                }
+                if !Self::grant_is_authorised(
+                    threshold,
+                    issuer_user,
+                    self.founder,
+                    grant,
+                    &executed,
+                    &self.proposals,
+                ) {
+                    continue;
+                }
+                if ever_admin.insert(grant.subject) {
                     changed = true;
                 } else {
-                    // Either the issuer cannot administer, or the subject was
-                    // already known to have been an admin.
+                    // The subject was already known to have been an admin.
                 }
             }
 
@@ -552,20 +885,71 @@ impl CapabilityStore {
             }
         }
 
-        // Now the roles, from the admitted grants only. The founder's seed is
-        // recorded at the smallest possible `(seq, digest)` — the all-zero
-        // digest trick `NamespaceEpoch::INITIAL` already uses — so any real
-        // grant naming the founder supersedes it rather than tying with it.
-        let mut best: BTreeMap<[u8; 32], (u64, [u8; 32])> =
-            BTreeMap::from([(self.founder, (0, [0u8; 32]))]);
-        let mut roles = BTreeMap::from([(self.founder, Role::Admin)]);
+        let roles = Self::resolve_roles(
+            threshold,
+            self.founder,
+            &self.grants,
+            &self.proposals,
+            &device_user,
+            &ever_admin,
+            &executed,
+        );
 
-        for (digest, signed) in &self.grants {
+        self.threshold = threshold;
+        self.executed = executed;
+        self.device_user = device_user;
+        self.ever_admin = ever_admin;
+        self.roles = roles;
+    }
+
+    /// Resolve each user's current role, once the closure has settled.
+    ///
+    /// Split from [`Self::recompute`] because it is a different question asked of
+    /// the same fixpoint: that loop decides what is *admissible*, monotonically;
+    /// this decides what is *current*, by `(seq, digest)`, and is allowed to be
+    /// order-sensitive because the cost of disagreeing is a refused action rather
+    /// than a dropped operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every argument is a piece of the fixpoint this reads; bundling \
+                  them into a struct would add a type whose only purpose is to be \
+                  destructured on the next line"
+    )]
+    fn resolve_roles(
+        threshold: u32,
+        founder: [u8; 32],
+        grants: &BTreeMap<[u8; 32], Signed<Grant>>,
+        proposals: &BTreeMap<[u8; 32], Signed<AdminProposal>>,
+        device_user: &BTreeMap<[u8; 32], [u8; 32]>,
+        ever_admin: &BTreeSet<[u8; 32]>,
+        executed: &BTreeSet<[u8; 32]>,
+    ) -> BTreeMap<[u8; 32], Role> {
+        // The founder's seed is recorded at the smallest possible
+        // `(seq, digest)` — the all-zero digest trick `NamespaceEpoch::INITIAL`
+        // already uses — so any real grant naming the founder supersedes it
+        // rather than tying with it.
+        let mut best: BTreeMap<[u8; 32], (u64, [u8; 32])> =
+            BTreeMap::from([(founder, (0, [0u8; 32]))]);
+        let mut roles = BTreeMap::from([(founder, Role::Admin)]);
+
+        for (digest, signed) in grants {
             let grant = signed.payload();
             let Some(issuer_user) = device_user.get(&signed.issuer().to_bytes()).copied() else {
                 continue;
             };
             if !ever_admin.contains(&issuer_user) {
+                continue;
+            }
+            if !Self::grant_is_authorised(
+                threshold,
+                issuer_user,
+                founder,
+                grant,
+                executed,
+                proposals,
+            ) {
+                // Above a threshold of one, a role is the founder's to set or a
+                // quorum's — see `grant_is_authorised`.
                 continue;
             }
             let rank = (grant.seq, *digest);
@@ -581,9 +965,249 @@ impl CapabilityStore {
             }
         }
 
-        self.device_user = device_user;
-        self.ever_admin = ever_admin;
-        self.roles = roles;
+        // Roles a quorum set directly. An executed `SetRole` proposal is the
+        // authority in its own right: nobody has to mint a grant afterwards, and
+        // nobody should, because every replica executes independently and would
+        // mint a different certificate for the same decision.
+        for (digest, signed) in proposals {
+            if !executed.contains(digest) {
+                continue;
+            }
+            let AdminAction::SetRole { user, role } = signed.payload().action else {
+                continue;
+            };
+            let rank = (signed.payload().seq, *digest);
+            if best.get(&user).is_none_or(|current| rank > *current) {
+                best.insert(user, rank);
+                roles.insert(user, role);
+            } else {
+                // An older decision about this user, or one that lost the
+                // digest tie-break with a concurrent proposal.
+            }
+        }
+
+        roles
+    }
+
+    /// The workspace threshold, from the founder's policy.
+    ///
+    /// Only the founder's own policy is honoured — anyone else's is inert — which
+    /// is what makes this a constant rather than something a member can move.
+    /// `max` across them so a duplicate can never *lower* the bar; an honest
+    /// founder mints exactly one, in [`WorkspaceState::found`](crate::state::WorkspaceState::found).
+    fn resolve_threshold(&self) -> u32 {
+        self.policies
+            .values()
+            .filter(|signed| signed.issuer().to_bytes() == self.founder)
+            .map(|signed| signed.payload().threshold.max(1))
+            .max()
+            .unwrap_or(DEFAULT_THRESHOLD)
+    }
+
+    /// The distinct users who have approved `proposal` and have ever been admins.
+    ///
+    /// **`ever_admin`, not `role_of`, and that is the whole soundness argument.**
+    /// This set is consulted by `CgkaController::authorize` when it decides
+    /// whether to merge somebody else's removal, so it must be monotone: a peer
+    /// holding more certificates has to reach *at least* the same verdict, or two
+    /// peers would merge different operations and the group would split. Counting
+    /// by `role_of` would let a demotion retract an approval and do exactly that.
+    ///
+    /// The cost is the one already recorded for `ever_admin` everywhere else: a
+    /// demoted admin's approval keeps counting. Demotion is a courtesy; removal
+    /// is the enforcement.
+    ///
+    /// Users and not devices, because counting devices would let one admin with
+    /// three computers satisfy a threshold of three.
+    fn approving_users(
+        approvals: &BTreeMap<[u8; 32], Signed<Approval>>,
+        device_user: &BTreeMap<[u8; 32], [u8; 32]>,
+        ever_admin: &BTreeSet<[u8; 32]>,
+        proposal: &[u8; 32],
+    ) -> BTreeSet<[u8; 32]> {
+        approvals
+            .values()
+            .filter(|signed| signed.payload().proposal == *proposal)
+            .filter_map(|signed| device_user.get(&signed.issuer().to_bytes()).copied())
+            .filter(|user| ever_admin.contains(user))
+            .collect()
+    }
+
+    /// Whether a grant may set a role, given the workspace threshold.
+    ///
+    /// At a threshold of one this is unconditional and the whole quorum
+    /// mechanism is absent. Above it, a role may be set only by **the founder**
+    /// or by **a quorum**, and both halves are load-bearing:
+    ///
+    /// * the founder's exemption is what lets a workspace bootstrap at all — with
+    ///   a threshold of two and one admin, no proposal could ever reach quorum,
+    ///   so somebody has to be able to appoint the second admin unilaterally, and
+    ///   the founder already is the root of every chain here;
+    /// * requiring a quorum of everyone else is what closes the obvious way round
+    ///   a threshold: an admin who could appoint a second admin alone could
+    ///   appoint a puppet and then approve its own actions twice.
+    fn grant_is_authorised(
+        threshold: u32,
+        issuer_user: [u8; 32],
+        founder: [u8; 32],
+        grant: &Grant,
+        executed: &BTreeSet<[u8; 32]>,
+        proposals: &BTreeMap<[u8; 32], Signed<AdminProposal>>,
+    ) -> bool {
+        if threshold <= DEFAULT_THRESHOLD || issuer_user == founder {
+            return true;
+        }
+        executed.iter().any(|digest| {
+            proposals.get(digest).is_some_and(|signed| {
+                signed.payload().action
+                    == AdminAction::SetRole {
+                        user: grant.subject,
+                        role: grant.capability,
+                    }
+            })
+        })
+    }
+
+    /// How many **distinct admin users** have approved this proposal.
+    ///
+    /// Users and not devices, and the difference is the whole security property:
+    /// counting devices would let one admin satisfy a threshold of three by
+    /// approving from a laptop, a phone and a tablet — which is not a quorum, it
+    /// is one person with three computers.
+    #[must_use]
+    pub fn approver_count(&self, proposal: &[u8; 32]) -> usize {
+        self.approvers(proposal).len()
+    }
+
+    /// The distinct admin users who have approved this proposal, in id order.
+    #[must_use]
+    pub fn approvers(&self, proposal: &[u8; 32]) -> BTreeSet<[u8; 32]> {
+        Self::approving_users(
+            &self.approvals,
+            &self.device_user,
+            &self.ever_admin,
+            proposal,
+        )
+    }
+
+    /// How many distinct admins an administrative action needs.
+    ///
+    /// Fixed by the founder at creation and never changed; see [`Policy`].
+    /// [`DEFAULT_THRESHOLD`] when no policy was minted, so a workspace that never
+    /// uses this machinery behaves exactly as it did before the machinery
+    /// existed.
+    #[must_use]
+    pub fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
+    /// Whether some proposal for exactly this action has reached quorum.
+    ///
+    /// The receiver-side predicate. `CgkaController::authorize` asks it before
+    /// merging somebody else's `Remove`, which is what makes a threshold binding
+    /// on the group rather than on the node that happens to be issuing.
+    #[must_use]
+    pub fn is_executed_action(&self, action: &AdminAction) -> bool {
+        self.executed.iter().any(|digest| {
+            self.proposals
+                .get(digest)
+                .is_some_and(|signed| signed.payload().action == *action)
+        })
+    }
+
+    /// Whether this proposal has reached the threshold that applied to it.
+    #[must_use]
+    pub fn is_executable(&self, proposal: &[u8; 32]) -> bool {
+        self.executed.contains(proposal)
+    }
+
+    /// The certificates proving a quorum authorised `action`.
+    ///
+    /// The founder's policy, the executed proposal, and the approvals that
+    /// carried it — everything a receiver needs to reach the same verdict
+    /// without already holding any of it. Bundled with the operation for the
+    /// reason [`AuthorizedOp`](crate::keys::AuthorizedOp) gives: an operation
+    /// whose proof travels separately cannot be judged on arrival, and one that
+    /// cannot be judged has to be parked, which is a flooding surface.
+    ///
+    /// Empty if no proposal for this action has reached quorum.
+    #[must_use]
+    pub fn proof_of(&self, action: &AdminAction) -> Vec<Certificate> {
+        let Some(digest) = self.executed.iter().find(|digest| {
+            self.proposals
+                .get(*digest)
+                .is_some_and(|signed| signed.payload().action == *action)
+        }) else {
+            return Vec::new();
+        };
+
+        let mut proof: Vec<Certificate> = self
+            .policies
+            .values()
+            .filter(|signed| signed.issuer().to_bytes() == self.founder)
+            .cloned()
+            .map(Certificate::Policy)
+            .collect();
+        if let Some(signed) = self.proposals.get(digest) {
+            proof.push(Certificate::Proposal(signed.clone()));
+        } else {
+            // Unreachable: `digest` came from a lookup in this same map.
+        }
+        proof.extend(
+            self.approvals
+                .values()
+                .filter(|signed| signed.payload().proposal == *digest)
+                .cloned()
+                .map(Certificate::Approval),
+        );
+        proof
+    }
+
+    /// Every proposal that has reached quorum, with its action, in digest order.
+    ///
+    /// What a replica performs. Every node holding the same certificates derives
+    /// the same list, so each one acts independently and the duplicates merge.
+    #[must_use]
+    pub fn executable(&self) -> Vec<([u8; 32], AdminAction)> {
+        self.executed
+            .iter()
+            .filter_map(|digest| {
+                let signed = self.proposals.get(digest)?;
+                Some((*digest, signed.payload().action))
+            })
+            .collect()
+    }
+
+    /// Every proposal this store holds, executed or not, in digest order.
+    ///
+    /// For an application that wants to show what is awaiting approval, together
+    /// with how close each one is.
+    #[must_use]
+    pub fn proposals(&self) -> Vec<ProposalStatus> {
+        self.proposals
+            .iter()
+            .map(|(digest, signed)| ProposalStatus {
+                digest: *digest,
+                action: signed.payload().action,
+                approvals: self.approver_count(digest),
+                required: self.threshold,
+                executable: self.executed.contains(digest),
+            })
+            .collect()
+    }
+
+    /// The next `seq` to use for a new proposal.
+    ///
+    /// One past the highest any proposal carries, admitted or not — the same
+    /// reasoning as [`Self::next_seq`]: counting rejected proposals too stops a
+    /// member freezing the sequence with one absurd value.
+    #[must_use]
+    pub fn next_proposal_seq(&self) -> u64 {
+        self.proposals
+            .values()
+            .map(|signed| signed.payload().seq)
+            .max()
+            .map_or(0, |highest| highest.saturating_add(1))
     }
 
     /// Whether this user has ever held an admin grant. **Monotone.**
@@ -700,7 +1324,9 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     use super::{
-        BINDING_DOMAIN, CapabilityStore, Certificate, DeviceBinding, GRANT_DOMAIN, Grant, Role,
+        APPROVAL_DOMAIN, AdminAction, AdminProposal, Approval, BINDING_DOMAIN, CapabilityStore,
+        Certificate, DeviceBinding, GRANT_DOMAIN, Grant, POLICY_DOMAIN, PROPOSAL_DOMAIN, Policy,
+        Role,
     };
 
     /// A signer and its device id.
@@ -1045,12 +1671,24 @@ mod tests {
     /// why this asserts the encoding and not just the inequality.
     #[test]
     fn the_domain_tags_are_distinct_and_free_of_nul_bytes() {
-        assert_ne!(
-            GRANT_DOMAIN, BINDING_DOMAIN,
-            "two certificate kinds sharing a tag would leave them mutually \
-             confusable, which is the whole thing the tags exist to prevent"
-        );
-        for (name, tag) in [("grant", GRANT_DOMAIN), ("binding", BINDING_DOMAIN)] {
+        let tags = [
+            ("grant", GRANT_DOMAIN),
+            ("binding", BINDING_DOMAIN),
+            ("proposal", PROPOSAL_DOMAIN),
+            ("approval", APPROVAL_DOMAIN),
+            ("policy", POLICY_DOMAIN),
+        ];
+        for (i, (a_name, a)) in tags.iter().enumerate() {
+            for (b_name, b) in tags.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "the {a_name} and {b_name} tags are identical; two certificate \
+                     kinds sharing a tag are mutually confusable, which is the \
+                     whole thing the tags exist to prevent"
+                );
+            }
+        }
+        for (name, tag) in tags {
             assert!(
                 tag.iter().all(u8::is_ascii_graphic),
                 "the {name} tag must be printable ASCII: a zero byte in positions \
@@ -1113,12 +1751,37 @@ mod tests {
         })
         .expect("an operation serializes");
 
-        assert_ne!(
-            grant, binding,
-            "a grant and a binding must never encode alike, or one signature \
-             authorises both"
-        );
-        for (name, encoded) in [("grant", &grant), ("binding", &binding)] {
+        let proposal = bincode::serialize(&AdminProposal::new(
+            AdminAction::RemoveMember { member: id },
+            0,
+            None,
+            [0u8; 16],
+        ))
+        .expect("a proposal serializes");
+        let approval = bincode::serialize(&Approval::new([0u8; 32], [0u8; 16]))
+            .expect("an approval serializes");
+        let policy = bincode::serialize(&Policy::new(2, [0u8; 16])).expect("a policy serializes");
+
+        // Pairwise, not just against the grant: five types means ten pairs, and
+        // the newest are the smallest payloads in the protocol — exactly
+        // the shape that collides.
+        let all = [
+            ("grant", &grant),
+            ("binding", &binding),
+            ("proposal", &proposal),
+            ("approval", &approval),
+            ("policy", &policy),
+        ];
+        for (i, (a_name, a)) in all.iter().enumerate() {
+            for (b_name, b) in all.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "a {a_name} and a {b_name} must never encode alike, or one \
+                     signature authorises both"
+                );
+            }
+        }
+        for (name, encoded) in all {
             assert_ne!(
                 encoded[..],
                 remove[..],
@@ -1143,6 +1806,17 @@ mod tests {
         // The wire format, pinned. Untagged these were 61 and 80.
         assert_eq!(grant.len(), 77, "a grant with no expiry is 16+32+4+8+1+16");
         assert_eq!(binding.len(), 96, "a binding is 16+32+32+16");
+        assert_eq!(
+            proposal.len(),
+            77,
+            "a removal proposal with no expiry is 16+4+32+8+1+16 — the same \
+             length as a grant, which is fine and is the point: what separates \
+             them is the domain tag in the first sixteen bytes, not their size. \
+             An implementer who reads a length collision here as a defect has \
+             misread the property."
+        );
+        assert_eq!(approval.len(), 64, "an approval is 16+32+16");
+        assert_eq!(policy.len(), 36, "a policy is 16+4+16");
         assert_eq!(
             bincode::serialize(&Grant::new(id, Role::Admin, 0, Some(1), [0u8; 16]))
                 .expect("a grant serializes")

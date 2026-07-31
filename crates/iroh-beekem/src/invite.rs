@@ -618,13 +618,27 @@ mod tests {
     /// collide with one already in use.
     #[test]
     fn the_invite_tag_is_distinct_from_every_certificate_tag() {
-        use iroh_beekem_core::capability::{BINDING_DOMAIN, GRANT_DOMAIN};
+        use iroh_beekem_core::capability::{
+            APPROVAL_DOMAIN, BINDING_DOMAIN, GRANT_DOMAIN, POLICY_DOMAIN, PROPOSAL_DOMAIN,
+        };
 
-        assert!(
-            INVITE_DOMAIN != GRANT_DOMAIN && INVITE_DOMAIN != BINDING_DOMAIN,
-            "an invite sharing a tag with a certificate would make the tag useless \
-             for exactly the pair it is supposed to separate"
-        );
+        // Every certificate tag, not just the two that existed first. The
+        // constants live in crates with different release cadences, so nothing
+        // else notices a future tag chosen — by accident or otherwise — to
+        // collide with this one.
+        for (name, tag) in [
+            ("grant", GRANT_DOMAIN),
+            ("binding", BINDING_DOMAIN),
+            ("proposal", PROPOSAL_DOMAIN),
+            ("approval", APPROVAL_DOMAIN),
+            ("policy", POLICY_DOMAIN),
+        ] {
+            assert_ne!(
+                INVITE_DOMAIN, tag,
+                "an invite sharing a tag with a {name} certificate would make the \
+                 tag useless for exactly the pair it is supposed to separate"
+            );
+        }
         assert!(
             INVITE_DOMAIN.iter().all(u8::is_ascii_graphic),
             "the invite tag must be printable ASCII: bytes 1..4 of a bincode enum \

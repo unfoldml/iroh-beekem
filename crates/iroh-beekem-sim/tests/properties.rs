@@ -1931,3 +1931,177 @@ mod a_member_leaves_of_its_own_accord {
         assert_deterministic(|| plan::<Departure>(Vec::new()), Seed(0x0DEA_2712));
     }
 }
+
+/// M-of-N: a workspace where one admin acting alone is not enough.
+///
+/// The founder promotes node 1 and raises the threshold to two — both while the
+/// threshold is still one, which is the only route off the default — and then
+/// proposes removing node 2. Four nodes, so the victim is neither of the admins
+/// deciding on it.
+///
+/// What makes this worth asserting under a network rather than in a unit test is
+/// that the quorum is computed from a *replicated* certificate set: every node
+/// resolves the threshold and the approver count for itself, and two nodes that
+/// disagreed would execute different actions.
+mod an_action_needs_a_quorum {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{Quorum, WorkspaceNode};
+    use propsim::prelude::*;
+
+    use super::{SEEDS, joined, plan_of_size};
+
+    /// One more than the honest group, so the removal target is not an approver.
+    const NODES_WITH_VICTIM: usize = 4;
+    /// The node the founder proposes to remove.
+    const VICTIM: u64 = 2;
+
+    fn quorum_plan(
+        properties: Vec<Property<WorkspaceNode<Quorum>>>,
+    ) -> TestPlan<WorkspaceNode<Quorum>> {
+        plan_of_size(NODES_WITH_VICTIM, properties)
+    }
+
+    /// Nodes that are not the removal target.
+    fn survivors<'a>(w: &'a World<'a, WorkspaceNode<Quorum>>) -> Vec<&'a WorkspaceNode<Quorum>> {
+        joined(w).into_iter().filter(|n| n.id() != VICTIM).collect()
+    }
+
+    /// In a workspace whose threshold is two, upon any proposal, we expect no
+    /// node ever to treat it as executable on fewer than two approvals.
+    ///
+    /// The core property of the phase, asserted where it is hardest to hold: the
+    /// approver count is derived from certificates that arrive in any order, are
+    /// duplicated by the transport, and are re-shipped whole on every log
+    /// exchange. A count that double-counted a re-delivered approval would
+    /// satisfy a unit test and fail here.
+    #[test]
+    fn no_proposal_is_executable_below_the_threshold() {
+        quorum_plan(vec![property::always(
+            "no node treats a proposal as executable on too few approvals",
+            |w: &World<'_, WorkspaceNode<Quorum>>| {
+                w.nodes().all(|n| {
+                    n.proposals().iter().all(|status| {
+                        !status.executable || status.approvals >= status.required as usize
+                    })
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace whose threshold is two, upon the network settling, we
+    /// expect the proposed removal to have been carried out everywhere.
+    ///
+    /// The counterweight to every `always` here: an implementation that refused
+    /// all quorum actions would satisfy them and fail this.
+    #[test]
+    fn a_proposal_with_enough_approvals_is_eventually_performed_everywhere() {
+        quorum_plan(vec![property::eventually_within(
+            "every remaining admin's group has lost the proposed member",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Quorum>>| {
+                let staying = survivors(w);
+                staying.len() == NODES_WITH_VICTIM - 1
+                    && staying.iter().all(|n| {
+                        u32::try_from(NODES_WITH_VICTIM).is_ok_and(|all| n.group_size() < all)
+                    })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace founded at a threshold of two, upon every node joining, we
+    /// expect all of them to agree on what the threshold is.
+    ///
+    /// The soundness of the receiver-side check rests on this. The threshold is
+    /// read off the founder's policy, which travels in the same certificate
+    /// bundle without which a node could not have joined at all — so a member
+    /// cannot be behind on it, and no two members can merge different sets of
+    /// operations because they disagreed about the bar.
+    #[test]
+    fn every_node_resolves_the_same_threshold() {
+        quorum_plan(vec![property::eventually_within(
+            "every joined node reports the same threshold",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Quorum>>| {
+                let nodes = joined(w);
+                nodes.len() == NODES_WITH_VICTIM && nodes.iter().all(|n| n.threshold() == 2)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace founded at a threshold of two, upon the run finishing, we
+    /// expect no node ever to have seen more administrators than the founder
+    /// appointed.
+    ///
+    /// The founder's bootstrap exemption is narrow on purpose, and this is what
+    /// keeps it narrow: nobody the founder appoints inherits the power to appoint
+    /// further admins, or an admin could raise a puppet and approve its own
+    /// actions twice.
+    #[test]
+    fn nobody_but_the_founder_can_add_an_administrator() {
+        quorum_plan(vec![property::always(
+            "no node ever sees more than two administrators",
+            |w: &World<'_, WorkspaceNode<Quorum>>| joined(w).iter().all(|n| n.admin_count() <= 2),
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect a quorum to have actually
+    /// been reached.
+    ///
+    /// The anti-vacuity guard. `no_proposal_is_executable_below_the_threshold`
+    /// is satisfied by a run in which nothing was ever proposed, and
+    /// `nobody_but_the_founder_can_add_an_administrator` by one in which nobody
+    /// tried.
+    #[test]
+    fn a_quorum_is_actually_reached_in_this_run() {
+        quorum_plan(vec![property::sometimes(
+            "some node holds a proposal that reached a threshold above one",
+            |w: &World<'_, WorkspaceNode<Quorum>>| {
+                w.nodes().any(|n| {
+                    n.threshold() > 1
+                        && n.proposals()
+                            .iter()
+                            .any(|status| status.executable && status.approvals >= 2)
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace under a quorum, upon the network settling, we expect the
+    /// remaining members still to converge.
+    ///
+    /// Refusing more aggressively is not a fix. A threshold that stalled the
+    /// group, or an execution path that every replica ran differently, would
+    /// satisfy every safety property above.
+    #[test]
+    fn the_remaining_members_still_converge_under_a_quorum() {
+        quorum_plan(vec![property::eventually_within(
+            "the remaining members hold the same content",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Quorum>>| {
+                let staying = survivors(w);
+                staying.len() == NODES_WITH_VICTIM - 1
+                    && staying.windows(2).all(|p| {
+                        let mut a: Vec<char> = p[0].all_text().concat().chars().collect();
+                        let mut b: Vec<char> = p[1].all_text().concat().chars().collect();
+                        a.sort_unstable();
+                        b.sort_unstable();
+                        a == b
+                    })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Reproducibility, as every other scenario asserts it.
+    #[test]
+    fn the_quorum_run_is_reproducible() {
+        let _ = SEEDS;
+        assert_deterministic(|| quorum_plan(Vec::new()), Seed(0x0000_9401));
+    }
+}

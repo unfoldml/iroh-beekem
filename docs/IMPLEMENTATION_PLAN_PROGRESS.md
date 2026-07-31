@@ -35,7 +35,19 @@ not — the invite was the least confusable payload in the protocol. The exposed
 `DeviceBinding` against `CgkaOperation::Remove`; both certificate payloads are now tagged too, and
 the whole analysis is recorded under *Signature domain separation*.
 
-What remains is Phases 7–9.
+Phases 7 and 8 have since landed. Persistence is real — snapshots, a filesystem-backed node, a
+stable derived author identity, and a crash/restart harness whose amnesia had to be authored by the
+node itself because propsim freezes rather than forgets. Lifecycle is closed with `leave`, `delete`,
+`open` and `list`. And M-of-N admin actions ship as certificates rather than as manifest state, which
+is where §8.2 as drafted was wrong.
+
+Seven corrections came out of building them, each recorded in place below: §8.2's manifest-held
+threshold was not implementable, a *mutable* threshold could not be receiver-enforced at all,
+certificates had no anti-entropy, §7.4's account of how propsim restarts a node was wrong about the
+mechanism, §7.2's per-workspace roster only half-closes what it claims, `Workspace::open` needed
+bootstrap peers the plan did not mention, and `leave` could not consume its own workspace.
+
+What remains is Phase 9.
 
 NB: Where this document and the code disagree on detail, the
 code wins.
@@ -52,6 +64,8 @@ code wins.
 | 3 | `RosterGuard` on all three ALPNs, roster derived from manifest devices ∩ `current_members`, bootstrap admission for cold joiners | [roster.rs](crates/iroh-beekem/src/roster.rs), `WorkspaceState::roster` |
 | 4 | `Remove`-before-rotate ordering, `NamespaceEpoch` on `(epoch, digest)`, `Effect::AdoptNamespace`, demand-driven repair via `Keying::Fresh`, read-only invite tickets for Viewers | [state.rs](crates/iroh-beekem-core/src/state.rs), [workspace.rs](crates/iroh-beekem/src/workspace.rs) |
 | 5 | `Grant`/`DeviceBinding`/`CapabilityStore` with a monotone `ever_admin` and `(seq, digest)`-ordered `role_of`; the third check in `merge`; `AuthorizedOp` proof bundles on `BroadcastOp`/`ControlMsg::Op`/`Msg::Op`; `ControlMsg::Log` ships the whole store; `Effect::BroadcastCerts` and `Effect::EvictUncertified`; roles and bindings removed from the manifest; `Insider` and `Revenant` scenarios | [capability.rs](crates/iroh-beekem-core/src/capability.rs), [keys.rs](crates/iroh-beekem-core/src/keys.rs), [state.rs](crates/iroh-beekem-core/src/state.rs) |
+| 7 | `snapshot.rs` with `CgkaSnapshot`/`WorkspaceSnapshot`; `WorkspaceState::export`/`import`; `Node::spawn_persistent` with a persisted endpoint key and nonce ledger; `Workspace::open`/`list`/`delete`; derived `iroh-docs` author from `author_seed`; roster registry keyed by tree id; a simulated disk and an authored wipe in `WorkspaceNode` | [snapshot.rs](crates/iroh-beekem-core/src/snapshot.rs), [store.rs](crates/iroh-beekem/src/store.rs), [roster.rs](crates/iroh-beekem/src/roster.rs) |
+| 8 | `Event::Leave` and `Workspace::leave`; `Policy`/`AdminProposal`/`Approval` as tagged certificates; a founder-fixed threshold; `require_quorum` on the issuer **and** a quorum check in `CgkaController::authorize` on every receiver; `Event::ResyncCertificates`; `propose`/`approve`/`proposals`/`threshold`; `Departure` and `Quorum` scenarios | [capability.rs](crates/iroh-beekem-core/src/capability.rs), [state.rs](crates/iroh-beekem-core/src/state.rs) |
 | 6 | `Signed<InviteTerms>` with `invitee`/`not_after`/`nonce`/`epoch`; domain tags on all three signed payload types, checked before the signature; `Node::claim_invite` nonce ledger; `Enrollment` plus `MemberId`/`ShareKey`/`Role` re-exports; `WorkspaceState::joined` seeded with the joiner's namespace generation; `Msg::Welcome` carries the invitee and the replica; `StolenInvite` scenario | [invite.rs](crates/iroh-beekem/src/invite.rs), [identity.rs](crates/iroh-beekem/src/identity.rs), [node.rs](crates/iroh-beekem/src/node.rs) |
 
 ### Residuals from the landed phases
@@ -504,9 +518,48 @@ broken `iroh-beekem-core`'s API — but it lands before 0.1 rather than after fo
 
 ---
 
-## Phase 7 — Persistence
+## Phase 7 — Persistence — **closed**
 
 Implements `Workspace::open` / `list` and turns "local-first" from a claim into a fact.
+
+### Three corrections this phase produced
+
+**§7.4's account of propsim is wrong, and building to it would have produced a test that passes
+while testing nothing.** The claim was that "propsim reconstructs a crashed node through `Default`".
+It does not: `dispatch_start` takes the existing node out of its slot, calls `on_start` on the *same
+object*, and puts it back. A crash is a **freeze**, not amnesia — `state`, `index`, `roster` and
+every counter survive intact. So the harness work was never "give the node a store to reload from";
+it was "give the node a store **and make it wipe everything else**, because the harness will not".
+`WorkspaceNode::reboot` authors that wipe, and the conclusion §7.4 drew still stands.
+
+This was confirmed rather than assumed: with the restore disabled,
+`a_restarted_node_is_a_member_again_without_being_re_invited` fails; with the restart branch
+disabled, `no_node_ever_initialises_the_workspace_more_than_once` and
+`every_document_converges_after_the_founder_restarts` fail.
+
+**A crashed *member* cannot catch the initialisation bug; only a crashed founder can.** The first
+version of the restart scenario crashed node 2 and the initialisation property passed even against a
+harness that treated a restart as a fresh start — because `on_welcome` already refuses to act on a
+node that has state. `on_start`'s *founding* branch has no such guard, so a restarted founder would
+overwrite the live workspace with a second tree. The scenario now has both variants.
+
+Also worth recording: `admin_count() == 1` does **not** catch a forked founder. A re-founded node is
+the sole admin of its own new tree and so reports exactly one administrator, as does everybody else.
+The fork is invisible to any property that asks each node about itself rather than comparing them.
+
+**§7.2's per-workspace roster only half-closes what it claims.** Keying by tree id fixes a real
+defect — `set_derived` replaces wholesale, so two workspaces on one node clobbered each other on
+every refresh and membership flapped for as long as the node ran. But admission stays a **union**:
+`RosterGuard::on_accepting` sees an `EndpointId` and nothing else, because gossip multiplexes every
+topic and docs every namespace over one connection per ALPN. `admission_is_a_union_across_workspaces`
+pins that limitation deliberately, so a later reader finds the residual rather than assuming the
+keying bought isolation. README *Not yet implemented* #3 carries it.
+
+**`Workspace::open` needs bootstrap peers, which the plan did not say.** A joiner is dialled into the
+group by its inviter; a restart has no inviter, and `Gossip::subscribe` with an empty peer list forms
+an overlay of one. Nothing would ever reconnect it. `open` now seeds bootstrap from its own derived
+roster — the manifest records every device's endpoint — and `sync_with`s each. Found by
+`a_restarted_joiners_later_writes_are_still_accepted`, which timed out until it was fixed.
 
 ### 7.1 Core snapshots
 
@@ -577,7 +630,71 @@ re-runs the join handshake.
 
 ---
 
-## Phase 8 — Lifecycle and M-of-N admin
+## Phase 8 — Lifecycle and M-of-N admin — **closed**
+
+### Two corrections this phase produced
+
+**§8.2's `admin_threshold` in the manifest is not implementable, and the section contradicts
+itself.** `Manifest::import` is an unconditional CRDT merge — that is the whole of phase 5 — so a
+manifest-held threshold is writable by any member, who would set it to one and act alone. The
+threshold is authority and had to be a certificate. §8.2's own later sentence ("approvals reuse
+Phase 5's machinery") was the correct instinct; the container was the mistake, and the
+*Signature domain separation* section had already anticipated `Signed<Policy>`/`Signed<Approval>` as
+the next two tagged payloads.
+
+**And a mutable threshold cannot be enforced by a receiver at all.** The first attempt shipped
+`AdminAction::SetThreshold` and enforced the quorum only on the node *issuing* an action — which is
+no enforcement, because an attacker running modified code simply does not run the issuer's guard.
+Moving the check to `CgkaController::authorize`, where it belongs, exposed why the mutable version
+could not have it: a receiver-side quorum check is **stricter the more a node knows**, so a peer
+holding the certificates that raised the bar would refuse an operation a peer still catching up had
+already merged — permanent divergence, the one failure this design exists to avoid, and the same
+argument that keeps `known_members` monotone.
+
+What shipped instead is a `Policy` certificate, self-signed by the founder in `WorkspaceState::found`
+and valid for exactly the reason the founder's own admin grant is. The threshold is therefore a
+constant of the workspace, delivered in the certificate bundle without which nobody could have joined
+— so no member can ever be behind on it, and the asymmetry disappears. Approvals are counted with
+`ever_admin` rather than `role_of` for the same reason: a peer that knows more must accept *at least*
+as much, never less. The cost is stated as a trade rather than a gap: **a workspace's threshold
+cannot be changed after it is created.**
+
+Two consequences that had to be designed rather than discovered:
+
+- **Bootstrap.** A workspace founded at a threshold of two starts with one admin, so no proposal
+  could ever reach quorum. The founder is exempt for *roles only* — never removals — which is
+  sound because the founder is already the axiom every chain terminates at.
+- **The puppet.** An admin who could appoint a second admin alone could appoint a puppet and approve
+  its own actions twice, making any threshold decorative. Above a threshold of one, everyone except
+  the founder needs a quorum to set a role, `AddUser` included.
+
+Three falsifications were confirmed red before the fix: with the receiver-side check removed,
+`a_removal_no_quorum_authorised_is_refused_by_the_receiver` fails; with issuer-side enforcement
+removed, `one_admin_cannot_remove_a_member_alone` fails; with approvals counted per device rather
+than per user, the quorum forms on one admin's two machines.
+
+**Certificates needed anti-entropy, and nothing had noticed.** A grant, proposal or approval is
+broadcast exactly once with no write behind it — the position `Event::ResyncManifest` and
+`Event::ResyncNamespace` already exist for — so a single dropped gossip message stranded it until a
+neighbour happened to reappear. Survivable for a grant; not for an approval, where a quorum that
+formed on one node and reached no other leaves an action performed there and refused everywhere else.
+`Event::ResyncCertificates` closes it, driven from both backends' resync paths. Found by the
+real-QUIC quorum test, which hung with the second admin's approval sitting on the wrong node.
+
+`AdminAction` carries no `Rotate` variant, although §8.2 lists one. Namespace rotation is not
+independently proposable — `on_remove_member` emits it as a *consequence* — so gating the removal
+already gates the rotation, and the variant would have been a wire format with no caller.
+
+**`Workspace::leave` cannot consume its own workspace.** `GossipSender::broadcast` enqueues a command
+on a channel the topic actor drains: it returns when the message is accepted, not when it reaches
+anybody, and there is no flush and no acknowledgement. Dropping the subscription discards the queue.
+A `leave` that broadcast and immediately tore down was therefore racing its own announcement and
+losing often enough to fail under test load — and losing is terminal, because a `Remove` has no
+anti-entropy behind it and the one node that would re-announce it is the one that left. A one-second
+grace made it flaky; three seconds made it a coin flip. `leave` is now `&self` and announce-only,
+with teardown left to `delete`, which removes the race rather than bounding it.
+
+
 
 ### 8.1 `leave` and `delete`
 

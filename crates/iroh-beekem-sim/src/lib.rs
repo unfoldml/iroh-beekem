@@ -43,8 +43,9 @@ use beekem::{
 // simulator is the thing under test.
 pub use iroh_beekem_core::Role;
 use iroh_beekem_core::{
-    AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect, EpochId, Event,
-    NamespaceEpoch, RepairTarget, StorageKey, WorkspaceSecret, WorkspaceState,
+    AdminAction, AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect, EpochId,
+    Event, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey, WorkspaceSecret,
+    WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -181,6 +182,25 @@ const WRITE_AFTER_REVOKE_AT: Duration = Duration::from_secs(6);
 /// horizon shows what the remaining members do about it.
 const LEAVE_AT: Duration = Duration::from_secs(3);
 
+/// When the founder promotes a co-admin and raises the threshold.
+///
+/// After the group has formed and the co-admin's certificates have had time to
+/// reach everybody: a promotion that raced the co-admin's own admission would
+/// leave a workspace whose threshold is two and whose second admin nobody has
+/// heard of, which deadlocks rather than tests anything.
+const APPOINT_CO_ADMIN_AT: Duration = Duration::from_millis(1500);
+
+/// When the founder proposes the removal a quorum has to authorise.
+const PROPOSE_AT: Duration = Duration::from_millis(2500);
+
+/// How often each admin looks for something to approve.
+///
+/// Polled rather than driven by the arrival of a proposal, because an admin in a
+/// real workspace approves when a person decides to — and because a timer keeps
+/// the simulated approval independent of the delivery order the transport
+/// happens to produce.
+const APPROVE_INTERVAL: Duration = Duration::from_millis(600);
+
 /// How often a forging node emits an operation signed by a non-member key.
 const FORGE_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -278,6 +298,25 @@ pub trait Scenario: Clone + Default + 'static {
     /// and every convergence property would still pass while the departing
     /// member quietly minted and received the capability it was leaving.
     const LEAVE: Option<u64> = None;
+
+    /// How many distinct admins an administrative action needs.
+    ///
+    /// One by default, which is the threshold every workspace starts at and the
+    /// one under which `require_quorum` behaves exactly like the `require_admin`
+    /// it replaced — so every scenario that does not set this is unaffected by
+    /// the machinery existing.
+    ///
+    /// Above one, the founder promotes [`Self::CO_ADMIN`] and then proposes and
+    /// approves the raise, both of which it can still do alone because the raise
+    /// is judged at the threshold in force *before* it.
+    const THRESHOLD: u32 = 1;
+
+    /// A second node the founder promotes to admin, so a quorum is reachable.
+    ///
+    /// Without one, raising the threshold to two would deadlock the workspace:
+    /// no action could ever collect two approvals, and every property about a
+    /// quorum being *reached* would be vacuous rather than false.
+    const CO_ADMIN: Option<u64> = None;
 }
 
 /// The base protocol: joins, edits and anti-entropy, nothing adversarial.
@@ -391,6 +430,24 @@ pub struct Departure;
 
 impl Scenario for Departure {
     const LEAVE: Option<u64> = Some(2);
+}
+
+/// A workspace that needs two admins to agree before anything happens.
+///
+/// The founder promotes node 1 to admin and raises the threshold to two — both
+/// while the threshold is still one, which is the only way a workspace can ever
+/// get off the default. It then proposes removing node 2, which now needs node
+/// 1's approval as well as its own.
+///
+/// Four nodes rather than three, so that the victim of the proposed removal is
+/// neither of the two admins deciding on it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Quorum;
+
+impl Scenario for Quorum {
+    const THRESHOLD: u32 = 2;
+    const CO_ADMIN: Option<u64> = Some(1);
+    const REVOKE: Option<u64> = Some(2);
 }
 impl Scenario for StolenInvite {
     const INVITE_THIEF: Option<u64> = Some(3);
@@ -682,6 +739,12 @@ pub enum Tick {
     Overreach,
     /// Time for a member to leave the workspace of its own accord.
     Leave,
+    /// Time for the founder to appoint the co-admin a quorum needs.
+    AppointCoAdmin,
+    /// Time for the founder to propose a removal that needs a quorum.
+    ProposeRemoval,
+    /// Time for an admin to approve whatever is awaiting approval.
+    ApproveProposals,
 }
 
 /// One simulated workspace participant.
@@ -751,6 +814,13 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// any node could apply anything — and a real client queues an edit made
     /// while it is still connecting rather than discarding it.
     deferred_ops: Vec<(OpToken, WsOp)>,
+    /// Proposals this node has already cast an approval for.
+    ///
+    /// Local bookkeeping only. Re-approving is idempotent on the certificate
+    /// digest, but each round would mint a *fresh* nonce and so a fresh
+    /// certificate — filling the store with duplicates that all resolve to one
+    /// approver and make `certificates()` grow without bound.
+    approved: BTreeSet<[u8; 32]>,
     /// Whether this node has walked away from the workspace.
     ///
     /// Recorded rather than inferred from [`Scenario::LEAVE`], because the
@@ -949,6 +1019,30 @@ impl<S: Scenario> WorkspaceNode<S> {
     #[must_use]
     pub fn is_invite_thief(&self) -> bool {
         S::INVITE_THIEF == Some(self.me)
+    }
+
+    /// How many distinct admins an action currently needs here.
+    #[must_use]
+    pub fn threshold(&self) -> u32 {
+        self.state
+            .as_ref()
+            .map_or(1, |state| state.capabilities().threshold())
+    }
+
+    /// How many distinct admin users have approved this proposal here.
+    #[must_use]
+    pub fn approvals_for(&self, proposal: &[u8; 32]) -> usize {
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.capabilities().approver_count(proposal))
+    }
+
+    /// Every proposal this node knows of, with how close each is to its quorum.
+    #[must_use]
+    pub fn proposals(&self) -> Vec<ProposalStatus> {
+        self.state
+            .as_ref()
+            .map_or_else(Vec::new, |state| state.capabilities().proposals())
     }
 
     /// Whether this node has left the workspace of its own accord.
@@ -1495,6 +1589,18 @@ impl<S: Scenario> WorkspaceNode<S> {
         if S::FORGE && me.0 != FOUNDER {
             cx.set_timer(Tick::Forge, FORGE_INTERVAL);
         }
+        if S::THRESHOLD > 1 {
+            if me.0 == FOUNDER {
+                cx.set_timer(Tick::AppointCoAdmin, APPOINT_CO_ADMIN_AT);
+                cx.set_timer(Tick::ProposeRemoval, PROPOSE_AT);
+            } else {
+                // Only the founder drives the scenario's script; every admin
+                // approves.
+            }
+            cx.set_timer(Tick::ApproveProposals, APPROVE_INTERVAL);
+        } else {
+            // The default threshold, under which no quorum machinery runs.
+        }
         if S::LEAVE == Some(me.0) {
             // Late enough that the leaver has joined, edited and been seen by
             // everybody. A departure during onboarding would be
@@ -1504,6 +1610,111 @@ impl<S: Scenario> WorkspaceNode<S> {
         } else {
             // Not the leaver, or nobody leaves in this scenario.
         }
+    }
+
+    /// The quorum half of [`Self::apply_timer`].
+    ///
+    /// Split out because the three arms below are one mechanism with its own
+    /// script — appoint, propose, approve — and inlining them buried the
+    /// scenario timers they sit among.
+    fn apply_quorum_timer(&mut self, timer: &Tick, cx: &mut dyn Ctx<Self>) {
+        match timer {
+            Tick::AppointCoAdmin => {
+                // The founder's exemption in action, and the only way a workspace
+                // above a threshold of one can ever get a second admin: with one
+                // admin no proposal could reach a quorum of two, so a group that
+                // required one here would be deadlocked from birth.
+                if let Some(co_admin) = S::CO_ADMIN {
+                    let signer = MemorySigner::generate(&mut node_rng(NodeId(co_admin), 0xA1));
+                    let user = MemberId::from(signer.verifying_key()).to_bytes();
+                    self.drive(
+                        Event::SetRole {
+                            user,
+                            role: Role::Admin,
+                        },
+                        cx,
+                        0x9001,
+                    );
+                } else {
+                    // No co-admin; nothing this workspace could ever authorise.
+                }
+            }
+            Tick::ProposeRemoval => {
+                if let Some(victim) = S::REVOKE {
+                    let signer = MemorySigner::generate(&mut node_rng(NodeId(victim), 0xA1));
+                    let member = MemberId::from(signer.verifying_key()).to_bytes();
+                    self.propose_and_approve(AdminAction::RemoveMember { member }, cx, 0x9003);
+                } else {
+                    // Nothing to propose in this scenario.
+                }
+            }
+            Tick::ApproveProposals => {
+                // Every proposal this node has not already approved. Re-approving
+                // is harmless — the certificate is idempotent on its digest — but
+                // minting a fresh nonce each round would fill the store with
+                // duplicates that all count once.
+                let pending: Vec<[u8; 32]> = self.state.as_ref().map_or_else(Vec::new, |state| {
+                    state
+                        .capabilities()
+                        .proposals()
+                        .iter()
+                        .filter(|status| !status.executable)
+                        .map(|status| status.digest)
+                        .filter(|digest| !self.approved.contains(digest))
+                        .collect()
+                });
+                for (i, proposal) in pending.into_iter().enumerate() {
+                    self.approved.insert(proposal);
+                    self.drive(Event::Approve { proposal }, cx, 0x9100 + i as u64);
+                }
+                cx.set_timer(Tick::ApproveProposals, APPROVE_INTERVAL);
+            }
+            _ => {
+                // Every other tick is handled by `apply_timer`; this arm exists
+                // because a match must be total, not because it is reachable.
+            }
+        }
+    }
+
+    /// Propose an action and immediately approve it as this node.
+    ///
+    /// The proposer's own approval is not automatic in the core — proposing and
+    /// approving are separate acts, and a node that wanted to abstain from its
+    /// own proposal should be able to. The scenario chooses to approve, because a
+    /// proposer that did not would need one more admin than the threshold names.
+    fn propose_and_approve(&mut self, action: AdminAction, cx: &mut dyn Ctx<Self>, salt: u64) {
+        let before: BTreeSet<[u8; 32]> = self.proposal_digests();
+        self.drive(
+            Event::Propose {
+                action,
+                expires: None,
+            },
+            cx,
+            salt,
+        );
+        for (i, digest) in self
+            .proposal_digests()
+            .difference(&before)
+            .copied()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .enumerate()
+        {
+            self.approved.insert(digest);
+            self.drive(Event::Approve { proposal: digest }, cx, salt + 1 + i as u64);
+        }
+    }
+
+    /// Every proposal digest this node currently holds.
+    fn proposal_digests(&self) -> BTreeSet<[u8; 32]> {
+        self.state.as_ref().map_or_else(BTreeSet::new, |state| {
+            state
+                .capabilities()
+                .proposals()
+                .iter()
+                .map(|status| status.digest)
+                .collect()
+        })
     }
 
     /// Write this node's simulated disk.
@@ -1602,6 +1813,10 @@ impl<S: Scenario> WorkspaceNode<S> {
         // and is really a missing re-announcement.
         self.drive(Event::ResyncManifest, cx, 9100);
         self.drive(Event::ResyncNamespace, cx, 9101);
+        // Certificates too, and for a sharper reason than either of the above: a
+        // lost approval leaves a quorum that formed on one node and nowhere
+        // else, so the action is performed there and refused everywhere.
+        self.drive(Event::ResyncCertificates, cx, 9102);
     }
 
     /// Apply and complete everything queued while this node was still joining.
@@ -2054,8 +2269,11 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
 
         if me.0 == FOUNDER {
             if let Ok(cgka) = CgkaController::create(tree_id(), signer, &mut node_rng(me, 0xC3))
-                && let Ok(state) =
-                    WorkspaceState::found(cgka, WorkspaceSecret::new(workspace_secret_bytes()))
+                && let Ok(state) = WorkspaceState::found(
+                    cgka,
+                    WorkspaceSecret::new(workspace_secret_bytes()),
+                    S::THRESHOLD,
+                )
             {
                 self.state = Some(state);
                 self.initialisations += 1;
@@ -2327,6 +2545,9 @@ impl<S: Scenario> WorkspaceNode<S> {
                     let member = MemberId::from(victim_signer.verifying_key());
                     self.drive(Event::RemoveMember { member }, cx, 0xBEEF);
                 }
+            }
+            Tick::AppointCoAdmin | Tick::ProposeRemoval | Tick::ApproveProposals => {
+                self.apply_quorum_timer(timer, cx);
             }
             Tick::Leave => {
                 // Driven once and never re-armed. `Event::Leave` retracts every

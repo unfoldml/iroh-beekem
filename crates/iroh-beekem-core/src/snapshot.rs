@@ -176,7 +176,8 @@ mod tests {
 
     use super::{SNAPSHOT_VERSION, member_from_bytes};
     use crate::{
-        blinding::WorkspaceSecret, error::CoreError, keys::CgkaController, state::WorkspaceState,
+        blinding::WorkspaceSecret, capability::DEFAULT_THRESHOLD, error::CoreError,
+        keys::CgkaController, state::WorkspaceState,
     };
 
     /// A one-member workspace, which is all these checks need.
@@ -185,8 +186,12 @@ mod tests {
         let signer = MemorySigner::generate(&mut csprng);
         let tree_id = TreeId::from(signer.verifying_key());
         let cgka = CgkaController::create(tree_id, signer, &mut csprng).expect("founds a tree");
-        WorkspaceState::found(cgka, WorkspaceSecret::generate(&mut csprng))
-            .expect("founds a workspace")
+        WorkspaceState::found(
+            cgka,
+            WorkspaceSecret::generate(&mut csprng),
+            DEFAULT_THRESHOLD,
+        )
+        .expect("founds a workspace")
     }
 
     /// In a snapshot recorded by another build, upon import, we expect a refusal

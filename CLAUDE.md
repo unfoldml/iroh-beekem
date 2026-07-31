@@ -149,6 +149,12 @@ them *without* noticing will not fail loudly.
   also lives on `Node` and not on `Workspace`, because redeeming a ticket is what *creates* a
   workspace: there is nothing else to ask at the moment of the check.
 
+- **Every new `Signed<T>` needs a domain tag and a line in the encoding test.** Phase 8 added
+  `AdminProposal` and `Approval`; a `RemoveMember` proposal encodes to 77 bytes, exactly the length
+  of a `Grant`, and that is fine — what separates them is the tag in the first sixteen bytes, not
+  their size. `the_signed_payload_types_cannot_share_an_encoding` now checks all six pairs, and
+  `the_invite_tag_is_distinct_from_every_certificate_tag` checks all four tags across the crate
+  boundary.
 - **Every signed payload carries a 16-byte printable-ASCII domain tag, and both halves of that
   sentence are load-bearing.** `Signed<T>` covers `bincode(payload)` with no type name and no
   discriminator, and verification recomputes it for whatever `T` the *deserializer* chose — on the
@@ -219,6 +225,42 @@ them *without* noticing will not fail loudly.
   or fails according to whether the seed happened to enable partitions at all, which looks like
   flakiness and is really an unsound scenario. See `network_faults` in
   [properties.rs](crates/iroh-beekem-sim/tests/properties.rs).
+- **A restart in propsim is a freeze, not amnesia.** `dispatch_start` calls `on_start` on the *same*
+  node object; there is no `on_crash` hook and no per-node storage seam. `WorkspaceNode::reboot`
+  therefore authors the wipe itself, and `no_node_ever_initialises_the_workspace_more_than_once`
+  plus the founder-crash variant are what stop the harness degenerating into a re-invitation test.
+  A crashed *member* cannot catch that — `on_welcome` already refuses a node that has state — so the
+  scenario has to crash the **founder**, whose founding branch is unconditional.
+- **A snapshot is written before the write it covers is acknowledged.** `Workspace::drive` awaits
+  `persist` before returning `Ok`, and the simulator's `apply_client_op` does the same. `persist` is
+  called at *batch boundaries* — drive, control message, ingest pass, republish, assemble — and never
+  from `apply_effects`, which would make it O(documents) per arriving chunk. Do not gate it on the
+  effect batch being non-empty: `on_certs_arrived` absorbs certificates and can return no effects.
+- **`Workspace::leave` takes `&self` and does not tear anything down.** `GossipSender::broadcast`
+  enqueues without acknowledgement, offers no flush, and dropping the subscription discards the
+  queue — so a `leave` that consumed `self` would race its own departure, and a `Remove` has no
+  anti-entropy behind it to repair the loss. Teardown is `delete`, called by the caller when ready.
+- **The quorum threshold is a founder-signed certificate, fixed at creation, never the manifest and
+  never mutable.** A receiver-side quorum check is *stricter the more a node knows*, so a movable
+  threshold would let a peer holding the certificates that raised it refuse an operation a peer still
+  catching up had merged — permanent divergence. `Policy` is minted in `WorkspaceState::found` and
+  travels in the bundle without which nobody could have joined, so no member is ever behind on it.
+  Approvals are counted with `ever_admin`, not `role_of`, for the same monotonicity reason, and by
+  **distinct users**, not devices — counting devices lets one person with three computers satisfy a
+  threshold of three.
+- **Enforcement is on the receiver, in `CgkaController::authorize`.** `require_quorum` is a local
+  fail-fast an attacker would simply not run. Above a threshold of one, a `Remove` naming somebody
+  else is refused unless a matching proposal has reached quorum, and `Effect::BroadcastOp` carries the
+  policy, the proposal and the approvals so a peer that has not seen them can still verify. A
+  self-removal is never gated: a threshold governs what the group does *to* a member.
+- **Above a threshold of one only the founder may set a role alone.** Two things depend on it:
+  bootstrap, since a workspace with one admin and a threshold of two could otherwise never reach a
+  quorum; and the puppet hole, since an admin who could appoint a second admin alone could approve
+  its own actions twice. `AddUser` is gated with `SetRole` because admitting somebody assigns a role.
+- **Certificates need anti-entropy like the manifest and the namespace do.** A grant, proposal or
+  approval is broadcast once with no write behind it, so `Event::ResyncCertificates` must be driven
+  from both backends' resync paths. Without it a dropped approval leaves a quorum that formed on one
+  node and nowhere else — an action performed there and refused everywhere.
 - **Pinned dependencies are pinned for a reason** (see comments in the manifests): `rand` at 0.8.5 to
   unify with beekem's public API, `propsim` at a git rev because it has no semver.
 

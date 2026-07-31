@@ -419,41 +419,56 @@ reason enough to revisit the choice underneath.
    one secret keying every entry — would force every peer to rewrite every entry, which is why it is
    not done. They learn nothing about documents created after their removal, and can read no content
    either way.
-9. **Roles do not constrain what a member can *read*.** Anyone holding a leaf can decrypt, whatever
+9. **A workspace's admin threshold is fixed when it is created.** `create_with_quorum` sets it and
+   nothing can change it afterwards. This is what makes the threshold *enforceable by receivers*
+   rather than merely by the node issuing an action: the check is stricter the more a node knows, so
+   a movable threshold would let a peer holding the certificates that raised it refuse an operation
+   a peer still catching up had already merged — and the group would split. Pinning it to the
+   founding certificate bundle, which every member holds before it can join, removes the asymmetry.
+   Raising it later would be that unsound operation; lowering it would let one compromised admin undo
+   the protection everyone else is relying on.
+10. **Above a threshold of one, the founder may set roles alone.** Everybody else needs a quorum,
+   including to appoint an admin — which is what stops an admin raising a puppet and approving its
+   own actions twice. The founder is exempt because a workspace with one admin and a threshold of two
+   could otherwise never reach a quorum, and because the founder is already the axiom every capability
+   chain terminates at: `tree_id` *is* its key. The exemption covers roles only, never removals.
+11. **Roles do not constrain what a member can *read*.** Anyone holding a leaf can decrypt, whatever
    any certificate says. That is forward secrecy working as designed, and genuine read revocation is
    a CGKA removal. This is deliberately stated as a claim about *reading only*: roles do now
    constrain what a member can **do**, and every receiver enforces it — see
    [Authorization is verifiable offline](#authorization-is-verifiable-offline). Conflating the two
    is what made a defect look like a documented trade.
-11. **Demotion is a courtesy; removal is the enforcement.** A user who has ever held an admin grant
+12. **Demotion is a courtesy; removal is the enforcement.** A user who has ever held an admin grant
    stays `ever_admin`, so certificates it issues are still admitted and it can grant itself a higher
    `seq`. Demoting a *cooperative* admin works and needs no key rotation; stripping a *malicious* one
    means CGKA-removing every device of that user. This mirrors monotone `known_members` exactly, and
    for the same reason: the alternative is an order-dependent predicate that diverges the group.
-12. **A member may enrol unlimited devices for its own user.** Enrolling your own phone is not an act
+13. **A member may enrol unlimited devices for its own user.** Enrolling your own phone is not an act
    of administration, so it needs no role — which means a member can also grow the tree without bound.
    Every such leaf inherits only that member's own role, so it is not an escalation; it is a resource
    cost, and bounding it needs a policy the group has no way to express yet.
-13. **A removed member can splice a leaf in, and read for one eviction window.** It cannot escalate.
+14. **A removed member can splice a leaf in, and read for one eviction window.** It cannot escalate.
    See [A removed member is evicted again](#a-removed-member-is-evicted-again) for why refusing the
    operation outright is not available.
-14. **An invite still carries the workspace secret, and must travel confidentially.** Signing it
+15. **An invite still carries the workspace secret, and must travel confidentially.** Signing it
    binds who may redeem it and for how long; it does not encrypt it. A ticket read in transit hands
    the reader the blinding secret and the `iroh-docs` ticket, and no signature over a plaintext
    struct can change that. Deliver it over an authenticated, confidential channel — a direct `iroh`
    QUIC stream to a known public key qualifies, a public gossip topic does not — and treat a leak as
    a reason to rotate. What signing buys is that a *leaked* ticket is not a *redeemable* one.
-15. **Spent invite nonces are in memory, so a restart un-consumes every one.** The ledger lives on
-   `Node`, because redeeming an invite is what creates a workspace and there is nothing else to ask
-   at the moment of the check. Nothing persists it yet, so after a crash a ticket already used
-   becomes redeemable again — bounded only by its hour-long expiry, which is the guarantee that does
-   survive. Persisting it belongs with the node's endpoint secret key, and both land together.
-16. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
+16. **A snapshot is the whole read capability, and it is not encrypted at rest.** `Node::spawn_persistent`
+   writes the signing key, the leaf secret, every cached PCS key, the blinding secret and the
+   plaintext-equivalent documents under `<root>`, `0600` and no further. Deliberate rather than
+   omitted: `Identity::to_bytes` already made the application responsible for storing an equivalent
+   secret, so encrypting the snapshot while the identity beside it sits in the clear would move the
+   boundary without raising it. Hold `<root>` on an encrypted volume if that matters — which also
+   covers the blobs and docs stores, neither of which this crate controls.
+17. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
    certificates remain valid documents; what stops them mattering is CGKA removal. There is no
    expiry either: `Grant::not_after` is carried on the wire but deliberately **not** evaluated,
    because an expiry inside an authorization predicate makes admissibility depend on clock skew and
    two peers disagreeing would drop different operations.
-10. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
+18. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
    bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`) and evict oldest-first, because an unbounded
    queue is a remote memory-exhaustion vector. Evicted operations return with the next neighbour log
    exchange; evicted chunks wait for a resync. A property test asserts honest runs never evict.
@@ -465,26 +480,28 @@ reason enough to revisit the choice underneath.
 
 These are gaps, not trades. Nothing in the design prevents them.
 
-1. **No persistence.** `MemStore` and `Docs::memory()` only, and neither `CgkaController` nor
-   `WorkspaceState` can be serialized — so there is no export/import to build persistence on, and
-   nothing survives a restart.
-2. **M-of-N admin actions.** The manifest has the role schema; the threshold enforcement is not
-   written. Single-admin rules *are* enforced: admin-only membership changes, and a refusal to
-   demote or remove a user's last admin device.
-3. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
+1. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
    re-encrypts them and writes a new blob; superseded blobs are never collected. Cost grows
    quadratically in edits.
-4. **Eviction is eventual on every plane.** Removal now revokes reading (the CGKA), connecting
+2. **Eviction is eventual on every plane.** Removal now revokes reading (the CGKA), connecting
    (the roster) and watching (namespace rotation) — but all three converge asynchronously, so a
    peer that has not yet merged the removal still accepts the removed device's connections and
    entries, and nothing retracts what it already synced. The `a_removed_member_stops_seeing`
    properties in `iroh-beekem-sim` state exactly where the line now sits.
 
-5. **One roster per node, not per workspace.** The roster lives on `Node` because the guards must
-   be installed when the router is built, before any workspace exists. Two workspaces on one node
-   would therefore union their rosters, admitting a member of either to both. Fixing it means
-   keying the roster by workspace, which belongs with `Workspace::open`/`list` and persistence.
-6. **The gossip topic still never rotates.** It is derived from the tree id, which is the founder's
+3. **Admission is a union across the workspaces on one node.** The roster is now keyed by workspace,
+   so two workspaces no longer clobber each other's members — but `RosterGuard::on_accepting` sees
+   only an `EndpointId`, and `iroh-gossip` multiplexes every topic and `iroh-docs` every namespace
+   over one connection per ALPN, so there is no workspace to attribute a connection to at the moment
+   the decision is made. A member of one workspace may therefore open a connection that carries
+   traffic for another on the same node. Closing it means one endpoint per workspace. It is an
+   availability boundary either way: reaching a namespace is not reading it, and every chunk in it is
+   encrypted to a CGKA the peer holds no leaf in.
+4. **`leave` is announce-only and best-effort.** `GossipSender::broadcast` enqueues without
+   acknowledgement and offers no flush, so a departure that never reaches a peer simply did not
+   happen — and unlike a rotation it has no anti-entropy behind it, because the one node that would
+   re-announce it is the one that left. An admin should follow a `leave` with a `remove_user`.
+5. **The gossip topic still never rotates.** It is derived from the tree id, which is the founder's
    public key, so every past invitee knows it permanently. The roster is what refuses them; without
    a new tree id — that is, a new workspace — the topic itself cannot change.
 

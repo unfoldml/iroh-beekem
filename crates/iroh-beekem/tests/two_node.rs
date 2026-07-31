@@ -1573,3 +1573,150 @@ mod a_member_can_walk_away {
     /// Keeps `WorkspaceInfo` imported for the helper above.
     const _: fn() -> WorkspaceInfo = || info("");
 }
+
+/// M-of-N over real endpoints.
+///
+/// The simulator states the quorum properties under an adversarial network;
+/// these prove the facade actually plumbs them — that a threshold set at
+/// creation reaches a joiner, and that the joiner's approval is what completes
+/// the quorum rather than something the founder decided locally.
+mod an_action_needs_a_quorum {
+    use std::time::Duration;
+
+    use iroh_beekem::{AdminAction, Identity, Invite, Node, Role, Workspace};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    use super::{eventually, info};
+
+    /// In a workspace created at a threshold of two, upon a joiner arriving, we
+    /// expect it to read back the same threshold.
+    ///
+    /// The soundness of the receiver-side check depends on this: the threshold
+    /// travels in the founding certificate bundle, so a member cannot be behind
+    /// on it and two members cannot disagree about the bar an operation must
+    /// clear.
+    #[tokio::test]
+    async fn a_joiner_learns_the_workspace_threshold() {
+        let node = Node::spawn().await.expect("alice binds");
+        let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(70));
+        let alice = Workspace::create_with_quorum(
+            node,
+            &identity,
+            info("guarded"),
+            2,
+            &mut ChaCha20Rng::seed_from_u64(70),
+        )
+        .await
+        .expect("founding at a threshold of two succeeds");
+        assert_eq!(alice.threshold().await, 2, "the founder set the threshold");
+
+        let bob_node = Node::spawn().await.expect("bob binds");
+        let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(71));
+        let invite: Invite = alice
+            .add_user(
+                &bob_identity.enrollment(bob_node.endpoint().id()),
+                Role::Admin,
+                "bob",
+            )
+            .await
+            .expect("the founder may appoint an admin alone");
+        let bob = Workspace::join(
+            bob_node,
+            &invite,
+            &bob_identity,
+            &mut ChaCha20Rng::seed_from_u64(72),
+        )
+        .await
+        .expect("bob joins");
+
+        assert_eq!(
+            bob.threshold().await,
+            2,
+            "the joiner did not learn the workspace threshold, so it would accept \
+             operations the rest of the group refuses"
+        );
+    }
+
+    /// In a workspace at a threshold of two, upon one admin proposing and both
+    /// approving, we expect the removal to happen — and not before.
+    #[tokio::test]
+    async fn a_removal_waits_for_the_second_admin() {
+        let node = Node::spawn().await.expect("alice binds");
+        let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(73));
+        let alice = Workspace::create_with_quorum(
+            node,
+            &identity,
+            info("guarded"),
+            2,
+            &mut ChaCha20Rng::seed_from_u64(73),
+        )
+        .await
+        .expect("founding succeeds");
+
+        // Bob is the second admin; Carol is the member they decide about, so
+        // neither approver is ever also the target.
+        let mut joined = Vec::new();
+        for (i, role) in [(0u64, Role::Admin), (1, Role::Editor)] {
+            let peer_node = Node::spawn().await.expect("a peer binds");
+            let peer_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(74 + i));
+            let invite = alice
+                .add_user(
+                    &peer_identity.enrollment(peer_node.endpoint().id()),
+                    role,
+                    "peer",
+                )
+                .await
+                .expect("the founder admits a peer alone");
+            joined.push(
+                Workspace::join(
+                    peer_node,
+                    &invite,
+                    &peer_identity,
+                    &mut ChaCha20Rng::seed_from_u64(76 + i),
+                )
+                .await
+                .expect("the peer joins"),
+            );
+        }
+        let (bob, carol) = (&joined[0], &joined[1]);
+        eventually(
+            "everybody is in the group",
+            Duration::from_secs(20),
+            || async { alice.group_size().await == 3 && bob.group_size().await == 3 },
+        )
+        .await;
+
+        let action = AdminAction::RemoveMember {
+            member: carol.member_id().await.to_bytes(),
+        };
+        let proposal = alice
+            .propose(action, None)
+            .await
+            .expect("an admin may propose");
+        alice.approve(proposal).await.expect("alice approves");
+
+        // One approval is not two. Asserted after a settling window rather than
+        // immediately, so this is "the group did not act" and not "the group had
+        // not acted yet".
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            alice.group_size().await,
+            3,
+            "one admin's approval carried a threshold of two"
+        );
+
+        eventually("bob sees the proposal", Duration::from_secs(20), || async {
+            bob.proposals().await.iter().any(|p| p.digest == proposal)
+        })
+        .await;
+        bob.approve(proposal).await.expect("bob approves");
+
+        eventually(
+            "the removal a quorum authorised is performed everywhere",
+            Duration::from_secs(30),
+            || async { alice.group_size().await == 2 && bob.group_size().await == 2 },
+        )
+        .await;
+    }
+}

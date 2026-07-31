@@ -56,7 +56,10 @@ use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    capability::{CapabilityStore, Certificate, DeviceBinding, Grant, Role},
+    capability::{
+        AdminAction, AdminProposal, Approval, CapabilityStore, Certificate, DEFAULT_THRESHOLD,
+        DeviceBinding, Grant, Policy, Role,
+    },
     content::{Chunk, ChunkRef},
     error::CoreError,
     snapshot::{CgkaSnapshot, member_from_bytes},
@@ -703,6 +706,60 @@ impl CgkaController {
         Ok(cert)
     }
 
+    /// Mint a signed proposal, and record it locally.
+    ///
+    /// The returned certificate must be broadcast, or no peer can approve
+    /// something it has never seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn certify_proposal(
+        &mut self,
+        action: AdminAction,
+        seq: u64,
+        expires: Option<u64>,
+        nonce: [u8; 16],
+    ) -> Result<Certificate, CoreError> {
+        let cert = AdminProposal::new(action, seq, expires, nonce).sign(&self.signer)?;
+        self.certs.insert(cert.clone())?;
+        Ok(cert)
+    }
+
+    /// Mint a signed approval of `proposal`, and record it locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn certify_approval(
+        &mut self,
+        proposal: [u8; 32],
+        nonce: [u8; 16],
+    ) -> Result<Certificate, CoreError> {
+        let cert = Approval::new(proposal, nonce).sign(&self.signer)?;
+        self.certs.insert(cert.clone())?;
+        Ok(cert)
+    }
+
+    /// Mint the workspace's threshold policy, and record it locally.
+    ///
+    /// Only meaningful from the founding device: [`CapabilityStore`] honours a
+    /// policy signed by the founder and ignores everyone else's, which is what
+    /// makes the threshold a constant rather than something a member can move.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Signing`] if the signer rejects the payload.
+    pub fn certify_policy(
+        &mut self,
+        threshold: u32,
+        nonce: [u8; 16],
+    ) -> Result<Certificate, CoreError> {
+        let cert = Policy::new(threshold, nonce).sign(&self.signer)?;
+        self.certs.insert(cert.clone())?;
+        Ok(cert)
+    }
+
     /// Admit a new member who has published `share_key`.
     ///
     /// Returns `None` if the member is already present. The returned operation
@@ -1010,14 +1067,37 @@ impl CgkaController {
                 }
             }
             CgkaOperation::Remove { id, .. } => {
-                // An admin may remove anyone; anyone may remove their own
-                // devices, which is what `Workspace::leave` is built on.
+                // Anyone may remove their own devices, which is what
+                // `Workspace::leave` is built on, and no quorum governs it: a
+                // member walking away needs nobody's permission.
                 let target = id.to_bytes();
                 let same_user = self
                     .certs
                     .user_of(&target)
                     .is_some_and(|owner| self.certs.user_of(&issuer) == Some(owner));
-                if same_user || self.certs.may_administer(&issuer) {
+                if same_user {
+                    return Ok(());
+                }
+                if !self.certs.may_administer(&issuer) {
+                    return Err(refuse());
+                }
+                // Removing somebody *else* is what a threshold governs, and the
+                // check happens here — on the receiver — rather than only on the
+                // node that issued it. `WorkspaceState::require_quorum` is a
+                // local courtesy that a malicious admin simply would not run;
+                // this is what makes the threshold binding on the group.
+                //
+                // Sound because both inputs are monotone. The threshold is fixed
+                // by the founder's policy, which every member holds before it can
+                // join, and `is_executed_action` counts approvers with
+                // `ever_admin`. A peer that knows more therefore accepts at least
+                // as much — never less — so no two peers can merge different sets
+                // of operations and split the group.
+                if self.certs.threshold() <= DEFAULT_THRESHOLD
+                    || self
+                        .certs
+                        .is_executed_action(&AdminAction::RemoveMember { member: target })
+                {
                     Ok(())
                 } else {
                     Err(refuse())
@@ -1079,5 +1159,219 @@ impl CgkaController {
                 return first_error.map_or(Ok(total), Err);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use beekem::id::{MemberId, TreeId};
+    use keyhive_crypto::{
+        share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
+    };
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    use super::{AuthorizedOp, CgkaController, MergeOutcome};
+    use crate::{
+        capability::{AdminAction, Certificate, Role},
+        error::CoreError,
+    };
+
+    fn rng(seed: u64) -> ChaCha20Rng {
+        ChaCha20Rng::seed_from_u64(seed)
+    }
+
+    /// A founder and one other admin, in a workspace whose threshold is two.
+    ///
+    /// Built at this layer rather than through `WorkspaceState` because these
+    /// tests are about `authorize`, which is the *receiver's* check — and the
+    /// point is to issue operations the local guards would have refused, which a
+    /// controller can do and a `WorkspaceState` deliberately cannot.
+    struct Pair {
+        founder: CgkaController,
+        peer: CgkaController,
+        victim: MemberId,
+    }
+
+    fn two_of_two() -> Pair {
+        let signer = MemorySigner::generate(&mut rng(1));
+        let tree = TreeId::from(signer.verifying_key());
+        let founder_id = MemberId::from(signer.verifying_key());
+        let peer_signer = MemorySigner::generate(&mut rng(2));
+        let peer_id = MemberId::from(peer_signer.verifying_key());
+        let victim_signer = MemorySigner::generate(&mut rng(3));
+        let victim = MemberId::from(victim_signer.verifying_key());
+
+        let mut founder =
+            CgkaController::create(tree, signer, &mut rng(10)).expect("the tree is founded");
+        founder
+            .certify_device(founder_id.to_bytes(), founder_id.to_bytes(), [0u8; 16])
+            .expect("the founder binds itself");
+        founder
+            .certify_role(founder_id.to_bytes(), Role::Admin, [0u8; 16])
+            .expect("the founder is an admin");
+        founder
+            .certify_policy(2, [0u8; 16])
+            .expect("the founder fixes the threshold");
+
+        let peer_secret = ShareSecretKey::generate(&mut rng(20));
+        founder
+            .certify_device(peer_id.to_bytes(), peer_id.to_bytes(), [1u8; 16])
+            .expect("the founder binds the peer");
+        founder
+            .certify_role(peer_id.to_bytes(), Role::Admin, [1u8; 16])
+            .expect("the founder appoints a second admin");
+        founder
+            .add_member(peer_id, peer_secret.share_key())
+            .expect("the peer is added");
+
+        let victim_secret = ShareSecretKey::generate(&mut rng(30));
+        founder
+            .certify_device(victim.to_bytes(), victim.to_bytes(), [2u8; 16])
+            .expect("the founder binds the victim");
+        founder
+            .certify_role(victim.to_bytes(), Role::Editor, [2u8; 16])
+            .expect("the victim is an editor");
+        founder
+            .add_member(victim, victim_secret.share_key())
+            .expect("the victim is added");
+
+        let log = founder.op_log().expect("the log sorts");
+        let certs = founder.capabilities().certificates();
+        let peer = CgkaController::join(tree, peer_signer, peer_secret, &log, &certs)
+            .expect("the peer joins");
+
+        Pair {
+            founder,
+            peer,
+            victim,
+        }
+    }
+
+    /// Given a workspace whose threshold is two, when an admin issues a removal
+    /// that no quorum authorised, we expect the *receiver* to refuse to merge it.
+    ///
+    /// **The property M-of-N is worth having for.** `WorkspaceState::require_quorum`
+    /// runs on the node taking the action, and an attacker running modified code
+    /// simply would not call it: the operation below is well-formed, correctly
+    /// signed, and issued by a genuine administrator. Nothing but a check on the
+    /// receiving side distinguishes it from a legitimate removal, so without this
+    /// a threshold would constrain only the nodes that chose to honour it.
+    #[test]
+    fn a_removal_no_quorum_authorised_is_refused_by_the_receiver() {
+        let mut pair = two_of_two();
+        let op = pair
+            .founder
+            .remove_member(pair.victim)
+            .expect("the tree accepts the removal")
+            .expect("the victim is a member, so an operation is minted");
+
+        let before = pair.peer.group_size();
+        let err = pair
+            .peer
+            .merge(AuthorizedOp::bare(std::sync::Arc::new(op)))
+            .expect_err("an unauthorised removal must be refused");
+        assert!(
+            matches!(err, CoreError::Uncertified { .. }),
+            "the refusal must name a missing capability rather than a bad \
+             signature: the operation is genuine, it is the authority that is \
+             absent — {err}"
+        );
+        assert_eq!(
+            pair.peer.group_size(),
+            before,
+            "the receiver merged a removal that no quorum authorised, so the \
+             threshold constrains only nodes that choose to honour it"
+        );
+    }
+
+    /// Given a workspace whose threshold is two, when two distinct admins have
+    /// approved a removal, we expect the receiver to merge it.
+    ///
+    /// The counterweight: a receiver that refused every removal would satisfy the
+    /// property above while making the workspace unusable.
+    #[test]
+    fn a_removal_two_admins_approved_is_merged_by_the_receiver() {
+        let mut pair = two_of_two();
+        let action = AdminAction::RemoveMember {
+            member: pair.victim.to_bytes(),
+        };
+
+        let proposal = pair
+            .founder
+            .certify_proposal(action, 0, None, [9u8; 16])
+            .expect("the founder proposes");
+        let digest = proposal.digest();
+        let first = pair
+            .founder
+            .certify_approval(digest, [10u8; 16])
+            .expect("the founder approves");
+
+        // The second approval is minted by the peer's own key, which is what
+        // makes it a *distinct user* rather than a second device.
+        let second = pair
+            .peer
+            .certify_approval(digest, [11u8; 16])
+            .expect("the peer approves");
+        pair.founder
+            .absorb_certificates(vec![second, proposal, first]);
+        assert!(
+            pair.founder.capabilities().is_executed_action(&action),
+            "two distinct admins approved and the action was still not authorised"
+        );
+
+        let op = pair
+            .founder
+            .remove_member(pair.victim)
+            .expect("the tree accepts the removal")
+            .expect("an operation is minted");
+        let proof: Vec<Certificate> = pair.founder.capabilities().proof_of(&action);
+        assert!(
+            !proof.is_empty(),
+            "a quorum-authorised action must be able to prove itself to a peer \
+             that has not seen the approvals"
+        );
+
+        let before = pair.peer.group_size();
+        let outcome = pair
+            .peer
+            .merge(AuthorizedOp::new(op, proof))
+            .expect("a quorum-authorised removal must be accepted");
+        assert!(
+            matches!(outcome, MergeOutcome::Applied),
+            "the removal was not applied: {outcome:?}"
+        );
+        assert_eq!(
+            pair.peer.group_size(),
+            before - 1,
+            "the receiver accepted the removal but the leaf is still in the tree"
+        );
+    }
+
+    /// Given a workspace whose threshold is two, when a member removes its own
+    /// device, we expect the receiver to merge it without any quorum.
+    ///
+    /// A threshold governs what the group does *to* a member, never what a member
+    /// does about itself — otherwise a group could hold somebody in a workspace
+    /// against their will.
+    #[test]
+    fn a_self_removal_needs_no_quorum() {
+        let mut pair = two_of_two();
+        let me = pair.peer.member_id();
+        let op = pair
+            .peer
+            .remove_member(me)
+            .expect("the tree accepts the removal")
+            .expect("an operation is minted");
+
+        let before = pair.founder.group_size();
+        pair.founder
+            .merge(AuthorizedOp::bare(std::sync::Arc::new(op)))
+            .expect("a member's own departure needs nobody's approval");
+        assert_eq!(
+            pair.founder.group_size(),
+            before - 1,
+            "a receiver refused a member's own departure for want of a quorum"
+        );
     }
 }

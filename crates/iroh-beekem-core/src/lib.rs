@@ -36,7 +36,10 @@ pub mod state;
 pub mod sync_poll;
 
 pub use blinding::{DocumentUuid, StorageKey, WorkspaceSecret};
-pub use capability::{CapabilityStore, Certificate, DeviceBinding, Grant, Role};
+pub use capability::{
+    AdminAction, AdminProposal, Approval, CapabilityStore, Certificate, DEFAULT_THRESHOLD,
+    DeviceBinding, Grant, Policy, ProposalStatus, Role,
+};
 pub use content::{Chunk, ChunkRef};
 pub use error::CoreError;
 pub use keys::{AuthorizedOp, CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome};

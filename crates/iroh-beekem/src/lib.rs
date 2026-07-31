@@ -28,7 +28,7 @@ pub use invite::{Invite, InviteError, InviteTerms};
 ///
 /// Re-exported from `iroh-beekem-core` because [`Workspace::add_user`] takes one
 /// and [`Workspace::set_role`] takes one, so it is unavoidable in any caller.
-pub use iroh_beekem_core::Role;
+pub use iroh_beekem_core::{AdminAction, ProposalStatus, Role};
 /// The public half of a device's leaf secret.
 ///
 /// Re-exported from `keyhive_crypto` for the reason given on [`MemberId`].
