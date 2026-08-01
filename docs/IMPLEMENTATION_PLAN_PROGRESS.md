@@ -33,6 +33,8 @@ outranks both.
 | 8 | `Event::Leave` and `Workspace::leave`; `Policy`/`AdminProposal`/`Approval` as tagged certificates; a founder-fixed threshold; `require_quorum` on the issuer **and** a quorum check in `CgkaController::authorize` on every receiver; `Event::ResyncCertificates`; `propose`/`approve`/`proposals`/`threshold`; `Departure` and `Quorum` scenarios | [capability.rs](../crates/iroh-beekem-core/src/capability.rs), [state.rs](../crates/iroh-beekem-core/src/state.rs) |
 | 9 | blob collection (`temp_tag` + the `iroh-docs` protect callback, `NodeOptions`); delta publishing (`Extent`, `published_up_to`, quiescent resync, `RepairTarget::DocumentHistory`); large assets (`asset.rs`, envelope encryption, blinded segment key spaces, `attach_file`/`export_asset`, lazy download policy, the pending-asset intent log); rotation re-indexes assets; `Msg::Segment` and range reconciliation in the simulator; `Assets`/`AssetChurn` scenarios | [asset.rs](../crates/iroh-beekem-core/src/asset.rs), [blinding.rs](../crates/iroh-beekem-core/src/blinding.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs), [node.rs](../crates/iroh-beekem/src/node.rs) |
 
+| 10 | versioning: `version.rs` with `UnixSeconds`/`VersionId`/`VersionInfo`/`Checkpoint`/`AssetVersion`; a supplied clock on `WorkspaceState::handle`; per-document `authors` claims and `set_change_merge_interval(-1)`; `document_versions`/`document_text_at`/`Event::RevertDocument`; digest-keyed checkpoints with `RestoreOutcome`; per-version asset key spaces with `attach_version`/`export_asset_version`/`revert_asset`; `WsOp::Revert` in the generated workload; parked chunks no longer cached as delivered | [version.rs](../crates/iroh-beekem-core/src/version.rs), [state.rs](../crates/iroh-beekem-core/src/state.rs), [manifest.rs](../crates/iroh-beekem-core/src/manifest.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs) |
+
 The threat model — what is confidential and from whom, and what a member, a removed member and the
 holder of a leaked invite can each actually do — lives in [README.md](../README.md) under *Threat
 model*, together with *Current trade-offs* and *Not yet implemented*. Those three lists are
@@ -126,6 +128,68 @@ settled; if a user story needs a different answer, change it.
   lives only in memory until that entry lands — so an interrupted attachment would leave blobs that
   are protected from collection and nameable by nothing. The intent log is what makes the startup
   sweep possible.
+
+### Versioning
+
+- **A revert is a forward edit; history is never rewritten.** A document reverts through Loro's
+  `revert_to`, which appends the inverse of everything after the named version, and an asset reverts by
+  appending a version record naming segments that are already stored. The alternative — dropping the
+  operations after that point — is not available in a group at all: a peer that had already merged them
+  would keep them and the two replicas could never agree again. Two properties fall out and both are
+  tested: a revert converges with a concurrent edit like any other write, and the version reverted away
+  from stays listed, so a revert can be reverted.
+
+- **Attribution is recorded, not derived, and that is a correctness decision rather than a taste one.**
+  The obvious design — derive each device's Loro peer id from the workspace secret and the member id, so
+  every peer can invert it — corrupts documents. Assigning a peer id also fixes the operation counter a
+  replica writes next, so any device that loses a document's local history while another replica keeps
+  it (deleting and recreating a UUID, resuming a wipe) restarts its counter and mints operation ids that
+  already name different operations. Loro says plainly that this can corrupt a document and recommends
+  the random per-session id it defaults to. Peer ids therefore stay random and each writing replica adds
+  one `peer id → member id` claim to an `authors` container inside the document. It is a claim in the
+  manifest's sense — it grants nothing, so a lie costs a wrong name beside a change.
+
+- **Time is a parameter of `WorkspaceState::handle`, never read.** The core has no clock; the simulator
+  supplies `cx.now()`, so a seeded run produces byte-identical version timestamps and a property can
+  assert on them. Loro raises a change's timestamp to at least the greatest on its causal ancestry, so a
+  slow clock cannot date work before what it followed — but a fast one can date its own work in the
+  future, which is why a timestamp is presented as a claim.
+
+- **Change merging is off (`set_change_merge_interval(-1)`).** Loro merges consecutive local commits
+  within an interval defaulting to a thousand seconds, which is right for an undo stack and wrong here:
+  a change is what a version *is*, so three edits a minute apart would collapse into one entry nobody
+  can revert past. Negative rather than zero, because the comparison is `<=` and a supplied clock can
+  date a whole simulated run to one second.
+
+- **Checkpoints are keyed by digest, asset versions too.** Keyed by name, two members tagging `v1.0`
+  while partitioned would have one silently overwrite the other under Loro's own ordering — a fact about
+  operation ids rather than about what either member did. Keyed by digest both survive and a name
+  resolves by `(at, digest)`, a pure function of the values. Asset versions are separate map keys for the
+  same reason *and* one more: a nested list would be *created* by whoever wrote the first version, and two
+  replicas doing that concurrently create two containers, discarding a whole history rather than one
+  record.
+
+- **Each asset version owns its key space, and precedence leads with a per-entry sequence.** A new
+  version publishing into the old one's blinded key space would replace the index entries, and an index
+  entry is the only thing protecting a blob from collection — the previous version would be gone.
+  Precedence is `(seq, at, content)`: `seq` is one past the highest the publisher had merged, because a
+  timestamp is whole seconds and a member attaching twice in quick succession would otherwise have the
+  order of its own writes settled by a coin toss between two random UUIDs. `asset_prefixes` covers every
+  version, not just the current one — that list is what a peer declines to fetch eagerly, so leaving a
+  superseded version out would have every member download it in full.
+
+- **Deleting an entry withdraws every version's key space.** Missing one leaves its payload on every
+  member's disk forever, for a file that no longer exists, and for assets that is measured in gigabytes.
+
+- **A parked chunk must not be cached as delivered.** `seen_entries` in the transport caches what has
+  been *fetched*, to stop a quiescent workspace re-decrypting everything on every sync event. A chunk
+  awaiting CRDT dependencies has been fetched and not applied, and it is rescued only by the
+  `DocumentHistory` repair the core raises after enough retries — so caching it meant no retries, no
+  repair, and an edit missing on that peer permanently, with nothing reporting it. `ingest_all` now
+  forgets the cache entry for any document still holding parked chunks.
+  `a_peer_that_misses_the_base_of_a_delta_still_catches_up` in
+  [two_node.rs](../crates/iroh-beekem/tests/two_node.rs) is the regression: two writes made faster than
+  the peer can sync, which is ordinary rather than exotic.
 
 ### Removal and rotation
 
@@ -247,7 +311,7 @@ settled; if a user story needs a different answer, change it.
   new, because a proposal can become executable without one arriving. A quorum removal makes
   concurrent identical removals the normal case, which is why this surfaced there.
   `beekem_group_size_disagrees_with_current_members` pins the behaviour so a fixed beekem is noticed;
-  [docs/beekem-repro/](beekem-repro/) is the standalone reproduction for upstream.
+  [docs/beekem-bug-repro/](beekem-bug-repro/) is the standalone reproduction for upstream.
 
 ### Quorum
 
@@ -416,7 +480,7 @@ One or more scenarios per user story, all in
 | 3 — removal | `Eviction`, `Churn`, `Insider`, `Revenant`, `Departure`, `Quorum` | `a_removed_member_stops_seeing`, `concurrent_rotation_and_revocation`, `an_insider_cannot_exceed_its_role`, `a_removed_member_is_evicted_again`, `a_member_leaves_of_its_own_accord`, `an_action_needs_a_quorum` |
 | 4 — outsiders | `Forging`, `Outsider`, `StolenInvite` | `a_forging_peer_is_rejected`, `an_outsider_observes_nothing`, `a_stolen_invite_buys_only_visibility` |
 | 4 — large assets | `Assets`, `AssetChurn` | `an_asset_reaches_every_member` |
-| workloads | `Crud`, `CrudChurn` | `generated_crud_workloads` |
+| workloads | `Crud`, `CrudChurn` | `generated_crud_workloads` — the generated stream now includes `WsOp::Revert`, so every convergence property covers reverting too |
 
 Story 2 has no scenario type of its own by design: "offline" is `Honest` under a scripted fault, in two
 variants — **disconnected** (`partition` then `heal_all`) and **shut down** (`crash` then `restart`) —
@@ -450,6 +514,29 @@ against the wrong scenario and passing vacuously.
 ---
 
 ## What remains
+
+### Versioning, and where it is tested
+
+Versioning adds no scenario of its own, deliberately. A revert is an ordinary edit, so the question it
+raises — does the group still converge — is the question every existing plan already asks; the way to
+cover it is to put reverts into the generated workload rather than to build a plan that only reverts.
+`WsOp::Revert` names a version by counting back from the newest, because a generated workload cannot
+know a `VersionId`: those are minted by the very edits it is producing.
+
+The rest sits where it can be stated exactly:
+
+| Claim | Where |
+|---|---|
+| Every edit is a version; reading at one gives the text as it stood | `history_is_readable_and_revertible` in [workspace_state.rs](../crates/iroh-beekem-core/tests/workspace_state.rs) |
+| Reverting restores the text *and lengthens* the history | same, plus a proptest over arbitrary edit sequences |
+| A revert converges with a concurrent edit | same, and every workload plan in the simulator |
+| A version names the member that made it, and the instant the caller stated | same |
+| Restoring a checkpoint puts back what it named and leaves the rest | `checkpoints_name_a_state_of_the_workspace` |
+| Two members tagging one name both keep their record | same |
+| A second asset version does not replace the first; delete withdraws every key space | `assets_keep_their_versions` |
+| Two versions attached in the same second are still ordered | same |
+| It all works over real QUIC, including exporting a superseded version | `versions_travel_over_the_wire` in [two_node.rs](../crates/iroh-beekem/tests/two_node.rs) |
+| A peer that missed the base of a delta still catches up | same — the regression for the `seen_entries` gap |
 
 ### Gaps in the property suite
 

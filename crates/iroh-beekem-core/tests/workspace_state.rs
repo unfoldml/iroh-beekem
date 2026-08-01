@@ -10,7 +10,7 @@ use std::sync::Arc;
 use beekem::id::{MemberId, TreeId};
 use iroh_beekem_core::{
     AuthorizedOp, Certificate, CgkaController, DocumentUuid, Effect, EpochId, Event, RepairTarget,
-    Role, WorkspaceSecret, WorkspaceState,
+    Role, UnixSeconds, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
@@ -23,6 +23,14 @@ fn rng(seed: u64) -> ChaCha20Rng {
 }
 
 const DOC: DocumentUuid = DocumentUuid([42u8; 16]);
+
+/// The instant every test here drives the state machine at.
+///
+/// A constant rather than a clock for the same reason the RNG is seeded: these
+/// tests are about ordering, and ordering comes from the causal DAG rather than
+/// from the timestamp, so a moving clock would add nondeterminism that decides
+/// nothing. The tests that *are* about time state their own instants.
+const T0: UnixSeconds = UnixSeconds::new(1_767_225_600);
 
 /// A two-node workspace with an explicit, inspectable message bus.
 struct Bus {
@@ -86,6 +94,7 @@ fn two_node_workspace() -> Bus {
                 endpoint: None,
             },
             &mut rng(21),
+            T0,
         )
         .expect("alice admits bob");
 
@@ -136,7 +145,7 @@ impl Bus {
     fn alice_does(&mut self, event: Event, seed: u64) {
         let effects = self
             .alice
-            .handle(event, &mut rng(seed))
+            .handle(event, &mut rng(seed), T0)
             .expect("alice should handle the event");
         self.queue_for_bob(effects);
     }
@@ -147,7 +156,7 @@ impl Bus {
     /// whether it produced anything at all — as distinct from its effect on bob.
     fn alice_emits(&mut self, event: Event, seed: u64) -> Vec<Effect> {
         self.alice
-            .handle(event, &mut rng(seed))
+            .handle(event, &mut rng(seed), T0)
             .expect("alice should handle the event")
     }
 
@@ -212,6 +221,7 @@ impl Bus {
                 .handle(
                     Event::NamespaceMinted { epoch, ticket },
                     &mut rng(epoch.into()),
+                    T0,
                 )
                 .expect("alice should encrypt the namespace she asked to mint");
             self.queue_for_bob(effects);
@@ -230,6 +240,7 @@ impl Bus {
                         chunk: Box::new(chunk),
                     },
                     &mut rng(0),
+                    T0,
                 )
                 .expect("bob should handle a rotation announcement");
         }
@@ -239,7 +250,7 @@ impl Bus {
     fn bob_receives(&mut self, event: Event) {
         let effects = self
             .bob
-            .handle(event, &mut rng(0))
+            .handle(event, &mut rng(0), T0)
             .expect("bob should handle the event");
         // Bob is a passive receiver in these tests, so the only effect of his
         // that the bus carries is a repair request; anything he publishes is
@@ -319,7 +330,7 @@ impl Bus {
     /// asking what alice now *believes*, not what she says next.
     fn alice_receives(&mut self, event: Event) {
         self.alice
-            .handle(event, &mut rng(0))
+            .handle(event, &mut rng(0), T0)
             .expect("alice should handle the event");
     }
 
@@ -350,6 +361,7 @@ impl Bus {
                         epoch,
                     },
                     &mut rng(seed + answered as u64),
+                    T0,
                 )
                 .expect("alice should handle a repair request from a member");
             if !effects.is_empty() {
@@ -472,6 +484,7 @@ fn concurrent_edits_from_both_members_converge() {
                 text: "b".into(),
             },
             &mut rng(31),
+            T0,
         )
         .expect("bob edits locally");
     bus.alice_does(
@@ -490,17 +503,18 @@ fn concurrent_edits_from_both_members_converge() {
                     .handle(
                         Event::ControlOp(AuthorizedOp::bare(Arc::new(*op))),
                         &mut rng(0),
+                        T0,
                     )
                     .expect("alice handles bob's op");
             }
             Effect::StoreChunk { chunk, .. } => {
                 bus.alice
-                    .handle(Event::ChunkArrived { doc: DOC, chunk }, &mut rng(0))
+                    .handle(Event::ChunkArrived { doc: DOC, chunk }, &mut rng(0), T0)
                     .expect("alice handles bob's chunk");
             }
             Effect::StoreManifest { chunk, .. } => {
                 bus.alice
-                    .handle(Event::ManifestArrived { chunk }, &mut rng(0))
+                    .handle(Event::ManifestArrived { chunk }, &mut rng(0), T0)
                     .expect("alice handles bob's manifest");
             }
             // Bob is not an admin in this test, so he never rotates, never
@@ -540,6 +554,1020 @@ fn concurrent_edits_from_both_members_converge() {
     assert_eq!(bus.bob.pending_len(), 0, "bob should have nothing parked");
 }
 
+/// In a member whose own edits come back to it inside a peer's chunk, upon
+/// editing again, we expect every edit to survive and the two replicas to still
+/// agree.
+///
+/// This is the ordinary case rather than a corner: a peer publishing a document
+/// for the first time exports *all* updates, so what reaches alice contains
+/// alice's own operations. It is worth pinning because of what a device's Loro
+/// peer id now does. The id is derived from the workspace secret so that history
+/// stays attributable across restarts, and assigning it is also what derives the
+/// operation counter this replica writes next from. A counter derived before its
+/// own past arrives is one that hands out ids already spent, and the resulting
+/// replica is not refused but corrupt. `adopt_peer` after every import is what
+/// keeps the two in step; this test is the echo path stated end to end.
+#[test]
+fn a_members_own_edits_returning_from_a_peer_do_not_collide_with_its_next_edit() {
+    let mut bus = two_node_workspace();
+    bus.alice_does(
+        Event::LocalEdit {
+            doc: DOC,
+            text: "alice one\n".into(),
+        },
+        40,
+    );
+    bus.deliver_all_to_bob();
+
+    // Bob has published nothing for this document, so his chunk is a full
+    // export — alice's operations included. This is the echo that matters.
+    let from_bob = bus
+        .bob
+        .handle(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "bob one\n".into(),
+            },
+            &mut rng(41),
+            T0,
+        )
+        .expect("bob edits locally");
+    for effect in from_bob {
+        match effect {
+            Effect::BroadcastOp { op, .. } => {
+                bus.alice_receives(Event::ControlOp(AuthorizedOp::bare(Arc::new(*op))));
+            }
+            Effect::StoreChunk { chunk, .. } => {
+                bus.alice_receives(Event::ChunkArrived { doc: DOC, chunk });
+            }
+            // Nothing else bob emits bears on this document.
+            _ => {}
+        }
+    }
+
+    // Several, because a single edit could avoid a collision by luck.
+    for (n, seed) in [(2, 42), (3, 43), (4, 44)] {
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: format!("alice {n}\n"),
+            },
+            seed,
+        );
+    }
+    bus.deliver_all_to_bob();
+
+    let alice_text = bus.alice.document_text(DOC);
+    for expected in ["alice one", "bob one", "alice 2", "alice 3", "alice 4"] {
+        assert!(
+            alice_text.contains(expected),
+            "an edit was lost after alice merged her own operations back from bob; \
+             {expected:?} missing from {alice_text:?}"
+        );
+    }
+    assert_eq!(
+        alice_text,
+        bus.bob.document_text(DOC),
+        "the two replicas diverged, which is what colliding operation ids look \
+         like when they do not abort outright"
+    );
+}
+
+/// A document's history is readable, and a past state can be restored.
+///
+/// Revert is applied as a new edit going forward rather than as a rewrite, which
+/// is what makes it safe in a group: a peer that already merged the operations
+/// being undone keeps them, and the undo merges with whatever it was doing.
+mod history_is_readable_and_revertible {
+    use iroh_beekem_core::{CoreError, UnixSeconds, version::VersionId};
+    use proptest::prelude::*;
+
+    use super::{DOC, Event, T0, rng, two_node_workspace};
+
+    /// In a document edited several times, upon listing its versions, we expect
+    /// one entry per edit, in the order the edits were made.
+    #[test]
+    fn every_edit_is_a_version() {
+        let mut bus = two_node_workspace();
+        for (n, seed) in [(1, 800), (2, 801), (3, 802)] {
+            bus.alice_does(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: format!("line {n}\n"),
+                },
+                seed,
+            );
+        }
+
+        let versions = bus.alice.document_versions(DOC);
+        assert_eq!(
+            versions.len(),
+            3,
+            "each edit commits one change and so contributes one version, got {versions:?}"
+        );
+        // Each version names the state after its own edit, so reading them back
+        // in order must reproduce the document as it grew.
+        for (i, version) in versions.iter().enumerate() {
+            let expected: String = (1..=i + 1).fold(String::new(), |mut acc, n| {
+                use std::fmt::Write as _;
+                let _ = writeln!(acc, "line {n}");
+                acc
+            });
+            assert_eq!(
+                bus.alice
+                    .document_text_at(DOC, &version.id)
+                    .expect("a version this replica listed is one it can resolve"),
+                expected,
+                "version {i} did not read back as the document stood after edit {i}"
+            );
+        }
+    }
+
+    /// In a document whose history this replica holds, upon reverting to an
+    /// earlier version, we expect its text to be what it was at that version and
+    /// its history to be longer rather than shorter.
+    ///
+    /// The second half is the one worth stating. A revert that shortened history
+    /// would mean the operations had been dropped, and a peer that had already
+    /// merged them would keep them forever: the two replicas could never agree
+    /// again. Undoing forward is what makes the group case sound at all.
+    #[test]
+    fn a_revert_restores_the_text_and_extends_the_history() {
+        let mut bus = two_node_workspace();
+        for (n, seed) in [(1, 810), (2, 811), (3, 812)] {
+            bus.alice_does(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: format!("line {n}\n"),
+                },
+                seed,
+            );
+        }
+        let before = bus.alice.document_versions(DOC);
+        let second = before[1].id.clone();
+
+        bus.alice_does(
+            Event::RevertDocument {
+                doc: DOC,
+                to: second,
+            },
+            813,
+        );
+
+        assert_eq!(
+            bus.alice.document_text(DOC),
+            "line 1\nline 2\n",
+            "reverting to the version after the second edit must undo the third"
+        );
+        let after = bus.alice.document_versions(DOC);
+        assert!(
+            after.len() > before.len(),
+            "a revert must add to the history, not remove from it: {} versions \
+             before, {} after",
+            before.len(),
+            after.len()
+        );
+        assert!(
+            after.iter().any(|v| v.id == before[2].id),
+            "the version that was reverted away must still be listed, or it could \
+             never be returned to"
+        );
+        assert_eq!(
+            bus.alice
+                .document_text_at(DOC, &before[2].id)
+                .expect("the reverted-away version is still resolvable"),
+            "line 1\nline 2\nline 3\n",
+            "reverting must not change what an earlier version reads as"
+        );
+    }
+
+    /// In a replica that reverted a document, upon a peer receiving the result,
+    /// we expect both to agree — including when the peer edited concurrently.
+    #[test]
+    fn a_revert_converges_with_a_concurrent_edit() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "shared\n".into(),
+            },
+            820,
+        );
+        bus.deliver_all_to_bob();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "alice regrets this\n".into(),
+            },
+            821,
+        );
+        let base = bus.alice.document_versions(DOC)[0].id.clone();
+
+        // Bob writes while alice is undoing, and neither has seen the other.
+        let from_bob = bus
+            .bob
+            .handle(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: "bob's own work\n".into(),
+                },
+                &mut rng(822),
+                T0,
+            )
+            .expect("bob edits locally");
+        bus.alice_does(Event::RevertDocument { doc: DOC, to: base }, 823);
+
+        for effect in from_bob {
+            match effect {
+                iroh_beekem_core::Effect::BroadcastOp { op, .. } => {
+                    bus.alice_receives(Event::ControlOp(iroh_beekem_core::AuthorizedOp::bare(
+                        std::sync::Arc::new(*op),
+                    )));
+                }
+                iroh_beekem_core::Effect::StoreChunk { chunk, .. } => {
+                    bus.alice_receives(Event::ChunkArrived { doc: DOC, chunk });
+                }
+                _ => {}
+            }
+        }
+        bus.deliver_all_to_bob();
+
+        let alice_text = bus.alice.document_text(DOC);
+        assert_eq!(
+            alice_text,
+            bus.bob.document_text(DOC),
+            "a revert must converge with a concurrent edit like any other write"
+        );
+        assert!(
+            alice_text.contains("bob's own work"),
+            "a revert must undo only what it names; bob's concurrent edit was \
+             swallowed: {alice_text:?}"
+        );
+        assert!(
+            !alice_text.contains("alice regrets this"),
+            "the reverted edit is still present: {alice_text:?}"
+        );
+    }
+
+    /// In any replica, upon being asked for a version it does not hold, we expect
+    /// [`CoreError::UnknownVersion`] rather than a wrong answer.
+    ///
+    /// Ordinary rather than adversarial: version ids travel between members, and
+    /// a peer that is behind genuinely cannot resolve one its neighbour just
+    /// listed.
+    #[test]
+    fn a_version_this_replica_does_not_hold_is_refused() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "only alice has this".into(),
+            },
+            830,
+        );
+        let known = bus.alice.document_versions(DOC)[0].id.clone();
+
+        assert!(
+            matches!(
+                bus.bob.document_text_at(DOC, &known),
+                Err(CoreError::UnknownDocument)
+            ),
+            "a peer holding no copy of the document must say so"
+        );
+        assert!(
+            matches!(
+                bus.alice
+                    .document_text_at(DOC, &VersionId::from_bytes(vec![0xff; 8])),
+                Err(CoreError::UnknownVersion { .. })
+            ),
+            "bytes that are not a version this replica holds must be refused"
+        );
+    }
+
+    /// In a document each of whose members has edited it, upon listing versions,
+    /// we expect every change to name the member that made it.
+    #[test]
+    fn a_version_names_the_member_that_made_it() {
+        let mut bus = two_node_workspace();
+        let alice_id = bus.alice.member_id().to_bytes();
+        let bob_id = bus.bob.member_id().to_bytes();
+
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "from alice\n".into(),
+            },
+            840,
+        );
+        bus.deliver_all_to_bob();
+        let from_bob = bus
+            .bob
+            .handle(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: "from bob\n".into(),
+                },
+                &mut rng(841),
+                T0,
+            )
+            .expect("bob edits locally");
+        for effect in from_bob {
+            match effect {
+                iroh_beekem_core::Effect::BroadcastOp { op, .. } => {
+                    bus.alice_receives(Event::ControlOp(iroh_beekem_core::AuthorizedOp::bare(
+                        std::sync::Arc::new(*op),
+                    )));
+                }
+                iroh_beekem_core::Effect::StoreChunk { chunk, .. } => {
+                    bus.alice_receives(Event::ChunkArrived { doc: DOC, chunk });
+                }
+                _ => {}
+            }
+        }
+
+        let authors: Vec<Option<[u8; 32]>> = bus
+            .alice
+            .document_versions(DOC)
+            .into_iter()
+            .map(|v| v.author)
+            .collect();
+        assert!(
+            authors.contains(&Some(alice_id)),
+            "alice's own change is unattributed on her own replica"
+        );
+        assert!(
+            authors.contains(&Some(bob_id)),
+            "bob's change did not carry the claim that names him, so a version \
+             list can never say who wrote what"
+        );
+    }
+
+    /// In a document edited at a stated instant, upon listing versions, we expect
+    /// that instant back — not the machine's clock.
+    ///
+    /// The core reads no clock, so the caller's value is the only one there is.
+    /// A test that let `SystemTime` in here would pass on any implementation and
+    /// prove nothing about the simulator's determinism, which is the property
+    /// this actually protects.
+    #[test]
+    fn a_version_carries_the_instant_the_caller_stated() {
+        let mut bus = two_node_workspace();
+        let when = UnixSeconds::new(1_600_000_000);
+        bus.alice
+            .handle(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: "dated".into(),
+                },
+                &mut rng(850),
+                when,
+            )
+            .expect("alice edits");
+
+        assert_eq!(
+            bus.alice.document_versions(DOC)[0].at,
+            when,
+            "the version was not dated from the instant the caller supplied"
+        );
+    }
+
+    proptest! {
+        /// In a document edited an arbitrary number of times, upon reverting to
+        /// the version recorded before edit *k*, we expect the text observed at
+        /// *k* back, and the document to still be writable afterwards.
+        ///
+        /// The second half catches a revert that leaves the replica detached: a
+        /// checkout would satisfy every assertion about the text and quietly stop
+        /// the document accepting anything else.
+        #[test]
+        fn reverting_to_any_version_restores_what_was_observed_there(
+            edits in prop::collection::vec("[a-z]{1,4}", 1..8),
+            k in 0usize..8,
+        ) {
+            let mut bus = two_node_workspace();
+            let mut observed = Vec::new();
+            for (i, text) in edits.iter().enumerate() {
+                bus.alice_does(
+                    Event::LocalEdit { doc: DOC, text: text.clone() },
+                    860 + i as u64,
+                );
+                observed.push(bus.alice.document_text(DOC));
+            }
+
+            let versions = bus.alice.document_versions(DOC);
+            let target = k % versions.len();
+            bus.alice_does(
+                Event::RevertDocument { doc: DOC, to: versions[target].id.clone() },
+                900,
+            );
+
+            prop_assert_eq!(
+                bus.alice.document_text(DOC),
+                observed[target].clone(),
+                "reverting to the version after edit {} did not restore what the \
+                 document read at that point",
+                target
+            );
+
+            // Still a live replica, not a detached view of the past.
+            bus.alice_does(
+                Event::LocalEdit { doc: DOC, text: "after".into() },
+                901,
+            );
+            prop_assert!(
+                bus.alice.document_text(DOC).ends_with("after"),
+                "the document stopped accepting edits after a revert, which is what \
+                 a detached checkout looks like"
+            );
+        }
+    }
+}
+
+/// Checkpoints: a name for a state of the whole workspace, and a way back to it.
+///
+/// A checkpoint is a claim recorded in the manifest — it points at versions that
+/// already exist — so it needs no new effect and rides the manifest's own
+/// anti-entropy. Restoring one is [`Event::RevertDocument`] applied to each entry
+/// it names, which is why the concurrency argument for revert covers it too.
+mod checkpoints_name_a_state_of_the_workspace {
+    use iroh_beekem_core::{CoreError, FileEntry, RestoreOutcome, UnixSeconds};
+
+    use super::{Event, T0, rng, two_node_workspace};
+
+    const ONE: iroh_beekem_core::DocumentUuid = iroh_beekem_core::DocumentUuid([1u8; 16]);
+    const TWO: iroh_beekem_core::DocumentUuid = iroh_beekem_core::DocumentUuid([2u8; 16]);
+
+    fn entry(uuid: iroh_beekem_core::DocumentUuid, path: &str) -> FileEntry {
+        FileEntry {
+            uuid,
+            logical_path: path.to_string(),
+            mime_type: "text/plain".to_string(),
+            asset: None,
+        }
+    }
+
+    /// In a workspace whose files were edited after a checkpoint was taken, upon
+    /// restoring it, we expect every file it names to read as it did then, and
+    /// files created since to be left alone.
+    ///
+    /// The second half is what makes a checkpoint a *tag* rather than a snapshot
+    /// of the filesystem: restoring must not delete work that has nothing to do
+    /// with it.
+    #[test]
+    fn restoring_puts_back_what_was_named_and_leaves_the_rest() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: entry(ONE, "/one"),
+            },
+            870,
+        );
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: entry(TWO, "/two"),
+            },
+            871,
+        );
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: ONE,
+                text: "one, as tagged".into(),
+            },
+            872,
+        );
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: TWO,
+                text: "two, as tagged".into(),
+            },
+            873,
+        );
+
+        let (effects, digest) = bus
+            .alice
+            .checkpoint("v1", "before the rewrite", &mut rng(874), T0)
+            .expect("an editor may take a checkpoint");
+        bus.queue_for_bob(effects);
+
+        // Both named files move on, and a third appears that the tag never saw.
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: ONE,
+                text: "\nand then some regret".into(),
+            },
+            875,
+        );
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: TWO,
+                text: "\nand more regret".into(),
+            },
+            876,
+        );
+        let three = iroh_beekem_core::DocumentUuid([3u8; 16]);
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: entry(three, "/three"),
+            },
+            877,
+        );
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: three,
+                text: "written after the tag".into(),
+            },
+            878,
+        );
+
+        let (effects, outcomes) = bus
+            .alice
+            .restore_checkpoint(&digest, &mut rng(879), T0)
+            .expect("a checkpoint this replica holds can be restored");
+        bus.queue_for_bob(effects);
+
+        assert_eq!(
+            bus.alice.document_text(ONE),
+            "one, as tagged",
+            "a file named by the checkpoint was not put back"
+        );
+        assert_eq!(
+            bus.alice.document_text(TWO),
+            "two, as tagged",
+            "a second file named by the checkpoint was not put back"
+        );
+        assert_eq!(
+            bus.alice.document_text(three),
+            "written after the tag",
+            "restoring a checkpoint must not touch a file it never named"
+        );
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "one outcome per named entry, so a caller can tell what happened to \
+             each: {outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, RestoreOutcome::Restored(_))),
+            "both named files were restorable, so both must report it: {outcomes:?}"
+        );
+    }
+
+    /// In a workspace where a checkpointed file has since been deleted, upon
+    /// restoring, we expect the deletion to be reported rather than skipped.
+    ///
+    /// Deleting drops the replica, so no version of that file survives to revert
+    /// to and no later sync will produce one. A caller told only "restored" would
+    /// believe the workspace was whole when a file is missing from it.
+    #[test]
+    fn a_file_deleted_since_the_checkpoint_is_reported_as_gone() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: entry(ONE, "/one"),
+            },
+            880,
+        );
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: ONE,
+                text: "here for now".into(),
+            },
+            881,
+        );
+        let (_, digest) = bus
+            .alice
+            .checkpoint("v1", "", &mut rng(882), T0)
+            .expect("taking a checkpoint");
+
+        bus.alice_does(Event::DeleteFile { doc: ONE }, 883);
+
+        let (_, outcomes) = bus
+            .alice
+            .restore_checkpoint(&digest, &mut rng(884), T0)
+            .expect("restoring a checkpoint whose file is gone is not an error");
+        assert_eq!(
+            outcomes,
+            vec![RestoreOutcome::Deleted(ONE)],
+            "a deleted file must be named as unrecoverable, not silently skipped"
+        );
+    }
+
+    /// In two members who tag the same name while partitioned, upon exchanging
+    /// manifests, we expect both records to survive.
+    ///
+    /// Checkpoints are keyed by digest for this reason. Keyed by name, one would
+    /// overwrite the other by whichever Loro ordering happened to win — a fact
+    /// about operation ids rather than about what either member did — and the
+    /// loser's tag would vanish with no trace and no error.
+    #[test]
+    fn two_members_tagging_the_same_name_both_keep_their_record() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: entry(ONE, "/one"),
+            },
+            890,
+        );
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: ONE,
+                text: "shared".into(),
+            },
+            891,
+        );
+        bus.deliver_all_to_bob();
+
+        let (alice_effects, alice_digest) = bus
+            .alice
+            .checkpoint("release", "alice's idea of it", &mut rng(892), T0)
+            .expect("alice tags");
+        let (_bob_effects, bob_digest) = bus
+            .bob
+            .checkpoint("release", "bob's idea of it", &mut rng(893), T0)
+            .expect("bob tags");
+        assert_ne!(
+            alice_digest, bob_digest,
+            "two different records must not collide, or this test proves nothing"
+        );
+
+        // Alice's manifest reaches bob, who already has his own tag of that name.
+        bus.queue_for_bob(alice_effects);
+        bus.deliver_all_to_bob();
+
+        let names: Vec<String> = bus
+            .bob
+            .checkpoints()
+            .into_iter()
+            .map(|c| c.message)
+            .collect();
+        assert!(
+            names.contains(&"alice's idea of it".to_string())
+                && names.contains(&"bob's idea of it".to_string()),
+            "both tags of the same name must survive the merge, got {names:?}"
+        );
+        assert!(
+            bus.bob.checkpoints().iter().any(|c| c.name == "release"),
+            "the name must still resolve to something"
+        );
+    }
+
+    /// In a replica that has not merged a checkpoint, upon being asked to restore
+    /// it, we expect a refusal naming the digest rather than a silent no-op.
+    #[test]
+    fn a_checkpoint_this_replica_does_not_hold_is_refused() {
+        let mut bus = two_node_workspace();
+        let result = bus.alice.restore_checkpoint(&[7u8; 32], &mut rng(895), T0);
+        assert!(
+            matches!(result, Err(CoreError::UnknownVersion { .. })),
+            "restoring an unknown checkpoint must say so, got {result:?}"
+        );
+    }
+
+    /// In a checkpoint taken at a stated instant by a stated member, upon listing
+    /// checkpoints, we expect both recorded.
+    #[test]
+    fn a_checkpoint_records_who_took_it_and_when() {
+        let mut bus = two_node_workspace();
+        let when = UnixSeconds::new(1_700_000_000);
+        bus.alice
+            .checkpoint("dated", "with a message", &mut rng(896), when)
+            .expect("taking a checkpoint");
+
+        let recorded = bus
+            .alice
+            .checkpoints()
+            .into_iter()
+            .next()
+            .expect("the checkpoint just taken is listed");
+        assert_eq!(
+            recorded.at, when,
+            "the checkpoint was not dated from the caller's clock"
+        );
+        assert_eq!(
+            recorded.author,
+            bus.alice.member_id().to_bytes(),
+            "the checkpoint does not name the member that took it"
+        );
+        assert_eq!(recorded.message, "with a message", "the message was lost");
+    }
+}
+
+/// Asset versions: the same feature as document history, by a different
+/// mechanism, because an asset has no CRDT to point into.
+///
+/// Each version is its own body of immutable segments under its own key space,
+/// which is what lets an older one survive a newer one; reverting appends a
+/// version naming bytes that are already there.
+mod assets_keep_their_versions {
+    use iroh_beekem_core::{
+        AssetMeta, CoreError, DocumentUuid, Effect, FileEntry, UnixSeconds, version::AssetVersion,
+    };
+
+    use super::{Event, rng, two_node_workspace};
+
+    const ENTRY: DocumentUuid = DocumentUuid([11u8; 16]);
+    const V1: DocumentUuid = DocumentUuid([21u8; 16]);
+    const V2: DocumentUuid = DocumentUuid([22u8; 16]);
+
+    fn meta(size: u64) -> AssetMeta {
+        AssetMeta {
+            size,
+            segments: AssetMeta::segments_for(size, 1024),
+            segment_bytes: 1024,
+            // Distinct per size, which is all these tests need of a digest.
+            content_hash: [u8::try_from(size % 256).unwrap_or(0); 32],
+        }
+    }
+
+    fn attached() -> super::Bus {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::UpsertFile {
+                entry: FileEntry {
+                    uuid: ENTRY,
+                    logical_path: "/big.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    asset: None,
+                },
+            },
+            900,
+        );
+        bus
+    }
+
+    /// In an entry with two versions attached, upon listing them, we expect both,
+    /// and the newer one to be what the entry currently reports.
+    ///
+    /// Both halves matter: the older version surviving is what makes the feature
+    /// a history rather than an overwrite, and the entry reporting the newer one
+    /// is what makes an ordinary read see the latest file.
+    #[test]
+    fn a_second_version_does_not_replace_the_first() {
+        let mut bus = attached();
+        let effects = bus
+            .alice
+            .add_asset_version(ENTRY, V1, meta(10), &mut rng(901), UnixSeconds::new(100))
+            .expect("attaching the first version");
+        bus.queue_for_bob(effects);
+        let effects = bus
+            .alice
+            .add_asset_version(ENTRY, V2, meta(20), &mut rng(902), UnixSeconds::new(200))
+            .expect("attaching the second version");
+        bus.queue_for_bob(effects);
+
+        let versions = bus.alice.asset_versions(ENTRY);
+        assert_eq!(
+            versions.iter().map(|v| v.content).collect::<Vec<_>>(),
+            vec![V1, V2],
+            "both versions must be listed, oldest first"
+        );
+        assert_eq!(
+            bus.alice
+                .manifest()
+                .files()
+                .into_iter()
+                .find(|e| e.uuid == ENTRY)
+                .and_then(|e| e.asset)
+                .map(|m| m.size),
+            Some(20),
+            "the entry must report the current version's metadata, or an ordinary \
+             read opens the superseded file"
+        );
+    }
+
+    /// In an entry versioned twice by one member within the same second, upon
+    /// asking which is current, we expect the second.
+    ///
+    /// Attaching two versions in quick succession is the common case, not a
+    /// corner: a timestamp here is whole seconds. With precedence decided by
+    /// `(at, content)` alone the two would tie and be separated by their random
+    /// UUIDs, so the *first* attachment would win about half the time — and the
+    /// caller would have no way to avoid it. `seq` is what orders a member's own
+    /// writes; it caught this as a networked test opening the previous file.
+    #[test]
+    fn two_versions_attached_in_the_same_second_are_still_ordered() {
+        let mut bus = attached();
+        let same_instant = UnixSeconds::new(1_700_000_000);
+        for (content, size, seed) in [(V1, 10u64, 912), (V2, 20, 913)] {
+            let effects = bus
+                .alice
+                .add_asset_version(ENTRY, content, meta(size), &mut rng(seed), same_instant)
+                .expect("attaching a version");
+            bus.queue_for_bob(effects);
+        }
+
+        assert_eq!(
+            bus.alice
+                .asset_versions(ENTRY)
+                .into_iter()
+                .max_by_key(AssetVersion::precedence)
+                .map(|v| v.content),
+            Some(V2),
+            "the later of two attachments made in one second must be current, \
+             whatever the two content UUIDs happen to sort like"
+        );
+    }
+
+    /// In an entry whose newer version is current, upon reverting to the older
+    /// one, we expect the older to be current again and the newer to remain
+    /// listed and readable.
+    ///
+    /// Reverting appends rather than removes for the same reason a document's
+    /// revert does: the bytes are still indexed, so pointing at them again costs
+    /// a manifest write and nothing else — no re-upload of a file that may be
+    /// gigabytes — and the version reverted away from can be returned to.
+    #[test]
+    fn reverting_an_asset_points_at_bytes_that_are_already_there() {
+        let mut bus = attached();
+        for (content, size, at, seed) in [(V1, 10u64, 100i64, 903), (V2, 20, 200, 904)] {
+            let effects = bus
+                .alice
+                .add_asset_version(
+                    ENTRY,
+                    content,
+                    meta(size),
+                    &mut rng(seed),
+                    UnixSeconds::new(at),
+                )
+                .expect("attaching a version");
+            bus.queue_for_bob(effects);
+        }
+
+        let effects = bus
+            .alice
+            .revert_asset(ENTRY, V1, &mut rng(905), UnixSeconds::new(300))
+            .expect("reverting to a version this replica holds");
+        // A manifest write and nothing else: no key chunk, no segment store.
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::StoreChunk { .. })),
+            "reverting an asset must not re-upload it, got {effects:?}"
+        );
+        bus.queue_for_bob(effects);
+
+        let versions = bus.alice.asset_versions(ENTRY);
+        assert_eq!(
+            versions.len(),
+            3,
+            "the revert must be a third version rather than a removal: {versions:?}"
+        );
+        assert_eq!(
+            versions
+                .iter()
+                .max_by_key(|v| AssetVersion::precedence(v))
+                .map(|v| v.content),
+            Some(V1),
+            "the reverted-to version must be current again"
+        );
+        assert!(
+            versions.iter().any(|v| v.content == V2),
+            "the version reverted away from must still be listed, or it could \
+             never be returned to"
+        );
+    }
+
+    /// In an entry with several versions, upon deleting it, we expect every
+    /// version's key space to be withdrawn.
+    ///
+    /// An index entry is what protects a blob from collection, so a version left
+    /// out here keeps its payload on every member's disk forever, for a file that
+    /// no longer exists — and for assets that is measured in gigabytes.
+    #[test]
+    fn deleting_an_entry_withdraws_every_versions_key_space() {
+        let mut bus = attached();
+        for (content, at, seed) in [(V1, 100i64, 906), (V2, 200, 907)] {
+            let effects = bus
+                .alice
+                .add_asset_version(
+                    ENTRY,
+                    content,
+                    meta(10),
+                    &mut rng(seed),
+                    UnixSeconds::new(at),
+                )
+                .expect("attaching a version");
+            bus.queue_for_bob(effects);
+        }
+
+        let effects = bus.alice_emits(Event::DeleteFile { doc: ENTRY }, 908);
+        for content in [V1, V2] {
+            assert!(
+                effects.iter().any(
+                    |e| matches!(e, Effect::DeleteAssetSegments { asset, .. } if *asset == content)
+                ),
+                "the segments of version {content:?} were not withdrawn: {effects:?}"
+            );
+            assert!(
+                effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::DeleteEntry { doc, .. } if *doc == content)),
+                "the content key entry of version {content:?} was not withdrawn: {effects:?}"
+            );
+        }
+    }
+
+    /// In an entry whose versions were attached by two members while partitioned,
+    /// upon their manifests merging, we expect both replicas to agree on which is
+    /// current.
+    ///
+    /// Precedence is `(at, content)` — a function of the values — precisely so
+    /// that this cannot depend on which replica merged in which order. Deciding
+    /// by list position instead would have two members open different files.
+    #[test]
+    fn two_replicas_agree_on_which_version_is_current() {
+        let mut bus = attached();
+        bus.deliver_all_to_bob();
+
+        // Alice and bob each attach a version, neither having seen the other's.
+        let alice_effects = bus
+            .alice
+            .add_asset_version(ENTRY, V1, meta(10), &mut rng(909), UnixSeconds::new(100))
+            .expect("alice attaches");
+        let bob_effects = bus
+            .bob
+            .add_asset_version(ENTRY, V2, meta(20), &mut rng(910), UnixSeconds::new(200))
+            .expect("bob attaches");
+
+        bus.queue_for_bob(alice_effects);
+        bus.queue_from_bob_to_alice(bob_effects);
+        bus.deliver_all_to_bob();
+        bus.deliver_all_to_alice();
+
+        let current = |state: &iroh_beekem_core::WorkspaceState| {
+            state
+                .asset_versions(ENTRY)
+                .into_iter()
+                .max_by_key(AssetVersion::precedence)
+                .map(|v| v.content)
+        };
+        assert_eq!(
+            current(&bus.alice),
+            current(&bus.bob),
+            "the two replicas disagree about which version of the asset is current"
+        );
+        assert_eq!(
+            bus.alice.asset_versions(ENTRY).len(),
+            2,
+            "a concurrent attach must not discard the other member's version"
+        );
+        assert_eq!(
+            bus.alice
+                .asset_versions(ENTRY)
+                .iter()
+                .map(|v| v.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 0],
+            "neither member had seen the other's attachment, so both must claim              the same sequence and be separated by the clock instead"
+        );
+    }
+
+    /// In an entry that has no such version, upon reverting to it, we expect a
+    /// refusal rather than a record pointing at bytes nobody has.
+    #[test]
+    fn reverting_to_a_version_the_entry_does_not_have_is_refused() {
+        let mut bus = attached();
+        let result = bus
+            .alice
+            .revert_asset(ENTRY, V1, &mut rng(911), UnixSeconds::new(100));
+        assert!(
+            matches!(result, Err(CoreError::UnknownVersion { .. })),
+            "reverting to an unknown version must say so rather than record a \
+             version whose segments do not exist, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn scratch_two_appends_with_delivery_between() {
+    let mut bus = two_node_workspace();
+    bus.alice_does(
+        Event::LocalEdit {
+            doc: DOC,
+            text: "keep this\n".into(),
+        },
+        950,
+    );
+    bus.deliver_all_to_bob();
+    eprintln!("AFTER FIRST bob={:?}", bus.bob.document_text(DOC));
+    bus.alice_does(
+        Event::LocalEdit {
+            doc: DOC,
+            text: "undo this\n".into(),
+        },
+        951,
+    );
+    bus.deliver_all_to_bob();
+    eprintln!(
+        "AFTER SECOND bob={:?} alice={:?} pending={}",
+        bus.bob.document_text(DOC),
+        bus.alice.document_text(DOC),
+        bus.bob.pending_len()
+    );
+}
+
 /// Roles were fully implemented in the manifest but had no caller: nothing
 /// consulted them before acting. These cover the enforcement points.
 mod roles_are_enforced {
@@ -552,7 +1580,7 @@ mod roles_are_enforced {
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
     };
 
-    use super::{DOC, rng, two_node_workspace};
+    use super::{DOC, T0, rng, two_node_workspace};
 
     #[test]
     fn the_founder_is_an_admin_and_a_joiner_is_not() {
@@ -594,7 +1622,7 @@ mod roles_are_enforced {
         // Bob has synced no manifest, so he holds no role at all.
         let result = bus
             .bob
-            .handle(Event::RemoveMember { member: alice_id }, &mut rng(9));
+            .handle(Event::RemoveMember { member: alice_id }, &mut rng(9), T0);
 
         assert!(
             matches!(result, Err(CoreError::NotAnAdmin)),
@@ -654,6 +1682,7 @@ mod roles_are_enforced {
                 role: Role::Editor,
             },
             &mut rng(60),
+            T0,
         );
         assert!(
             matches!(demote, Err(CoreError::LastAdmin)),
@@ -663,7 +1692,7 @@ mod roles_are_enforced {
 
         let remove = bus
             .alice
-            .handle(Event::RemoveMember { member: alice_id }, &mut rng(61));
+            .handle(Event::RemoveMember { member: alice_id }, &mut rng(61), T0);
         assert!(
             matches!(remove, Err(CoreError::LastAdmin)),
             "removing the only admin must be refused for the same reason, got {remove:?}"
@@ -697,11 +1726,15 @@ mod roles_are_enforced {
 
         // Bob is a certified editor, so his claim completes all three links.
         bus.bob
-            .handle(Event::AnnounceAuthor { author: bob_author }, &mut rng(70))
+            .handle(
+                Event::AnnounceAuthor { author: bob_author },
+                &mut rng(70),
+                T0,
+            )
             .expect("announcing your own author id needs no privilege");
         let claim = bus
             .bob
-            .handle(Event::ResyncManifest, &mut rng(71))
+            .handle(Event::ResyncManifest, &mut rng(71), T0)
             .expect("re-publishing the manifest needs no role");
         bus.queue_from_bob_to_alice(claim);
         bus.deliver_all_to_alice();
@@ -756,11 +1789,12 @@ mod roles_are_enforced {
                         text: "viewers may not write".into(),
                     },
                     &mut rng(80),
+                    T0,
                 ),
             ),
             (
                 "resync",
-                bus.bob.handle(Event::Resync { doc: DOC }, &mut rng(81)),
+                bus.bob.handle(Event::Resync { doc: DOC }, &mut rng(81), T0),
             ),
             (
                 "upsert",
@@ -774,6 +1808,7 @@ mod roles_are_enforced {
                         },
                     },
                     &mut rng(82),
+                    T0,
                 ),
             ),
             (
@@ -784,6 +1819,7 @@ mod roles_are_enforced {
                         path: "/renamed-by-viewer.md".into(),
                     },
                     &mut rng(83),
+                    T0,
                 ),
             ),
         ];
@@ -849,6 +1885,7 @@ mod roles_are_enforced {
                 text: "written before my certificates arrived".into(),
             },
             &mut rng(84),
+            T0,
         );
 
         assert!(
@@ -871,7 +1908,7 @@ mod roles_are_enforced {
 mod publishing_costs_the_edit_and_not_the_document {
     use iroh_beekem_core::{Chunk, Effect, Event, RepairTarget};
 
-    use super::{DOC, rng, two_node_workspace};
+    use super::{DOC, T0, rng, two_node_workspace};
 
     /// The chunk in a batch of effects, for the single-document publishes here.
     fn chunk_in(effects: &[Effect]) -> Option<Chunk> {
@@ -1133,6 +2170,7 @@ mod publishing_costs_the_edit_and_not_the_document {
                     text: " and bob's line".into(),
                 },
                 &mut rng(632),
+                T0,
             )
             .expect("bob writes as an editor");
         let bobs_chunk = chunk_in(&from_bob).expect("bob's edit publishes a chunk");
@@ -1163,7 +2201,7 @@ mod the_pending_queue_is_bounded {
     };
     use keyhive_crypto::{digest::Digest, siv::Siv, symmetric_key::SymmetricKey};
 
-    use super::{DOC, rng, two_node_workspace};
+    use super::{DOC, T0, rng, two_node_workspace};
 
     /// A syntactically valid chunk that no key in the workspace can open.
     ///
@@ -1200,6 +2238,7 @@ mod the_pending_queue_is_bounded {
                         chunk: Box::new(undecryptable_chunk(i as u64, 64)),
                     },
                     &mut rng(0),
+                    T0,
                 )
                 .expect("an undecryptable chunk parks rather than failing");
         }
@@ -1232,6 +2271,7 @@ mod the_pending_queue_is_bounded {
                         chunk: Box::new(undecryptable_chunk(i as u64, chunk_size)),
                     },
                     &mut rng(0),
+                    T0,
                 )
                 .expect("an undecryptable chunk parks rather than failing");
         }
@@ -1270,7 +2310,7 @@ mod repair_reaches_a_member_admitted_late {
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
     };
 
-    use super::{Bus, DOC, MemberId, rng};
+    use super::{Bus, DOC, MemberId, T0, rng};
 
     /// The text alice writes while she is still alone in the workspace.
     const EARLY: &str = "written before bob arrived";
@@ -1317,6 +2357,7 @@ mod repair_reaches_a_member_admitted_late {
                     text: EARLY.into(),
                 },
                 &mut rng(30),
+                T0,
             )
             .expect("alice writes while she is the only member");
         let stale = only_chunk(&effects);
@@ -1334,6 +2375,7 @@ mod repair_reaches_a_member_admitted_late {
                     endpoint: None,
                 },
                 &mut rng(31),
+                T0,
             )
             .expect("alice is an admin and may admit bob");
 
@@ -1527,6 +2569,7 @@ mod repair_reaches_a_member_admitted_late {
                 epoch: EpochId::of(&stale),
             },
             &mut rng(61),
+            T0,
         );
 
         assert!(
@@ -1663,7 +2706,7 @@ mod users_own_devices {
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
     };
 
-    use super::{rng, two_node_workspace};
+    use super::{T0, rng, two_node_workspace};
 
     #[test]
     fn a_device_acts_under_its_owners_role() {
@@ -1744,6 +2787,7 @@ mod users_own_devices {
                 endpoint: None,
             },
             &mut rng(312),
+            T0,
         );
 
         assert!(
@@ -1774,9 +2818,9 @@ mod users_own_devices {
         // Removing one of the sole admin's two devices must be allowed: the
         // user keeps administering the workspace from the other one. Guarding
         // on the leaf rather than the user would refuse this.
-        let removed = bus
-            .alice
-            .handle(Event::RemoveMember { member: laptop_id }, &mut rng(323));
+        let removed =
+            bus.alice
+                .handle(Event::RemoveMember { member: laptop_id }, &mut rng(323), T0);
         assert!(
             removed.is_ok(),
             "removing one device of a multi-device admin must be allowed, got {removed:?}"
@@ -1795,7 +2839,7 @@ mod users_own_devices {
 mod file_crud {
     use iroh_beekem_core::{CoreError, Effect, Event, FileEntry};
 
-    use super::{DOC, rng, two_node_workspace};
+    use super::{DOC, T0, rng, two_node_workspace};
 
     fn entry() -> FileEntry {
         FileEntry {
@@ -1919,7 +2963,7 @@ mod file_crud {
 
         let effects = bus
             .alice
-            .handle(Event::DeleteFile { doc: DOC }, &mut rng(432))
+            .handle(Event::DeleteFile { doc: DOC }, &mut rng(432), T0)
             .expect("alice may delete her own document");
 
         assert!(
@@ -1953,11 +2997,12 @@ mod file_crud {
                     text: "in flight".into(),
                 },
                 &mut rng(441),
+                T0,
             )
             .expect("bob writes");
 
         bus.alice
-            .handle(Event::DeleteFile { doc: DOC }, &mut rng(442))
+            .handle(Event::DeleteFile { doc: DOC }, &mut rng(442), T0)
             .expect("alice deletes");
 
         assert_eq!(
@@ -1977,7 +3022,7 @@ mod file_crud {
         let mut bus = two_node_workspace();
         let result = bus
             .alice
-            .handle(Event::DeleteFile { doc: DOC }, &mut rng(450));
+            .handle(Event::DeleteFile { doc: DOC }, &mut rng(450), T0);
         assert!(
             matches!(result, Err(CoreError::UnknownDocument)),
             "deleting a document that was never recorded should fail, got {result:?}"
@@ -2190,7 +3235,7 @@ mod removal_rotates_the_namespace {
 
         let effects = bus
             .alice
-            .handle(Event::RemoveMember { member: bob_id }, &mut rng(500))
+            .handle(Event::RemoveMember { member: bob_id }, &mut rng(500), T0)
             .expect("alice should be able to remove bob");
 
         let removal = effects
@@ -2271,6 +3316,7 @@ mod removal_rotates_the_namespace {
                     ticket: b"a capability alice minted".to_vec(),
                 },
                 &mut rng(520),
+                T0,
             )
             .expect("alice should encrypt a capability she minted");
         bus.queue_for_bob(effects);
@@ -2301,7 +3347,7 @@ mod removal_rotates_the_namespace {
 
         let effects = bus
             .alice
-            .handle(Event::RemoveMember { member: stranger }, &mut rng(531))
+            .handle(Event::RemoveMember { member: stranger }, &mut rng(531), T0)
             .expect("removing a non-member is not an error");
 
         assert!(
@@ -2382,7 +3428,7 @@ mod authorization_is_verified_by_the_receiver {
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
     };
 
-    use super::rng;
+    use super::{T0, rng};
 
     /// A founder, and one legitimately admitted member at a role of our choosing.
     ///
@@ -2423,6 +3469,7 @@ mod authorization_is_verified_by_the_receiver {
                     endpoint: None,
                 },
                 &mut rng(106),
+                T0,
             )
             .expect("alice is an admin and may admit bob");
 
@@ -2489,6 +3536,7 @@ mod authorization_is_verified_by_the_receiver {
         let outcome = ins.alice.handle(
             Event::ControlOp(AuthorizedOp::new(op, proof)),
             &mut rng(211),
+            T0,
         );
 
         assert!(
@@ -2533,6 +3581,7 @@ mod authorization_is_verified_by_the_receiver {
         let outcome = ins.alice.handle(
             Event::ControlOp(AuthorizedOp::new(op, proof)),
             &mut rng(221),
+            T0,
         );
 
         assert!(
@@ -2573,7 +3622,7 @@ mod authorization_is_verified_by_the_receiver {
         .expect("signing is infallible with a memory signer");
 
         ins.alice
-            .handle(Event::CertsArrived(vec![promotion]), &mut rng(230))
+            .handle(Event::CertsArrived(vec![promotion]), &mut rng(230), T0)
             .expect("a validly signed certificate is absorbed even when it grants nothing");
 
         assert_eq!(
@@ -2612,6 +3661,7 @@ mod authorization_is_verified_by_the_receiver {
                     endpoint: None,
                 },
                 &mut rng(241),
+                T0,
             )
             .expect("alice admits carol");
         let stolen: Vec<Certificate> = effects
@@ -2637,6 +3687,7 @@ mod authorization_is_verified_by_the_receiver {
         let outcome = fresh.alice.handle(
             Event::ControlOp(AuthorizedOp::new(op, stolen)),
             &mut rng(243),
+            T0,
         );
 
         assert!(
@@ -2685,6 +3736,7 @@ mod authorization_is_verified_by_the_receiver {
             .handle(
                 Event::ControlOp(AuthorizedOp::new(op, proof)),
                 &mut rng(251),
+                T0,
             )
             .expect("a member may enrol a further device of its own user");
 
@@ -2721,7 +3773,7 @@ mod authorization_is_verified_by_the_receiver {
         let mut ins = insider_workspace(Role::Admin);
         let bob_id = ins.bob_id;
         ins.alice
-            .handle(Event::RemoveMember { member: bob_id }, &mut rng(260))
+            .handle(Event::RemoveMember { member: bob_id }, &mut rng(260), T0)
             .expect("alice removes bob");
 
         // Bob's controller never saw the removal, so what it mints names
@@ -2744,6 +3796,7 @@ mod authorization_is_verified_by_the_receiver {
             .handle(
                 Event::ControlOp(AuthorizedOp::new(op, proof)),
                 &mut rng(262),
+                T0,
             )
             .expect("the splice is accepted rather than refused, by design");
 
@@ -2769,7 +3822,7 @@ mod authorization_is_verified_by_the_receiver {
         let mut ins = insider_workspace(Role::Viewer);
         let bob_id = ins.bob_id;
         ins.alice
-            .handle(Event::RemoveMember { member: bob_id }, &mut rng(270))
+            .handle(Event::RemoveMember { member: bob_id }, &mut rng(270), T0)
             .expect("alice removes bob");
 
         let (mallory, mallory_secret) = stranger(271);
@@ -2789,6 +3842,7 @@ mod authorization_is_verified_by_the_receiver {
         let _ = ins.alice.handle(
             Event::ControlOp(AuthorizedOp::new(op, proof)),
             &mut rng(272),
+            T0,
         );
 
         assert_ne!(
@@ -2831,6 +3885,7 @@ mod authorization_is_verified_by_the_receiver {
                     endpoint: None,
                 },
                 &mut rng(281),
+                T0,
             )
             .expect("alice admits carol");
         let mut certs: Vec<Certificate> = effects
@@ -2877,7 +3932,9 @@ mod a_snapshot_restores_the_whole_node {
     use iroh_beekem_core::{Chunk, FileEntry, WorkspaceInfo};
     use proptest::prelude::*;
 
-    use super::{Bus, DOC, Effect, Event, MemberId, Role, WorkspaceState, rng, two_node_workspace};
+    use super::{
+        Bus, DOC, Effect, Event, MemberId, Role, T0, WorkspaceState, rng, two_node_workspace,
+    };
 
     /// A second document, so a history can exercise more than one CRDT.
     const OTHER: iroh_beekem_core::DocumentUuid = iroh_beekem_core::DocumentUuid([7u8; 16]);
@@ -2936,6 +3993,7 @@ mod a_snapshot_restores_the_whole_node {
     /// legitimate refusal, and a generator that could not produce refusals would
     /// only ever snapshot states reached by a happy path.
     fn replay(bus: &mut Bus, steps: &[Step]) {
+        eprintln!("CASE {steps:?}");
         for (i, s) in steps.iter().enumerate() {
             let seed = 9000 + i as u64;
             let event = match s.clone() {
@@ -2975,7 +4033,10 @@ mod a_snapshot_restores_the_whole_node {
                 Step::DisplayName { name } => Event::SetDisplayName { display_name: name },
                 Step::Rotate => Event::Rotate,
             };
-            let effects = bus.alice.handle(event, &mut rng(seed)).unwrap_or_default();
+            let effects = bus
+                .alice
+                .handle(event, &mut rng(seed), T0)
+                .unwrap_or_default();
             bus.queue_for_bob(effects);
         }
         bus.deliver_all_to_bob();
@@ -3110,7 +4171,7 @@ mod a_snapshot_restores_the_whole_node {
         let bytes = bus.alice.export().expect("alice can be exported");
         let mut restored = WorkspaceState::import(&bytes).expect("alice can be imported");
         let after_restart = restored
-            .handle(Event::Resync { doc: DOC }, &mut rng(712))
+            .handle(Event::Resync { doc: DOC }, &mut rng(712), T0)
             .expect("a restored node handles a resync");
 
         assert!(
@@ -3175,6 +4236,7 @@ mod a_snapshot_restores_the_whole_node {
                     chunk: Box::new(chunk),
                 },
                 &mut rng(702),
+                T0,
             )
             .expect("the restored node accepts the chunk");
 
@@ -3212,7 +4274,7 @@ mod a_snapshot_restores_the_whole_node {
             "the founder's self-signed admin grant did not survive the round trip"
         );
         let effects = restored
-            .handle(Event::RemoveMember { member: bob }, &mut rng(710))
+            .handle(Event::RemoveMember { member: bob }, &mut rng(710), T0)
             .expect("a restored admin may still remove a member");
         assert!(
             effects
@@ -3228,7 +4290,7 @@ mod a_snapshot_restores_the_whole_node {
 /// it. The two differ in exactly three respects, and all three are asserted here
 /// because each one is silent if it regresses.
 mod a_member_can_walk_away {
-    use super::{Effect, Event, Role, rng, two_node_workspace};
+    use super::{Effect, Event, Role, T0, rng, two_node_workspace};
 
     /// In a two-member workspace, upon a non-admin member leaving, we expect its
     /// leaf to be retracted on the admin's node.
@@ -3248,7 +4310,7 @@ mod a_member_can_walk_away {
             "this test is only meaningful if bob cannot administer"
         );
 
-        let effects = bus.bob.handle(Event::Leave, &mut rng(800)).expect(
+        let effects = bus.bob.handle(Event::Leave, &mut rng(800), T0).expect(
             "a member that cannot administer must still be able to leave; refusing \
              would trap every viewer in every workspace they were ever invited to",
         );
@@ -3276,7 +4338,7 @@ mod a_member_can_walk_away {
         let mut bus = two_node_workspace();
         let effects = bus
             .bob
-            .handle(Event::Leave, &mut rng(801))
+            .handle(Event::Leave, &mut rng(801), T0)
             .expect("bob leaves");
 
         assert!(
@@ -3306,7 +4368,7 @@ mod a_member_can_walk_away {
         let mut bus = two_node_workspace();
         let err = bus
             .alice
-            .handle(Event::Leave, &mut rng(802))
+            .handle(Event::Leave, &mut rng(802), T0)
             .expect_err("the only admin must not be able to strand the workspace");
         assert!(
             matches!(err, iroh_beekem_core::CoreError::LastAdmin),
@@ -3347,6 +4409,7 @@ mod a_member_can_walk_away {
                     endpoint: None,
                 },
                 &mut rng(805),
+                T0,
             )
             .expect("bob enrols a second device of his own");
         bus.queue_from_bob_to_alice(effects);
@@ -3360,7 +4423,7 @@ mod a_member_can_walk_away {
 
         let effects = bus
             .bob
-            .handle(Event::Leave, &mut rng(806))
+            .handle(Event::Leave, &mut rng(806), T0)
             .expect("bob leaves with both devices");
         bus.queue_from_bob_to_alice(effects);
         bus.deliver_all_to_alice();
@@ -3390,7 +4453,7 @@ mod an_action_needs_a_quorum {
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
     };
 
-    use super::rng;
+    use super::{T0, rng};
 
     /// A three-member workspace founded at a threshold of two.
     ///
@@ -3430,6 +4493,7 @@ mod an_action_needs_a_quorum {
                     endpoint: None,
                 },
                 &mut rng(21),
+                T0,
             )
             .expect("the founder may appoint an admin alone");
         let carol_secret = ShareSecretKey::generate(&mut rng(30));
@@ -3443,6 +4507,7 @@ mod an_action_needs_a_quorum {
                     endpoint: None,
                 },
                 &mut rng(31),
+                T0,
             )
             .expect("the founder admits carol");
 
@@ -3486,7 +4551,7 @@ mod an_action_needs_a_quorum {
         let mut q = two_of_two();
         let err = q
             .alice
-            .handle(Event::RemoveMember { member: q.carol }, &mut rng(100))
+            .handle(Event::RemoveMember { member: q.carol }, &mut rng(100), T0)
             .expect_err("one admin is not a quorum of two");
         assert!(
             matches!(err, CoreError::QuorumRequired { .. }),
@@ -3516,6 +4581,7 @@ mod an_action_needs_a_quorum {
                     expires: None,
                 },
                 &mut rng(110),
+                T0,
             )
             .expect("an admin may propose");
         let digest = proposal_digest(&effects);
@@ -3523,7 +4589,7 @@ mod an_action_needs_a_quorum {
 
         let effects = q
             .alice
-            .handle(Event::Approve { proposal: digest }, &mut rng(111))
+            .handle(Event::Approve { proposal: digest }, &mut rng(111), T0)
             .expect("alice approves");
         wire.extend(certs_of(&effects));
         assert!(
@@ -3533,11 +4599,11 @@ mod an_action_needs_a_quorum {
 
         // Bob learns of the proposal and adds the second approval.
         q.bob
-            .handle(Event::CertsArrived(wire), &mut rng(112))
+            .handle(Event::CertsArrived(wire), &mut rng(112), T0)
             .expect("bob absorbs the proposal and alice's approval");
         let effects = q
             .bob
-            .handle(Event::Approve { proposal: digest }, &mut rng(113))
+            .handle(Event::Approve { proposal: digest }, &mut rng(113), T0)
             .expect("bob approves");
 
         assert!(
@@ -3563,7 +4629,7 @@ mod an_action_needs_a_quorum {
             })
             .expect("performing a removal broadcasts the operation");
         q.alice
-            .handle(Event::ControlOp(op), &mut rng(114))
+            .handle(Event::ControlOp(op), &mut rng(114), T0)
             .expect("alice accepts a removal a quorum authorised");
         assert_eq!(
             q.alice.group_size(),
@@ -3597,6 +4663,7 @@ mod an_action_needs_a_quorum {
                     endpoint: None,
                 },
                 &mut rng(42),
+                T0,
             )
             .expect_err("only the founder may appoint an admin alone");
         assert!(
@@ -3617,7 +4684,7 @@ mod an_action_needs_a_quorum {
         let mut q = two_of_two();
         let effects = q
             .bob
-            .handle(Event::Leave, &mut rng(120))
+            .handle(Event::Leave, &mut rng(120), T0)
             .expect("a member may always leave");
         assert!(
             effects
@@ -3636,7 +4703,7 @@ mod an_action_needs_a_quorum {
             })
             .expect("a departure broadcasts its removal");
         q.alice
-            .handle(Event::ControlOp(op), &mut rng(121))
+            .handle(Event::ControlOp(op), &mut rng(121), T0)
             .expect("alice accepts a self-removal");
         assert_eq!(
             q.alice.group_size(),

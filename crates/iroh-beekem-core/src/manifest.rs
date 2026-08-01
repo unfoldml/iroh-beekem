@@ -69,7 +69,12 @@ use std::fmt::Write as _;
 
 use loro::{ExportMode, LoroDoc, LoroMap};
 
-use crate::{asset::AssetMeta, blinding::DocumentUuid, error::CoreError};
+use crate::{
+    asset::AssetMeta,
+    blinding::DocumentUuid,
+    error::CoreError,
+    version::{AssetVersion, Checkpoint, UnixSeconds},
+};
 
 /// Root container holding document metadata, keyed by hex document UUID.
 const FILES_CONTAINER: &str = "files";
@@ -101,6 +106,23 @@ const META_CONTAINER: &str = "meta";
 /// safe precisely because it grants nothing: the entry is still worthless
 /// unless an *admin* separately assigned that member a writing role.
 const AUTHORS_CONTAINER: &str = "authors";
+
+/// Root container holding checkpoints, keyed by hex digest of the record.
+///
+/// Keyed by digest rather than by name so that two members who tag `v1.0` while
+/// partitioned both keep their record: a name key would have Loro's own ordering
+/// pick a winner, which is a fact about operation ids rather than about what
+/// anybody did. [`Manifest::checkpoint_named`] resolves a name to a record by
+/// `(at, digest)`, which is a pure function of the values and so agrees on every
+/// replica. See [`Checkpoint::digest`](crate::version::Checkpoint::digest).
+const CHECKPOINTS_CONTAINER: &str = "checkpoints";
+
+/// Prefix of the fields inside one file's record that hold its asset versions.
+///
+/// One field per version, named after the record's digest; see
+/// [`Manifest::add_asset_version`] for why not a list, and
+/// [`AssetVersion::digest`] for why not the content UUID.
+const VERSION_PREFIX: &str = "version:";
 
 /// One person in the workspace.
 ///
@@ -271,6 +293,10 @@ impl Manifest {
 
     fn devices_map(&self) -> LoroMap {
         self.doc.get_map(DEVICES_CONTAINER)
+    }
+
+    fn checkpoints_map(&self) -> LoroMap {
+        self.doc.get_map(CHECKPOINTS_CONTAINER)
     }
 
     fn meta_map(&self) -> LoroMap {
@@ -474,17 +500,158 @@ impl Manifest {
             .and_then(|b| <[u8; 32]>::try_from(b).ok())
     }
 
+    /// This entry's record, created empty if it does not exist yet.
+    ///
+    /// Reused rather than replaced, which matters more than it looks. Inserting a
+    /// *fresh* container for an entry that already has one discards whatever is
+    /// inside it — a peer's concurrent rename, and now an asset's whole version
+    /// list — and does so silently, because replacing a container is a perfectly
+    /// well-defined CRDT operation that simply wins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Manifest`] if the Loro write fails, or if the existing
+    /// record is not a map — which only a peer writing nonsense into the manifest
+    /// can produce.
+    fn file_node(&self, uuid: DocumentUuid) -> Result<LoroMap, CoreError> {
+        let files = self.files_map();
+        let key = hex(&uuid.0);
+        match files.get(&key).and_then(|v| v.into_container().ok()) {
+            Some(existing) => existing
+                .into_map()
+                .map_err(|_| CoreError::Manifest("files entry is not a map".into())),
+            None => files
+                .insert_container(&key, LoroMap::new())
+                .map_err(|e| CoreError::Manifest(e.to_string())),
+        }
+    }
+
+    /// Add a version to an asset entry's history.
+    ///
+    /// Recorded as **one map key per version**, named after the record's own
+    /// digest, rather than as a list or as one encoded vector. Both alternatives
+    /// lose data under exactly the case this feature exists for. A single encoded
+    /// field is last-writer-wins, so two members attaching while partitioned keep
+    /// one version and leave the other's segments indexed forever with nothing
+    /// naming them. A nested list is no better in practice: whoever writes the
+    /// first version *creates* the list container, two replicas doing that
+    /// concurrently create two containers, and the map keeps one of them —
+    /// discarding a whole history rather than one record.
+    ///
+    /// Independent keys merge with no such race, and writing one version twice is
+    /// idempotent because both the key and the value derive from the record.
+    /// Order is not carried by the container at all; it is computed from the
+    /// values by [`AssetVersion::precedence`].
+    ///
+    /// The record itself is one postcard-encoded hex string, following what
+    /// [`Self::upsert_file`] does for an asset's metadata and for the same reason:
+    /// its fields move together or not at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::UnknownDocument`] if no such entry is recorded — a
+    /// version of a file the manifest has never heard of would be indexed content
+    /// nothing names — [`CoreError::Serialization`] if the record cannot be
+    /// encoded, and [`CoreError::Manifest`] if the Loro write fails.
+    pub fn add_asset_version(
+        &self,
+        uuid: DocumentUuid,
+        version: &AssetVersion,
+    ) -> Result<(), CoreError> {
+        if self.files_map().get(&hex(&uuid.0)).is_none() {
+            return Err(CoreError::UnknownDocument);
+        }
+        let node = self.file_node(uuid)?;
+        let encoded = postcard::to_stdvec(version)?;
+        node.insert(
+            &format!("{VERSION_PREFIX}{}", hex(&version.digest())),
+            hex(&encoded).as_str(),
+        )
+        .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Every version recorded for one asset entry, oldest first by precedence.
+    ///
+    /// Empty for a document, and empty for an asset attached before versioning
+    /// existed — [`Self::files`] reads that older shape and reports it as a single
+    /// version, so callers see one history rather than two cases.
+    #[must_use]
+    pub fn asset_versions(&self, uuid: DocumentUuid) -> Vec<AssetVersion> {
+        let mut out = self.recorded_versions(uuid);
+        if out.is_empty() {
+            // The pre-versioning shape: metadata in the `asset` field, segments
+            // under the entry's own UUID. Presented as the one version it is.
+            out = self
+                .legacy_asset(uuid)
+                .map(|meta| {
+                    vec![AssetVersion {
+                        content: uuid,
+                        meta,
+                        // Nothing recorded who attached it or when; inventing
+                        // either would be a claim this replica has no basis for.
+                        author: [0u8; 32],
+                        at: UnixSeconds::EPOCH,
+                        // Lowest, so any version attached since supersedes it —
+                        // which is right, because this shape only exists for an
+                        // asset written before versions did.
+                        seq: 0,
+                    }]
+                })
+                .unwrap_or_default();
+        } else {
+            // Versioned already.
+        }
+        out.sort_by_key(AssetVersion::precedence);
+        out
+    }
+
+    /// The version list as recorded, unsorted and without the legacy fallback.
+    fn recorded_versions(&self, uuid: DocumentUuid) -> Vec<AssetVersion> {
+        let Some(node) = self
+            .files_map()
+            .get(&hex(&uuid.0))
+            .and_then(|v| v.into_container().ok())
+            .and_then(|c| c.into_map().ok())
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        node.for_each(|key, value| {
+            if !key.starts_with(VERSION_PREFIX) {
+                // One of the entry's ordinary fields: path, mime type, metadata.
+                return;
+            }
+            let decoded = value
+                .into_value()
+                .ok()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| unhex(&s))
+                .and_then(|bytes| postcard::from_bytes::<AssetVersion>(&bytes).ok());
+            if let Some(version) = decoded {
+                out.push(version);
+            } else {
+                // An unreadable record degrades to a missing version rather than
+                // an unreadable history, exactly as a bad `asset` field does.
+            }
+        });
+        out
+    }
+
+    /// The `asset` field as written before version lists existed.
+    fn legacy_asset(&self, uuid: DocumentUuid) -> Option<AssetMeta> {
+        let raw = Self::nested_field(&self.files_map(), &hex(&uuid.0), "asset")?;
+        unhex(&raw).and_then(|bytes| postcard::from_bytes::<AssetMeta>(&bytes).ok())
+    }
+
     /// Record or replace a document's metadata.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::Manifest`] if the Loro write fails.
     pub fn upsert_file(&self, entry: &FileEntry) -> Result<(), CoreError> {
-        let files = self.files_map();
-        let key = hex(&entry.uuid.0);
-        let node = files
-            .insert_container(&key, LoroMap::new())
-            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        let node = self.file_node(entry.uuid)?;
         node.insert("logical_path", entry.logical_path.as_str())
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
         node.insert("mime_type", entry.mime_type.as_str())
@@ -577,19 +744,29 @@ impl Manifest {
                     .map(|s| s.to_string())
                     .unwrap_or_default()
             };
-            // An unreadable `asset` field reads as `None`, i.e. as a document.
+            // The version list is authoritative where there is one, so that
+            // `asset` and `asset_versions` cannot disagree about which version an
+            // entry is on. The `asset` field is what an entry written before
+            // versioning looks like, and is read only when no list exists.
+            //
+            // An unreadable field or record reads as `None`, i.e. as a document.
             // The alternative is dropping the entry, which would hide a file
             // from its owner because somebody else wrote nonsense into a field
             // any member can write — the manifest holds claims, and a bad claim
             // must degrade rather than delete.
-            let asset = {
-                let raw = get("asset");
-                if raw.is_empty() {
-                    None
-                } else {
-                    unhex(&raw).and_then(|bytes| postcard::from_bytes::<AssetMeta>(&bytes).ok())
-                }
-            };
+            let asset = self
+                .recorded_versions(DocumentUuid(uuid))
+                .into_iter()
+                .max_by_key(AssetVersion::precedence)
+                .map(|current| current.meta)
+                .or_else(|| {
+                    let raw = get("asset");
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        unhex(&raw).and_then(|bytes| postcard::from_bytes::<AssetMeta>(&bytes).ok())
+                    }
+                });
             out.push(FileEntry {
                 uuid: DocumentUuid(uuid),
                 logical_path: get("logical_path"),
@@ -607,6 +784,74 @@ impl Manifest {
             .into_iter()
             .find(|f| f.logical_path == path)
             .map(|f| f.uuid)
+    }
+
+    /// Record a checkpoint, keyed by its own digest.
+    ///
+    /// Stored as one postcard-encoded hex string rather than as a nested map, for
+    /// the reason [`Self::upsert_file`] encodes an asset that way: the fields move
+    /// together or not at all. A checkpoint whose entry list converged without its
+    /// name, or whose name converged against somebody else's entry list, would
+    /// name a state nobody ever took.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Serialization`] if the record cannot be encoded, or
+    /// [`CoreError::Manifest`] if the Loro write fails.
+    pub fn add_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), CoreError> {
+        let encoded = postcard::to_stdvec(checkpoint)?;
+        self.checkpoints_map()
+            .insert(&hex(&checkpoint.digest()), hex(&encoded).as_str())
+            .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        self.doc.commit();
+        Ok(())
+    }
+
+    /// Every checkpoint recorded, newest first.
+    ///
+    /// Ordered by `(at, digest)` — a total order over the *values*, so two
+    /// replicas holding the same records list them identically whatever order
+    /// they merged in. A record that does not decode is skipped: the container is
+    /// writable by any member, so nonsense in it must cost one missing entry
+    /// rather than an unreadable list.
+    #[must_use]
+    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+        let mut out: Vec<Checkpoint> = Vec::new();
+        self.checkpoints_map().for_each(|_, value| {
+            let decoded = value
+                .into_value()
+                .ok()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| unhex(&s))
+                .and_then(|bytes| postcard::from_bytes::<Checkpoint>(&bytes).ok());
+            if let Some(checkpoint) = decoded {
+                out.push(checkpoint);
+            } else {
+                // Not a checkpoint this replica can read; see above.
+            }
+        });
+        out.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.digest().cmp(&a.digest())));
+        out
+    }
+
+    /// The checkpoint a name refers to: the most recent, ties broken by digest.
+    ///
+    /// A name is not unique — see [`CHECKPOINTS_CONTAINER`] — so this states which
+    /// of several a name resolves to rather than leaving it to iteration order.
+    /// A caller that needs to see the others calls [`Self::checkpoints`].
+    #[must_use]
+    pub fn checkpoint_named(&self, name: &str) -> Option<Checkpoint> {
+        self.checkpoints()
+            .into_iter()
+            .find(|checkpoint| checkpoint.name == name)
+    }
+
+    /// The checkpoint with this digest, if this replica holds it.
+    #[must_use]
+    pub fn checkpoint(&self, digest: &[u8; 32]) -> Option<Checkpoint> {
+        self.checkpoints()
+            .into_iter()
+            .find(|checkpoint| checkpoint.digest() == *digest)
     }
 
     /// Export the full manifest state, for a peer joining from scratch.
@@ -636,7 +881,7 @@ impl Manifest {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileEntry, Manifest};
+    use super::{AssetMeta, FileEntry, Manifest};
     use crate::blinding::DocumentUuid;
 
     fn entry(uuid: u8, path: &str) -> FileEntry {
@@ -646,6 +891,59 @@ mod tests {
             mime_type: "application/json".to_string(),
             asset: None,
         }
+    }
+
+    /// In an entry written before version lists existed, upon reading its
+    /// versions, we expect the one version it is — under the entry's own UUID.
+    ///
+    /// The older shape put an asset's metadata in an `asset` field and its
+    /// segments under the entry's UUID. Reading it as *no* versions would make
+    /// such an asset invisible to every caller that now goes through the version
+    /// list: unreadable, unexportable, and — worse — its segments would be left
+    /// indexed when the entry was deleted, since deletion withdraws the key space
+    /// of each version it can see.
+    #[test]
+    fn an_asset_written_before_versions_reads_as_a_single_version() {
+        let uuid = DocumentUuid([4u8; 16]);
+        let meta = AssetMeta {
+            size: 10,
+            segments: 1,
+            segment_bytes: 1024,
+            content_hash: [7u8; 32],
+        };
+        let m = Manifest::new();
+        m.upsert_file(&FileEntry {
+            uuid,
+            logical_path: "/old.bin".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            asset: Some(meta),
+        })
+        .unwrap();
+
+        let versions = m.asset_versions(uuid);
+        assert_eq!(
+            versions.len(),
+            1,
+            "an asset written before versions existed must present as one version"
+        );
+        assert_eq!(
+            versions[0].content, uuid,
+            "its segments are under the entry's own UUID, so that is the key space \
+             a reader and a deletion must both use"
+        );
+        assert_eq!(
+            versions[0].meta, meta,
+            "the recorded shape must survive being read through the version list"
+        );
+        assert_eq!(
+            m.files()
+                .into_iter()
+                .find(|e| e.uuid == uuid)
+                .unwrap()
+                .asset,
+            Some(meta),
+            "and it must still look like an asset to a caller reading the index"
+        );
     }
 
     #[test]

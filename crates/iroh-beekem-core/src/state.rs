@@ -43,20 +43,21 @@ use beekem::{
     operation::CgkaOperation,
 };
 use keyhive_crypto::{share_key::ShareKey, signed::Signed};
-use loro::{ExportMode, LoroDoc};
+use loro::{CommitOptions, ExportMode, Frontiers, LoroDoc};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
-    asset::AssetKey,
+    asset::{AssetKey, AssetMeta},
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
     capability::{AdminAction, CapabilityStore, Certificate, DEFAULT_THRESHOLD, Role},
     content::{Chunk, ChunkRef},
     error::CoreError,
     keys::{AuthorizedOp, CgkaController, DecryptOutcome, EpochId, MergeOutcome},
-    manifest::{DeviceRecord, FileEntry, Manifest, WorkspaceInfo},
+    manifest::{DeviceRecord, FileEntry, Manifest, WorkspaceInfo, hex},
     snapshot::{SNAPSHOT_VERSION, WorkspaceSnapshot, member_from_bytes},
+    version::{AssetVersion, Checkpoint, RestoreOutcome, UnixSeconds, VersionId, VersionInfo},
 };
 
 /// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
@@ -243,6 +244,26 @@ pub enum Event {
         pos: usize,
         /// How many characters to delete, clamped to what remains.
         len: usize,
+    },
+    /// The local user put a document back the way it was at an earlier version.
+    ///
+    /// Applied as a **new edit going forward**, never as a rewrite of history:
+    /// Loro is asked for the operations that undo everything since that version,
+    /// and those are committed and published like any other edit. Two properties
+    /// follow, and both are the reason it is done this way. It converges with a
+    /// member editing concurrently — their work is not silently discarded, it
+    /// merges with the revert exactly as two ordinary edits would. And every
+    /// version stays listed afterwards, including the ones reverted away, so a
+    /// revert can itself be reverted.
+    ///
+    /// The alternative — dropping the operations after that point — is not
+    /// available at all in a group: a peer that had already merged them would
+    /// keep them, and the two replicas would never agree again.
+    RevertDocument {
+        /// Which document to put back.
+        doc: DocumentUuid,
+        /// The state to restore, from [`WorkspaceState::document_versions`].
+        to: VersionId,
     },
     /// The local user deleted a document.
     ///
@@ -779,6 +800,15 @@ const MAX_DEP_WAIT_DRAINS: u32 = 8;
 /// bounds how long a peer that never speaks up stays behind.
 const FULL_PUBLISH_EVERY: u32 = 16;
 
+/// The container inside a document mapping hex Loro peer id to hex member id.
+///
+/// Lives in the document rather than in the manifest because it describes that
+/// document's own history, and a version listing must be answerable from the
+/// replica alone — a peer that has the document but not yet the manifest can
+/// still say who wrote what. See [`claim_authorship`] for why the mapping is
+/// recorded at all rather than derived.
+const DOC_AUTHORS_CONTAINER: &str = "authors";
+
 /// One node's complete workspace state.
 pub struct WorkspaceState {
     cgka: CgkaController,
@@ -903,7 +933,7 @@ impl Clone for WorkspaceState {
             .map(|(uuid, doc)| {
                 let copy = snapshot_doc(doc)
                     .and_then(|bytes| restore_doc(&bytes))
-                    .unwrap_or_else(|_| LoroDoc::new());
+                    .unwrap_or_else(|_| new_doc());
                 (*uuid, copy)
             })
             .collect();
@@ -1479,6 +1509,158 @@ impl WorkspaceState {
             .map_or_else(String::new, |d| d.get_text("content").to_string())
     }
 
+    /// Which documents are holding chunks that could not be applied yet.
+    ///
+    /// A backend needs this because *delivered* and *applied* are different
+    /// facts, and a transport that caches what it has delivered will otherwise
+    /// stop re-offering a chunk that never applied. That matters here in a way it
+    /// does not for a chunk awaiting key material: the control plane pushes key
+    /// material on its own, but a chunk awaiting *dependencies* is only ever
+    /// rescued by the [`RepairTarget::DocumentHistory`] request that
+    /// [`Self::handle`] raises after enough retries — and a retry only happens
+    /// when something re-offers the chunk. Cache it as seen and the retries never
+    /// come, so neither does the repair, and the edit is missing on that peer for
+    /// good.
+    ///
+    /// Deduplicated, and in arbitrary order: this answers "which documents should
+    /// be re-offered", not "how much is stuck".
+    #[must_use]
+    pub fn pending_docs(&self) -> Vec<DocumentUuid> {
+        let mut docs: Vec<DocumentUuid> = self
+            .pending_chunks
+            .iter()
+            .map(|parked| parked.doc)
+            .collect();
+        docs.sort_unstable();
+        docs.dedup();
+        docs
+    }
+
+    /// Everything this replica knows about how a document reached its current
+    /// state, oldest change first.
+    ///
+    /// Empty for a document this node does not hold, which is the same answer
+    /// [`Self::document_text`] gives and for the same reason: not holding a
+    /// document is an ordinary condition on a peer that has not synced it, not a
+    /// fault to report.
+    ///
+    /// The list is this *replica's* history and not the group's. A member admitted
+    /// yesterday sees everything a full export carried to it, which in practice is
+    /// the whole history — see [`Extent::Full`] — but a peer that has only ever
+    /// received deltas sees from where it joined. Two members may therefore list
+    /// different lengths and neither is wrong.
+    #[must_use]
+    pub fn document_versions(&self, doc: DocumentUuid) -> Vec<VersionInfo> {
+        let Some(loro) = self.docs.get(&doc) else {
+            return Vec::new();
+        };
+        let authors = Self::claimed_authors(loro);
+
+        let heads = loro.oplog_frontiers().to_vec();
+        let mut changes: Vec<loro::ChangeMeta> = Vec::new();
+        // Walking back from the heads visits every change that is an ancestor of
+        // the current state, which is the whole graph — a change with no
+        // descendant *is* a head. An error here means a head named an id the
+        // oplog does not hold, which is not something a caller can act on, so the
+        // walk keeps whatever it collected.
+        let _ = loro.travel_change_ancestors(&heads, &mut |meta| {
+            changes.push(meta);
+            std::ops::ControlFlow::Continue(())
+        });
+        // `ChangeMeta`'s own order: by the lamport of the change's *end*, then by
+        // peer. Causal order where there is one, and a stable tie-break where
+        // there is not — two concurrent changes have no true order, and inventing
+        // one that varied between replicas would make two members disagree about
+        // what their shared history looks like.
+        changes.sort_unstable();
+
+        changes
+            .into_iter()
+            .map(|meta| {
+                // A change spans `len` operations from its first id, so the state
+                // *after* it is named by the last of them.
+                // Saturating, so a document with an implausibly long history
+                // names its last operation rather than wrapping into a counter
+                // that belongs to somebody else's change.
+                let span = i32::try_from(meta.len).unwrap_or(i32::MAX);
+                let last = loro::ID::new(
+                    meta.id.peer,
+                    meta.id.counter.saturating_add(span).saturating_sub(1),
+                );
+                VersionInfo {
+                    id: VersionId::from_frontiers(&Frontiers::from_id(last)),
+                    author: authors.get(&meta.id.peer).copied(),
+                    at: UnixSeconds::new(meta.timestamp),
+                    ops: meta.len,
+                }
+            })
+            .collect()
+    }
+
+    /// The state this replica's copy of a document is in right now.
+    ///
+    /// `None` for a document this node does not hold. What a checkpoint records,
+    /// and what a caller compares against to ask whether a version is current.
+    #[must_use]
+    pub fn document_version(&self, doc: DocumentUuid) -> Option<VersionId> {
+        self.docs
+            .get(&doc)
+            .map(|loro| VersionId::from_frontiers(&loro.oplog_frontiers()))
+    }
+
+    /// A document's text as it stood at `version`.
+    ///
+    /// Reads through a fork rather than by checking the live document out. The
+    /// difference is not stylistic: a checkout *detaches* the replica the data
+    /// plane is concurrently importing chunks into, and a detached replica that
+    /// takes an import is a defect that will not reproduce on demand. A fork is a
+    /// separate document that is dropped when this returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::UnknownDocument`] if this node holds no such document,
+    /// and [`CoreError::UnknownVersion`] if the id is malformed or names a state
+    /// this replica has not merged.
+    pub fn document_text_at(
+        &self,
+        doc: DocumentUuid,
+        version: &VersionId,
+    ) -> Result<String, CoreError> {
+        let loro = self.docs.get(&doc).ok_or(CoreError::UnknownDocument)?;
+        let frontiers = version.to_frontiers()?;
+        let at = loro
+            .fork_at(&frontiers)
+            .map_err(|_| CoreError::UnknownVersion {
+                version: version.to_string(),
+            })?;
+        Ok(at.get_text("content").to_string())
+    }
+
+    /// The peer-id-to-member claims recorded inside one document.
+    ///
+    /// See [`claim_authorship`] for what these are and why they are claims. A
+    /// record that is not a pair of hex keys is skipped rather than reported: the
+    /// container is writable by any member, so a bad entry means somebody wrote
+    /// nonsense, and the answer to that is an unattributed change rather than a
+    /// failed listing.
+    fn claimed_authors(loro: &LoroDoc) -> HashMap<u64, [u8; 32]> {
+        let mut out = HashMap::new();
+        loro.get_map(DOC_AUTHORS_CONTAINER).for_each(|key, value| {
+            let peer = unhex_u64(key);
+            let member = value
+                .into_value()
+                .ok()
+                .and_then(|v| v.into_string().ok())
+                .and_then(|s| unhex_member(&s));
+            if let (Some(peer), Some(member)) = (peer, member) {
+                out.insert(peer, member);
+            } else {
+                // Not a claim this replica can use; see above.
+            }
+        });
+        out
+    }
+
     /// The complete CGKA operation log, for inviting a new member.
     ///
     /// # Errors
@@ -1490,6 +1672,14 @@ impl WorkspaceState {
 
     /// Handle one event, returning the effects the caller must perform.
     ///
+    /// `now` is the wall-clock instant the caller is acting at, and it is a
+    /// parameter rather than something read here because this crate has no clock:
+    /// the simulator drives the same state machine with virtual time, and a
+    /// version history dated from `SystemTime::now` would be unreproducible under
+    /// a seed. It reaches Loro as the timestamp on the change a content edit
+    /// commits, and the manifest as the date on a checkpoint. Events that write
+    /// no history ignore it.
+    ///
     /// # Errors
     ///
     /// Propagates CGKA, AEAD and CRDT failures. Note that an out-of-order
@@ -1498,15 +1688,17 @@ impl WorkspaceState {
         &mut self,
         event: Event,
         csprng: &mut R,
+        now: UnixSeconds,
     ) -> Result<Vec<Effect>, CoreError> {
         match event {
             Event::ControlOp(op) => self.on_control_op(op),
             Event::CertsArrived(certs) => self.on_certs_arrived(certs),
             Event::ChunkArrived { doc, chunk } => self.on_chunk_arrived(doc, *chunk),
-            Event::LocalEdit { doc, text } => self.on_append(doc, &text, csprng),
-            Event::WriteFile { doc, text } => self.on_write(doc, &text, csprng),
-            Event::InsertText { doc, pos, text } => self.on_insert(doc, pos, &text, csprng),
-            Event::RemoveText { doc, pos, len } => self.on_delete(doc, pos, len, csprng),
+            Event::LocalEdit { doc, text } => self.on_append(doc, &text, csprng, now),
+            Event::WriteFile { doc, text } => self.on_write(doc, &text, csprng, now),
+            Event::InsertText { doc, pos, text } => self.on_insert(doc, pos, &text, csprng, now),
+            Event::RemoveText { doc, pos, len } => self.on_delete(doc, pos, len, csprng, now),
+            Event::RevertDocument { doc, to } => self.on_revert(doc, &to, csprng, now),
             Event::DeleteFile { doc } => self.on_delete_file(doc, csprng),
             Event::Resync { doc } => self.on_resync(doc, csprng),
             Event::AddUser {
@@ -2107,8 +2299,9 @@ impl WorkspaceState {
         doc: DocumentUuid,
         text: &str,
         csprng: &mut R,
+        now: UnixSeconds,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.on_text_edit(doc, csprng, |content| {
+        self.on_text_edit(doc, csprng, now, |content| {
             let at = content.len_unicode();
             content.insert(at, text)
         })
@@ -2125,8 +2318,9 @@ impl WorkspaceState {
         doc: DocumentUuid,
         text: &str,
         csprng: &mut R,
+        now: UnixSeconds,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.on_text_edit(doc, csprng, |content| {
+        self.on_text_edit(doc, csprng, now, |content| {
             content
                 .update(text, loro::UpdateOptions::default())
                 .map_err(|e| loro::LoroError::Unknown(e.to_string().into()))
@@ -2144,8 +2338,9 @@ impl WorkspaceState {
         pos: usize,
         text: &str,
         csprng: &mut R,
+        now: UnixSeconds,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.on_text_edit(doc, csprng, |content| {
+        self.on_text_edit(doc, csprng, now, |content| {
             content.insert(pos.min(content.len_unicode()), text)
         })
     }
@@ -2157,8 +2352,9 @@ impl WorkspaceState {
         pos: usize,
         len: usize,
         csprng: &mut R,
+        now: UnixSeconds,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.on_text_edit(doc, csprng, |content| {
+        self.on_text_edit(doc, csprng, now, |content| {
             let end = content.len_unicode();
             let at = pos.min(end);
             content.delete(at, len.min(end - at))
@@ -2336,6 +2532,7 @@ impl WorkspaceState {
         &mut self,
         doc: DocumentUuid,
         csprng: &mut R,
+        now: UnixSeconds,
         mutate: F,
     ) -> Result<Vec<Effect>, CoreError>
     where
@@ -2343,10 +2540,181 @@ impl WorkspaceState {
         F: FnOnce(&loro::LoroText) -> Result<(), loro::LoroError>,
     {
         self.require_write()?;
-        let loro = self.docs.entry(doc).or_default();
+        let me = self.cgka.member_id().to_bytes();
+        let loro = self.docs.entry(doc).or_insert_with(new_doc);
+        // Before the edit, so the claim and the change it describes land in one
+        // commit and no reader can observe a change whose author is unnamed.
+        claim_authorship(loro, &me);
         let content = loro.get_text("content");
         mutate(&content).map_err(|e| CoreError::Manifest(e.to_string()))?;
-        loro.commit();
+        commit_at(loro, now);
+        self.publish(doc, csprng)
+    }
+
+    /// Name the state the workspace is in, and return what to call it back.
+    ///
+    /// A direct method rather than an [`Event`] for the reason
+    /// [`Self::seal_asset_key`] is one: the caller needs a value back — the digest
+    /// that identifies what it just took — and an event returns only effects. It
+    /// also keeps the two backends honest by not adding a variant they must both
+    /// learn to drive.
+    ///
+    /// Records the version of every entry the manifest holds *right now* whose
+    /// content this replica actually has. An entry it has heard of but not synced
+    /// is left out rather than named at some invented version — there is no state
+    /// to point at. The reverse case is what [`RestoreOutcome::Unavailable`] is
+    /// for: somebody else's checkpoint naming a version this replica has not
+    /// merged, which a sync fixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAWriter`] if this member's role cannot write — a
+    /// checkpoint is a manifest write like any other — and propagates encoding and
+    /// publish failures.
+    pub fn checkpoint<R: CryptoRng + RngCore>(
+        &mut self,
+        name: &str,
+        message: &str,
+        csprng: &mut R,
+        now: UnixSeconds,
+    ) -> Result<(Vec<Effect>, [u8; 32]), CoreError> {
+        self.require_write()?;
+        // Sorted, so the encoding and therefore the digest is a function of the
+        // contents rather than of the manifest's iteration order — two members
+        // taking the same checkpoint of the same state agree on its identity.
+        let mut entries: Vec<(DocumentUuid, VersionId)> = self
+            .manifest
+            .files()
+            .into_iter()
+            .filter_map(|entry| {
+                self.document_version(entry.uuid)
+                    .map(|version| (entry.uuid, version))
+            })
+            .collect();
+        entries.sort_by_key(|(uuid, _)| *uuid);
+
+        let checkpoint = Checkpoint {
+            name: name.to_string(),
+            message: message.to_string(),
+            author: self.cgka.member_id().to_bytes(),
+            at: now,
+            entries,
+        };
+        let digest = checkpoint.digest();
+        self.manifest.add_checkpoint(&checkpoint)?;
+        let effects = self.publish_manifest(Keying::Current, csprng)?;
+        Ok((effects, digest))
+    }
+
+    /// Put every entry a checkpoint names back to the version it names.
+    ///
+    /// Each entry is reverted exactly as [`Event::RevertDocument`] would revert
+    /// it — a forward edit — so a restore is as safe under concurrency as a single
+    /// revert, being several of them. Entries created since the checkpoint are
+    /// left alone: a checkpoint says what those files *were*, not that nothing
+    /// else existed.
+    ///
+    /// Returns one [`RestoreOutcome`] per named entry beside the effects, because
+    /// "restored 3 of 5" leaves a caller unable to say which two and what to do
+    /// about them. A deleted entry can never come back; an unavailable one is
+    /// waiting on a sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAWriter`] if this member's role cannot write, and
+    /// [`CoreError::UnknownVersion`] if no checkpoint with this digest is on this
+    /// replica — the digest names a record, and a record that has not merged yet
+    /// is the same "not here, ask again later" condition a version id has.
+    pub fn restore_checkpoint<R: CryptoRng + RngCore>(
+        &mut self,
+        digest: &[u8; 32],
+        csprng: &mut R,
+        now: UnixSeconds,
+    ) -> Result<(Vec<Effect>, Vec<RestoreOutcome>), CoreError> {
+        self.require_write()?;
+        let checkpoint =
+            self.manifest
+                .checkpoint(digest)
+                .ok_or_else(|| CoreError::UnknownVersion {
+                    version: hex(digest),
+                })?;
+
+        let live: HashSet<DocumentUuid> =
+            self.manifest.files().into_iter().map(|e| e.uuid).collect();
+        let mut effects = Vec::new();
+        let mut outcomes = Vec::new();
+        for (doc, version) in checkpoint.entries {
+            if !live.contains(&doc) {
+                // Deleted since. `on_delete_file` drops the replica, so there is
+                // no history left to revert to and no later sync will bring one.
+                outcomes.push(RestoreOutcome::Deleted(doc));
+            } else if self.document_version(doc).as_ref() == Some(&version) {
+                // Already there. Reverting would be a no-op that still costs a
+                // publish, so it is named rather than performed.
+                outcomes.push(RestoreOutcome::Unchanged(doc));
+            } else {
+                match self.on_revert(doc, &version, csprng, now) {
+                    Ok(mut produced) => {
+                        effects.append(&mut produced);
+                        outcomes.push(RestoreOutcome::Restored(doc));
+                    }
+                    // This replica is behind on that document's history. Not
+                    // terminal, and not a reason to abandon the other entries:
+                    // restoring again after a sync finishes the job.
+                    Err(CoreError::UnknownVersion { .. } | CoreError::UnknownDocument) => {
+                        outcomes.push(RestoreOutcome::Unavailable(doc));
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+        Ok((effects, outcomes))
+    }
+
+    /// Every checkpoint this replica holds, newest first.
+    #[must_use]
+    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+        self.manifest.checkpoints()
+    }
+
+    /// Put a document back the way it was at `version`, as a forward edit.
+    ///
+    /// Deliberately *not* routed through [`Self::on_text_edit`], because the
+    /// mutation is not one on the text container: `revert_to` computes the
+    /// inverse of everything after `version` across the whole document, which is
+    /// what makes the result correct when several containers moved. The three
+    /// things that funnel does are still done here in the same order — check the
+    /// write capability, claim authorship, commit at the caller's instant — and
+    /// the publish is the ordinary one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAWriter`] if this member's role cannot write,
+    /// [`CoreError::UnknownDocument`] if this node holds no such document, and
+    /// [`CoreError::UnknownVersion`] if the version is malformed or names a state
+    /// this replica has not merged. Reverting to the state a document is already
+    /// in is not an error: it produces no operations, so the publish that follows
+    /// finds nothing to say.
+    fn on_revert<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        version: &VersionId,
+        csprng: &mut R,
+        now: UnixSeconds,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_write()?;
+        let frontiers = version.to_frontiers()?;
+        let me = self.cgka.member_id().to_bytes();
+        // Not `entry().or_default()`: reverting a document this node has never
+        // seen would otherwise create an empty one and then revert it to a state
+        // it cannot hold, which is a confusing way to spell "ask a peer first".
+        let loro = self.docs.get(&doc).ok_or(CoreError::UnknownDocument)?;
+        claim_authorship(loro, &me);
+        loro.revert_to(&frontiers)
+            .map_err(|_| CoreError::UnknownVersion {
+                version: version.to_string(),
+            })?;
+        commit_at(loro, now);
         self.publish(doc, csprng)
     }
 
@@ -2358,13 +2726,8 @@ impl WorkspaceState {
     ) -> Result<Vec<Effect>, CoreError> {
         self.require_write()?;
         // Read before the tombstone lands: the manifest entry is what says
-        // whether this is an asset, and how many segments it occupies.
-        let asset = self
-            .manifest
-            .files()
-            .into_iter()
-            .find(|entry| entry.uuid == doc)
-            .and_then(|entry| entry.asset);
+        // whether this is an asset, and which key spaces its versions occupy.
+        let versions = self.manifest.asset_versions(doc);
         self.manifest.delete_file(doc)?;
         self.docs.remove(&doc);
         self.last_ref.remove(&doc);
@@ -2385,28 +2748,122 @@ impl WorkspaceState {
             keep
         });
         let mut effects = Vec::new();
-        if asset.is_some() {
-            // An asset occupies two key spaces and both have to go: the entry
-            // holding its wrapped content key, and the contiguous range of its
-            // segments. Withdrawing only the first would leave the payloads
-            // indexed — and therefore protected from blob collection — for a
-            // file that no longer exists.
-            effects.push(Effect::DeleteEntry {
-                key: self.secret.asset_key_key(doc),
-                doc,
-            });
-            effects.push(Effect::DeleteAssetSegments {
-                prefix: self.secret.asset_prefix(doc),
-                asset: doc,
-            });
-        } else {
+        if versions.is_empty() {
+            // A document: one entry, holding its chunks.
             effects.push(Effect::DeleteEntry {
                 key: self.secret.storage_key(doc),
                 doc,
             });
+        } else {
+            // An asset, and **every version** has to go, not just the current
+            // one. Each occupies two key spaces — the entry holding its wrapped
+            // content key, and the contiguous range of its segments — and an
+            // index entry is precisely what protects a blob from collection. Miss
+            // a version and its payload stays on every member's disk forever, for
+            // a file that no longer exists.
+            for version in versions {
+                effects.push(Effect::DeleteEntry {
+                    key: self.secret.asset_key_key(version.content),
+                    doc: version.content,
+                });
+                effects.push(Effect::DeleteAssetSegments {
+                    prefix: self.secret.asset_prefix(version.content),
+                    asset: version.content,
+                });
+            }
         }
         effects.extend(self.publish_manifest(Keying::Current, csprng)?);
         Ok(effects)
+    }
+
+    /// Record a new version of an asset entry and publish the manifest.
+    ///
+    /// A direct method rather than an [`Event`], like [`Self::seal_asset_key`] and
+    /// for the same reason: the caller has already sealed and stored the segments,
+    /// because bulk encryption cannot live in a crate that does no I/O, and what
+    /// it needs from here is the manifest write that makes them a version.
+    ///
+    /// **Call this after the segments are stored, never before.** The version
+    /// record is what declares them, so a crash between the two leaves segments
+    /// nobody references — recoverable, since the writer's intent log names them —
+    /// where the reverse order leaves a version whose payload does not exist,
+    /// which readers can only discover by failing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAWriter`] if this member's role cannot write,
+    /// [`CoreError::UnknownDocument`] if the manifest has no such entry, and
+    /// propagates encoding and publish failures.
+    pub fn add_asset_version<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        content: DocumentUuid,
+        meta: AssetMeta,
+        csprng: &mut R,
+        now: UnixSeconds,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_write()?;
+        // One past the highest this replica has merged, which is what makes a
+        // second attachment by one member beat its own first even though both
+        // are dated to the same second.
+        let seq = self
+            .manifest
+            .asset_versions(doc)
+            .iter()
+            .map(|version| version.seq)
+            .max()
+            .map_or(0, |highest| highest.saturating_add(1));
+        let version = AssetVersion {
+            content,
+            meta,
+            author: self.cgka.member_id().to_bytes(),
+            at: now,
+            seq,
+        };
+        self.manifest.add_asset_version(doc, &version)?;
+        self.publish_manifest(Keying::Current, csprng)
+    }
+
+    /// Make an earlier version of an asset the current one again.
+    ///
+    /// Appends a version naming the *same* content UUID the earlier one used, so
+    /// nothing is re-uploaded, re-encrypted or re-keyed — the ciphertext is
+    /// immutable and still indexed. This is the asset counterpart of reverting a
+    /// document forward, and it has the same property: the list only grows, so
+    /// the version reverted away from stays readable and can be returned to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAWriter`] if this member's role cannot write, and
+    /// [`CoreError::UnknownVersion`] if this entry has no version with that
+    /// content UUID — which is what a caller naming another file's version, or one
+    /// this replica has not merged, produces.
+    pub fn revert_asset<R: CryptoRng + RngCore>(
+        &mut self,
+        doc: DocumentUuid,
+        content: DocumentUuid,
+        csprng: &mut R,
+        now: UnixSeconds,
+    ) -> Result<Vec<Effect>, CoreError> {
+        self.require_write()?;
+        let target = self
+            .manifest
+            .asset_versions(doc)
+            .into_iter()
+            .find(|version| version.content == content)
+            .ok_or_else(|| CoreError::UnknownVersion {
+                version: hex(&content.0),
+            })?;
+        self.add_asset_version(doc, content, target.meta, csprng, now)
+    }
+
+    /// Every version recorded for an asset, oldest first.
+    ///
+    /// Empty for a document. An asset attached before versioning existed reports
+    /// the single version it is, so a caller has one shape to handle.
+    #[must_use]
+    pub fn asset_versions(&self, doc: DocumentUuid) -> Vec<AssetVersion> {
+        self.manifest.asset_versions(doc)
     }
 
     /// Admit a leaf to the group and record whatever the manifest needs.
@@ -2961,42 +3418,54 @@ impl WorkspaceState {
         Ok(effects)
     }
 
-    /// Every blinded key an asset occupies in the index: its key chunk, then
-    /// each of its segments in order.
+    /// Every blinded key an asset occupies in the index: for each version, its
+    /// key chunk and then each of its segments in order.
     ///
     /// Used by a namespace rotation. The new replica starts empty, and documents
     /// are carried into it by being re-encrypted — which for an asset would mean
     /// re-encrypting and re-uploading gigabytes that have not changed. Asset
     /// entries are re-*indexed* instead, by writing the hash the old replica
     /// already names, and this is the list of keys to do it for.
+    ///
+    /// **Every version, and keyed by the version's content UUID rather than the
+    /// entry's.** A rotation abandons the old replica, so a key left out here is
+    /// content that no live index names: the current version would be lost
+    /// outright, and a superseded one would become unreadable while still listed
+    /// — a history with holes in it.
     #[must_use]
     pub fn asset_index_keys(&self) -> Vec<StorageKey> {
         let mut keys = Vec::new();
         for entry in self.manifest.files() {
-            let Some(meta) = entry.asset else {
-                continue;
-            };
-            keys.push(self.secret.asset_key_key(entry.uuid));
-            for index in 0..meta.segments {
-                keys.push(self.secret.asset_part_key(entry.uuid, index));
+            for version in self.manifest.asset_versions(entry.uuid) {
+                keys.push(self.secret.asset_key_key(version.content));
+                for index in 0..version.meta.segments {
+                    keys.push(self.secret.asset_part_key(version.content, index));
+                }
             }
         }
         keys
     }
 
-    /// The blinded prefix of every asset the manifest records.
+    /// The blinded prefix of every asset version the manifest records.
     ///
     /// What a caller turns into an `iroh-docs` download policy. Without one every
     /// member fetches every asset's payload the moment its entries reconcile,
     /// which is the "slowing down document synchronization" the large-asset user
     /// story exists to rule out.
+    ///
+    /// **Every version, not just the current one**, and the direction matters:
+    /// this list is what a peer declines to fetch eagerly. A superseded version
+    /// left out of it would be downloaded in full by every member the moment its
+    /// entries reconciled — the opposite of the intent, and worse for an asset
+    /// nobody is reading. Fetching an old version on demand does not need the
+    /// policy's permission; declining to fetch it does.
     #[must_use]
     pub fn asset_prefixes(&self) -> Vec<[u8; 24]> {
         self.manifest
             .files()
             .into_iter()
-            .filter(|entry| entry.asset.is_some())
-            .map(|entry| self.secret.asset_prefix(entry.uuid))
+            .flat_map(|entry| self.manifest.asset_versions(entry.uuid))
+            .map(|version| self.secret.asset_prefix(version.content))
             .collect()
     }
 
@@ -3047,7 +3516,7 @@ impl WorkspaceState {
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
         let published = self.published_up_to.get(&doc).cloned();
-        let loro = self.docs.entry(doc).or_default();
+        let loro = self.docs.entry(doc).or_insert_with(new_doc);
 
         // `all_updates()` is what makes a chunk self-sufficient under loss, and
         // that is exactly what a `Delta` gives up in exchange for costing the
@@ -3211,7 +3680,7 @@ impl WorkspaceState {
             Ok(DecryptOutcome::Unreachable) => return ChunkVerdict::Unreachable,
             Err(_) => return ChunkVerdict::Corrupt,
         };
-        let loro = self.docs.entry(doc).or_default();
+        let loro = self.docs.entry(doc).or_insert_with(new_doc);
         // Loro reports its own missing dependencies separately from the
         // key-availability question. This one really is "not yet": the chunk
         // carrying the operations this one depends on is still in flight.
@@ -3254,10 +3723,109 @@ fn snapshot_doc(doc: &LoroDoc) -> Result<Vec<u8>, CoreError> {
 ///
 /// Returns [`CoreError::Manifest`] if the bytes are not a readable snapshot.
 fn restore_doc(bytes: &[u8]) -> Result<LoroDoc, CoreError> {
-    let doc = LoroDoc::new();
+    let doc = new_doc();
     doc.import(bytes)
         .map_err(|e| CoreError::Manifest(e.to_string()))?;
     Ok(doc)
+}
+
+/// Commit a document's pending operations, dated `now`.
+///
+/// `LoroDoc::commit` would date the change from the system clock, which this
+/// crate must not read — see the [`crate::version`] module documentation. Loro
+/// raises the value to at least the greatest timestamp in the change's causal
+/// ancestry, so a node with a slow clock cannot date its work before what it
+/// followed; a node with a fast one can date its own work in the future, which is
+/// why a timestamp is presented as a claim rather than as evidence.
+fn commit_at(doc: &LoroDoc, now: UnixSeconds) {
+    doc.commit_with(CommitOptions::new().timestamp(now.get()));
+}
+
+/// An empty document, configured the way every document here must be.
+///
+/// The only place a document `LoroDoc` is constructed, so that the one setting
+/// below cannot be forgotten on a path added later.
+///
+/// # Why change merging is off
+///
+/// Loro merges consecutive local commits from the same peer into a single change
+/// when they fall within a merge interval, which defaults to a thousand seconds.
+/// That is a sound default for an editor whose history is an undo stack, and it
+/// is the wrong one here: a change is what a version *is*, so three edits a
+/// minute apart would collapse into one entry a person cannot revert past. Worse,
+/// they collapse by wall-clock time, and this crate's clock is supplied by its
+/// caller — the simulator drives a whole run at one instant, so the merging would
+/// differ between the harness and production.
+///
+/// The cost is oplog metadata per commit rather than per interval, which is a few
+/// tens of bytes against a chunk that carries the edit itself.
+///
+/// **Negative, not zero.** Loro merges when `next.timestamp - last.timestamp <=
+/// interval`, so zero still merges two commits made in the same second — which,
+/// with a supplied clock, can be a whole simulated run. Any negative value makes
+/// the comparison unsatisfiable.
+fn new_doc() -> LoroDoc {
+    let doc = LoroDoc::new();
+    doc.set_change_merge_interval(-1);
+    doc
+}
+
+/// Read a hex-encoded Loro peer id back, as [`claim_authorship`] wrote it.
+fn unhex_u64(raw: &str) -> Option<u64> {
+    let bytes = unhex_bytes(raw)?;
+    <[u8; 8]>::try_from(bytes).ok().map(u64::from_be_bytes)
+}
+
+/// Read a hex-encoded member id back.
+fn unhex_member(raw: &str) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(unhex_bytes(raw)?).ok()
+}
+
+/// Decode a hex string, or `None` if it is not one.
+fn unhex_bytes(raw: &str) -> Option<Vec<u8>> {
+    if raw.len().is_multiple_of(2) {
+        (0..raw.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&raw[i..i + 2], 16).ok())
+            .collect()
+    } else {
+        None
+    }
+}
+
+/// Record that this replica's current Loro peer id belongs to `member`.
+///
+/// Attribution is *recorded* rather than derived, and the reason is a hazard
+/// rather than a preference. A version list has to resolve the peer id on a
+/// change back to a member, and the obvious answer — derive the peer id from the
+/// workspace secret and the member id, so that every peer can invert it without
+/// being told — is wrong in a way that corrupts documents. Assigning a peer id
+/// also fixes the operation counter this replica writes next, so a device that
+/// loses a document's local history while another replica keeps it — deleting and
+/// recreating a UUID, or resuming from a wipe — restarts its counter and mints
+/// operation ids that already name different operations. Loro says plainly that
+/// this can corrupt a document and recommends the random per-session id it
+/// defaults to. This keeps that default and writes the mapping down instead.
+///
+/// The record is a **claim**, in exactly the sense [`crate::manifest`] uses the
+/// word: it lives in content any member may write, so a member could name
+/// somebody else. It grants nothing — whether an entry is accepted at all is
+/// decided by the capability closure against its *author key* — so a lie costs a
+/// wrong name beside a change and nothing else. See [`crate::version`].
+///
+/// Idempotent, and cheap for that reason: a peer id changes only when a
+/// `LoroDoc` is constructed, so this writes one entry per document per session.
+fn claim_authorship(doc: &LoroDoc, member: &[u8; 32]) {
+    let peer = hex(&doc.peer_id().to_be_bytes());
+    let authors = doc.get_map(DOC_AUTHORS_CONTAINER);
+    if authors.get(&peer).is_some() {
+        // Already claimed by this session; the value cannot have changed, since
+        // a peer id belongs to one `LoroDoc` and that document is this one.
+    } else {
+        // A failed insert costs this session's attribution and nothing else, so
+        // it is absorbed rather than failing the edit it precedes.
+        let _ = authors.insert(&peer, hex(member).as_str());
+    }
 }
 
 /// A fresh nonce, so two otherwise identical certificates have distinct digests.

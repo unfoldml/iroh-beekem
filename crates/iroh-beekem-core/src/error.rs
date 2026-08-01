@@ -159,6 +159,22 @@ pub enum CoreError {
     #[error("no such document in the workspace manifest")]
     UnknownDocument,
 
+    /// This replica cannot resolve the version it was asked about.
+    ///
+    /// Two causes, and a caller that can tell them apart is holding information
+    /// this node does not have. The bytes may not be a version at all — a
+    /// truncated or invented id — or they may name a state some *other* replica
+    /// reached and this one has not merged yet. The second is ordinary: version
+    /// ids are handed between peers, and a peer that is behind has nothing to
+    /// resolve against. Retrying after a sync is the remedy in that case and
+    /// achieves nothing in the first, which is why the error carries the id
+    /// rather than a verdict on it.
+    #[error("this replica does not hold the document version {version}")]
+    UnknownVersion {
+        /// The version that could not be resolved, for the operator's log.
+        version: String,
+    },
+
     /// The manifest has no record binding this device to a user.
     ///
     /// Usually means the record has not synced yet rather than that the device

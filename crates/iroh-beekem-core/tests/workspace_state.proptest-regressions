@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# Two edits, revert to the first. Failed while Loro's change merging was still
+# on: both commits fell in one merge interval, collapsed into a single change,
+# and the version "before the second edit" did not exist to revert to. Kept
+# because it is the smallest case that distinguishes one change from one edit.
+cc 3c8d8eeaab40428679f4ecfe6daae99c978cc5ecbfbcd7d2cb320fea61330576 # shrinks to edits = ["a", "a"], k = 0

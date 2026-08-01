@@ -1,10 +1,14 @@
 # CLAUDE.md
 
-Guidance for Claude Code (claude.ai/code) working in this repository.
+## Language
 
+Important:  Only write in ASD-STE100 (Simplified Technical English )
+
+
+## User stories
 [docs/USER_STORIES.md](docs/USER_STORIES.md) states what this project is *for* and takes precedence
-over anything here. This file describes what exists *today* — the project is early, and most of what
-follows is a current choice rather than a settled one.
+over library functionality described here. 
+
 
 ## Commands
 
@@ -74,7 +78,7 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
 
 - Priorities when building a new feature or refactoring a preexisting one: first, make it correct. Second, make it principled (the API must follow textbook implementation and adhere to theory). Then, make it performant.
 - Never, ever stub out implementations, or make simplifying assumptions without asking the user. Only deliver complete features.
-- If you find code that is stubbed out, ask the user to expand the scope and fix it.
+- If you find code that is stubbed out, ask the user to expand the scope and fix it. Be a good repository citizen: if you see something broken or done poorly, fix it.
 - Don't guess performance; set up targeted benchmarks and measure instead.
 - Prefer total functions (i.e. producing an output for each value of the input). When total functions are not possible, use a sum type (e.g. Option, or implement an informative custom one) to enumerate the output cases.
 - As a corollary of the above, do not panic but use an "error"-like enum branch
@@ -321,7 +325,7 @@ them *without* noticing will not fail loudly.
   digest first turned that transient failure into a permanent divergence — and `on_certs_arrived` runs
   the quorum pass whether or not anything was new. `beekem_group_size_disagrees_with_current_members`
   in [beekem_loop.rs](crates/iroh-beekem-core/tests/beekem_loop.rs) pins it; the upstream reproduction
-  is in [docs/beekem-repro/](docs/beekem-repro/).
+  is in [docs/beekem-bug-repro/](docs/beekem-bug-repro/).
 
 - **An asset is keyed by an envelope, and that is what makes it repairable.** Segments are sealed under
   a per-asset content key with XChaCha20-Poly1305; only that 32-byte key is encrypted to the group. So

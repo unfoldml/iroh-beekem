@@ -149,6 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await;
 
+    versioning_round_trip(&alice, &bob, notes).await?;
+
     let leaked = revocation_takes_hold(&alice, &bob, bob_identity.member_id(), notes).await?;
 
     alice.shutdown().await?;
@@ -158,6 +160,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("revocation failed to take hold".into());
     }
     Ok(())
+}
+
+/// Walk a document's history, tag it, edit past the tag, and put it back.
+///
+/// Everything here is read out of history the CRDT already kept, and the restore
+/// travels as an ordinary edit — which is why the last step is bob converging on
+/// it rather than bob being told about it.
+async fn versioning_round_trip(
+    alice: &Workspace,
+    bob: &Workspace,
+    notes: iroh_beekem_core::DocumentUuid,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("\nalice looks back over the document's history...");
+    for version in alice.versions(notes).await {
+        let author = version
+            .author
+            .map_or_else(|| "unattributed".to_string(), |member| hex8(&member));
+        println!(
+            "    {} by {author} at {} ({} op(s))",
+            version.id, version.at, version.ops
+        );
+    }
+
+    println!("\nalice tags the current state, then writes past the tag...");
+    let tag = alice.checkpoint("demo", "before the last edit").await?;
+    alice.append(notes, "A LINE ALICE WILL TAKE BACK. ").await?;
+    println!("  alice now sees: {:?}", alice.read(notes).await);
+
+    println!("\nalice restores the tag...");
+    for outcome in alice.restore_checkpoint(&tag).await? {
+        println!("    {outcome:?}");
+    }
+    println!("  alice now sees: {:?}", alice.read(notes).await);
+
+    let restored = alice.read(notes).await;
+    settle(
+        "bob converges on the restored document",
+        Duration::from_secs(30),
+        || async {
+            bob.ingest().await;
+            bob.read(notes).await == restored
+        },
+    )
+    .await;
+    println!("  bob sees:       {:?}", bob.read(notes).await);
+    Ok(())
+}
+
+/// The first four bytes of an identifier, for a line a person reads.
+fn hex8(bytes: &[u8; 32]) -> String {
+    bytes[..4].iter().fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 /// Print the workspace as one peer sees it: name, files and people.

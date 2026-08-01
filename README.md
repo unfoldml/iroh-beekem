@@ -68,6 +68,30 @@ for user in ws.users().await {
 // fetch them until somebody opens it.
 let scan = ws.attach_file("/data/scan.tiff", "/scans/2026.tiff", "image/tiff").await?;
 ws.export_asset(scan, "/tmp/scan.tiff").await?;
+
+// Every edit is a version, and a version can be read or restored. Restoring is
+// published as a new edit going forward, so it merges with whatever a colleague
+// was writing at the time instead of overruling them — and the version it
+// undid stays listed, so a revert can itself be reverted.
+let history = ws.versions(notes).await;
+if let Some(before) = history.iter().rev().nth(1) {
+    println!("{} by {:?} at {}", before.id, before.author, before.at);
+    println!("read back: {}", ws.read_at(notes, &before.id).await?);
+    ws.revert(notes, &before.id).await?;
+}
+
+// Or name a state of the whole workspace, in the spirit of a git tag, and put
+// every file it named back later. Entries created since are left alone.
+let tag = ws.checkpoint("v1.0", "shipped").await?;
+for outcome in ws.restore_checkpoint(&tag).await? { println!("{outcome:?}"); }
+
+// An asset versions the same way, except that each version is its own body of
+// bytes: attaching a new one leaves the old one readable, and reverting points
+// back at bytes that are already stored rather than re-uploading them.
+ws.attach_version(scan, "/data/scan-v2.tiff").await?;
+let versions = ws.asset_versions(scan).await;
+ws.export_asset_version(&versions[0], "/tmp/scan-original.tiff").await?;
+ws.revert_asset(scan, versions[0].content).await?;
 ```
 
 A person may hold several devices, each with its own leaf and its own
@@ -528,6 +552,31 @@ reason enough to revisit the choice underneath.
    with a repair request, because holding it would occupy the budget for the life of the process
    while every drain retried a decryption that cannot succeed.
 
+21. **Document history is retained in full, and a new member receives all of it.** Every version of
+   every document stays in the Loro oplog, and a full export ships that oplog under the *current*
+   epoch key — so a member admitted today can read every edit ever made, including text deleted
+   before they joined. This was already true before versioning existed; what the feature changes is
+   that the data is now *readable* rather than merely present. Forward secrecy protects chunks, not
+   document history: a member who was never in the group reads nothing, and a member who is in it
+   reads everything the group kept. Bounding it means shallow snapshots and a retention policy, which
+   would make old versions genuinely unrecoverable — see *Not yet implemented* #7.
+22. **Reverting is a new edit, not an erasure.** A reverted change stays in the history and stays
+   readable, on every replica that holds it. That is what makes a revert converge with a concurrent
+   edit instead of splitting the group, and it means "revert" never means "destroy": there is no
+   operation in this design that removes content from peers who already have it, and there cannot be
+   one that is also convergent.
+23. **A version's author and date are claims.** Attribution is a `peer id → member` record written
+   into the document by the authoring replica, and the timestamp is whatever that node's clock said.
+   Both live in content any member may write, so a member running a modified client can misattribute
+   a change or date it in the future. Neither grants anything — whether an entry is accepted at all
+   is decided by the capability closure against its author *key* — but a version list is not evidence
+   of who did what. Making it evidence needs signed commits, which Loro does not offer.
+24. **Every asset version is kept until the entry is deleted.** Attaching a new version does not
+   collect the old one: its segments stay indexed, which is what keeps it readable and revertible, so
+   N versions of a ten-gigabyte asset cost N × ten gigabytes on every member that fetches them. Only
+   the current version is fetched eagerly; older ones are pulled on demand. There is no retention
+   policy and no way to drop a single version.
+
 ## Not yet implemented
 
 These are gaps, not trades. Nothing in the design prevents them.
@@ -565,6 +614,16 @@ These are gaps, not trades. Nothing in the design prevents them.
 5. **The gossip topic still never rotates.** It is derived from the tree id, which is the founder's
    public key, so every past invitee knows it permanently. The roster is what refuses them; without
    a new tree id — that is, a new workspace — the topic itself cannot change.
+6. **Deleting a file destroys its history, and no checkpoint brings it back.** `on_delete_file` drops
+   the replica, so a checkpoint naming that entry reports `RestoreOutcome::Deleted` rather than
+   restoring it. Nothing in the design prevents a tombstone that keeps the history — it needs a
+   decision about what "deleted" means when a version of the file is still readable, and a bound on
+   what a workspace pays to keep it.
+7. **There is no retention policy for history.** A document's oplog grows with the number of edits and
+   an entry's asset versions with the bytes attached, and nothing trims either. Loro's shallow
+   snapshots would bound the first and a per-entry version limit the second; both make old versions
+   genuinely unrecoverable, and both change what a new member can read about the past — see *Current
+   trade-offs* #21. Deferred deliberately rather than overlooked.
 
 
 

@@ -1,4 +1,4 @@
-//! The [`Workspace`] facade: a pump between `iroh` and the I/O-free core.
+//! The [`Workspace`] facade connecting `iroh` and the I/O-free core.
 //!
 //! This module contains no cryptography. Its whole job is to turn network
 //! arrivals into [`Event`]s for [`WorkspaceState`], and the [`Effect`]s that
@@ -19,10 +19,11 @@ use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
     ASSET_SEGMENT_BYTES, AdminAction, AssetKey, AssetMeta, AuthorizedOp, CgkaController,
     DEFAULT_THRESHOLD, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
-    NamespaceEpoch, ProposalStatus, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret,
-    WorkspaceState,
+    NamespaceEpoch, ProposalStatus, RepairTarget, RestoreOutcome, Role, UnixSeconds, VersionId,
+    VersionInfo, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
     asset::{ContentDigest, open_segment, seal_segment},
     state::AssetKeyVerdict,
+    version::{AssetVersion, Checkpoint},
 };
 use iroh_blobs::{
     HashAndFormat,
@@ -71,6 +72,21 @@ pub struct User {
     pub role: Option<Role>,
     /// The devices acting for this user, each holding one CGKA leaf.
     pub devices: Vec<DeviceRecord>,
+}
+
+/// This node's wall clock, in the form the core takes it.
+///
+/// The core reads no clock — it is driven by a simulator with virtual time — so
+/// every call into [`WorkspaceState::handle`] states the instant it is acting at.
+/// A clock before the Unix epoch reports [`UnixSeconds::EPOCH`] rather than
+/// refusing: the value dates a version for a person to read, and no protocol
+/// decision is taken on it, so a nonsensical clock must not be able to stop a
+/// write. Compare [`unix_now`], which *does* refuse, because an invite expiry is
+/// a decision.
+fn now() -> UnixSeconds {
+    unix_now().map_or(UnixSeconds::EPOCH, |secs| {
+        UnixSeconds::new(i64::try_from(secs).unwrap_or(i64::MAX))
+    })
 }
 
 /// What identifies one index entry: the blinded key and the author who wrote it.
@@ -938,12 +954,14 @@ impl Workspace {
                     author: author_id.to_bytes(),
                 },
                 &mut rand::rngs::OsRng,
+                now(),
             ));
             effects.extend(report_rejection(state.handle(
                 Event::AnnounceEndpoint {
                     endpoint_id: *endpoint_id.as_bytes(),
                 },
                 &mut rand::rngs::OsRng,
+                now(),
             )));
             effects
         };
@@ -1079,7 +1097,7 @@ impl Workspace {
         );
         let effects = {
             let mut state = self.inner.state.lock().await;
-            state.handle(event, &mut rand::rngs::OsRng)?
+            state.handle(event, &mut rand::rngs::OsRng, now())?
         };
         apply_effects(&self.inner, effects).await;
         if membership_moved {
@@ -1429,57 +1447,111 @@ impl Workspace {
         logical_path: &str,
         mime_type: &str,
     ) -> Result<DocumentUuid, WorkspaceError> {
+        let uuid = DocumentUuid::generate(&mut rand::rngs::OsRng);
+        // The entry first, empty of versions, because a version has to attach to
+        // something: `add_asset_version` refuses a version of a file the manifest
+        // has never heard of, which is what stops indexed segments existing with
+        // nothing naming them.
+        self.drive(Event::UpsertFile {
+            entry: FileEntry {
+                uuid,
+                logical_path: logical_path.to_string(),
+                mime_type: mime_type.to_string(),
+                asset: None,
+            },
+        })
+        .await?;
+        match self.attach_version(uuid, local).await {
+            Ok(()) => Ok(uuid),
+            Err(err) => {
+                // Withdraw the entry this call created. `attach_version` has
+                // already withdrawn the segments it wrote, so what would be left
+                // is an entry with no versions — which reads as an empty
+                // *document*, since that is exactly what "no versions" means for
+                // an entry. A failed attachment must leave nothing behind, not a
+                // phantom file the caller never asked for.
+                if let Err(cleanup) = self.delete_file(uuid).await {
+                    tracing::warn!(%cleanup, "could not withdraw the entry of a failed attachment");
+                } else {
+                    // Withdrawn; the workspace looks as it did before the call.
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Attach a new version of an existing entry, streaming it as
+    /// [`Self::attach_file`] does.
+    ///
+    /// The previous version is not touched and stays readable through
+    /// [`Self::export_asset_version`]: each version is sealed under a key of its
+    /// own into a key space of its own, which is what stops a new one overwriting
+    /// the index entries that protect the old one's blobs from collection.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::attach_file`], plus [`WorkspaceError::Core`] wrapping
+    /// `UnknownDocument` if the manifest has no such entry.
+    pub async fn attach_version(
+        &self,
+        entry: DocumentUuid,
+        local: impl AsRef<Path>,
+    ) -> Result<(), WorkspaceError> {
         let path = local.as_ref();
         let size = tokio::fs::metadata(path).await?.len();
-        // The default segmentation. Recorded in the entry rather than assumed by
-        // the reader, so a future default does not make today's assets
+        // The default segmentation. Recorded in the version rather than assumed
+        // by the reader, so a future default does not make today's assets
         // unreadable.
         let segment_bytes = u32::try_from(ASSET_SEGMENT_BYTES).unwrap_or(u32::MAX);
         let segments = AssetMeta::segments_for(size, segment_bytes);
-        let uuid = DocumentUuid::generate(&mut rand::rngs::OsRng);
+        // A key space of this version's own; see `AssetVersion::content`.
+        let content = DocumentUuid::generate(&mut rand::rngs::OsRng);
 
         // Key material first, exactly as `publish_keyed` does for a document.
         let (key, effects) = {
             let mut state = self.inner.state.lock().await;
-            state.seal_asset_key(uuid, &mut rand::rngs::OsRng)?
+            state.seal_asset_key(content, &mut rand::rngs::OsRng)?
         };
         apply_effects(&self.inner, effects).await;
         // Durably, and before the first segment: if this process does not
-        // survive to declare the asset, this is the only record that its
+        // survive to declare the version, this is the only record that its
         // segments exist.
-        note_pending_asset(&self.inner, uuid);
+        note_pending_asset(&self.inner, content);
 
         match self
-            .write_segments(uuid, &key, size, segments, segment_bytes, path)
+            .write_segments(content, &key, size, segments, segment_bytes, path)
             .await
         {
             Ok(content_hash) => {
-                self.drive(Event::UpsertFile {
-                    entry: FileEntry {
-                        uuid,
-                        logical_path: logical_path.to_string(),
-                        mime_type: mime_type.to_string(),
-                        asset: Some(AssetMeta {
+                let effects = {
+                    let mut state = self.inner.state.lock().await;
+                    state.add_asset_version(
+                        entry,
+                        content,
+                        AssetMeta {
                             size,
                             segments,
                             segment_bytes,
                             content_hash,
-                        }),
-                    },
-                })
-                .await?;
+                        },
+                        &mut rand::rngs::OsRng,
+                        now(),
+                    )?
+                };
+                apply_effects(&self.inner, effects).await;
+                persist(&self.inner).await;
                 refresh_download_policy(&self.inner).await;
                 // Declared, so it is no longer an orphan in waiting.
-                clear_pending_assets(&self.inner, &[uuid.0]);
-                Ok(uuid)
+                clear_pending_assets(&self.inner, &[content.0]);
+                Ok(())
             }
             Err(err) => {
                 // Withdraw what was written. Without this a failed ten-gigabyte
                 // upload leaks ten gigabytes: the segments are indexed, the
                 // index is what protects a blob from collection, and no manifest
                 // entry will ever name them.
-                self.discard_partial_asset(uuid).await;
-                clear_pending_assets(&self.inner, &[uuid.0]);
+                self.discard_partial_asset(content).await;
+                clear_pending_assets(&self.inner, &[content.0]);
                 Err(err)
             }
         }
@@ -1563,31 +1635,72 @@ impl Workspace {
         asset: DocumentUuid,
         target: impl AsRef<Path>,
     ) -> Result<(), WorkspaceError> {
-        use tokio::io::AsyncWriteExt as _;
-
-        let meta = self
-            .files()
+        // The current version, by the same `(at, content)` order every replica
+        // computes — never "the last one in the list", which would have two
+        // members open different files after a concurrent attach.
+        let current = self
+            .asset_versions(asset)
             .await
             .into_iter()
-            .find(|entry| entry.uuid == asset)
-            .and_then(|entry| entry.asset)
+            .max_by_key(AssetVersion::precedence)
             .ok_or(WorkspaceError::NotAnAsset)?;
+        self.export_asset_version(&current, target).await
+    }
 
-        let key = self.open_asset_key(asset).await?;
+    /// Every version recorded for an asset, oldest first.
+    ///
+    /// Empty for a document. An asset attached before versioning existed reports
+    /// the single version it is, so a caller has one shape to handle.
+    pub async fn asset_versions(&self, asset: DocumentUuid) -> Vec<AssetVersion> {
+        self.inner.state.lock().await.asset_versions(asset)
+    }
+
+    /// Write one version of a binary asset out to a local file, a segment at a
+    /// time.
+    ///
+    /// The reverse of [`Self::attach_version`], with the same memory bound, and it
+    /// **verifies**: the plaintext digest recorded in the manifest is recomputed
+    /// over what was written and compared before this returns `Ok`. That check is
+    /// what makes the manifest's mutability harmless. The manifest is an
+    /// unconditional CRDT merge, so any member can rewrite a version's recorded
+    /// size or segment count; doing so makes the export fail rather than hand the
+    /// caller a different file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::AssetKeyUnavailable`] if this node cannot yet
+    /// unwrap the content key — a repair is requested, and a later attempt
+    /// succeeds — [`WorkspaceError::MissingSegment`] if a segment has not reached
+    /// this node, [`WorkspaceError::CorruptAsset`] if the reassembled bytes do not
+    /// match the recorded digest, and [`WorkspaceError::AssetIo`] if `target`
+    /// cannot be written.
+    pub async fn export_asset_version(
+        &self,
+        version: &AssetVersion,
+        target: impl AsRef<Path>,
+    ) -> Result<(), WorkspaceError> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let meta = version.meta;
+        // Everything is keyed by the *version's* content UUID rather than by the
+        // entry's: that is what makes an older version still readable after a
+        // newer one has been attached.
+        let content = version.content;
+        let key = self.open_asset_key(content).await?;
 
         let mut out = tokio::fs::File::create(target.as_ref()).await?;
         let mut digest = ContentDigest::new();
         for index in 0..meta.segments {
             let sealed = fetch_indexed_bytes(
                 &self.inner,
-                self.inner.secret.asset_part_key(asset, index).as_bytes(),
+                self.inner.secret.asset_part_key(content, index).as_bytes(),
             )
             .await
             .ok_or(WorkspaceError::MissingSegment { index })?;
 
             let plaintext = open_segment(
                 &key,
-                asset,
+                content,
                 index,
                 meta.segments,
                 meta.segment_bytes,
@@ -1605,6 +1718,32 @@ impl Workspace {
         } else {
             Err(WorkspaceError::CorruptAsset)
         }
+    }
+
+    /// Make an earlier version of an asset current again.
+    ///
+    /// Records a new version pointing at the bytes that are already there: no
+    /// re-upload, no re-encryption, no new key. The version reverted away from
+    /// stays listed and stays readable, so this can itself be reverted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Core`] wrapping `UnknownVersion` if this entry
+    /// has no version with that content UUID, or `NotAWriter` if this member's
+    /// role cannot write.
+    pub async fn revert_asset(
+        &self,
+        asset: DocumentUuid,
+        content: DocumentUuid,
+    ) -> Result<(), WorkspaceError> {
+        let effects = {
+            let mut state = self.inner.state.lock().await;
+            state.revert_asset(asset, content, &mut rand::rngs::OsRng, now())?
+        };
+        apply_effects(&self.inner, effects).await;
+        persist(&self.inner).await;
+        refresh_download_policy(&self.inner).await;
+        Ok(())
     }
 
     /// Fetch and unwrap an asset's content key, asking for a repair if it is
@@ -1665,6 +1804,101 @@ impl Workspace {
             .await
             .ok_or_else(|| WorkspaceError::NoSuchPath(path.to_string()))?;
         Ok(self.read(doc).await)
+    }
+
+    /// A document's history as this node holds it, oldest change first.
+    ///
+    /// Empty for a document this node has not synced. Two members may list
+    /// different lengths without either being wrong — see
+    /// [`WorkspaceState::document_versions`].
+    pub async fn versions(&self, doc: DocumentUuid) -> Vec<VersionInfo> {
+        self.inner.state.lock().await.document_versions(doc)
+    }
+
+    /// A document's text as it stood at an earlier version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Core`] wrapping `UnknownDocument` if this node
+    /// holds no such document, or `UnknownVersion` if the id names a state this
+    /// replica has not merged — which a sync may fix.
+    pub async fn read_at(
+        &self,
+        doc: DocumentUuid,
+        version: &VersionId,
+    ) -> Result<String, WorkspaceError> {
+        Ok(self
+            .inner
+            .state
+            .lock()
+            .await
+            .document_text_at(doc, version)?)
+    }
+
+    /// Put a document back the way it was at an earlier version.
+    ///
+    /// Published as a new edit going forward, so it converges with a member
+    /// editing concurrently and can itself be reverted.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures, and the resolution failures of
+    /// [`Self::read_at`].
+    pub async fn revert(
+        &self,
+        doc: DocumentUuid,
+        version: &VersionId,
+    ) -> Result<(), WorkspaceError> {
+        self.drive(Event::RevertDocument {
+            doc,
+            to: version.clone(),
+        })
+        .await
+    }
+
+    /// Name the state the workspace is in, returning the checkpoint's digest.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures, and `NotAWriter` if this
+    /// member's role cannot write.
+    pub async fn checkpoint(&self, name: &str, message: &str) -> Result<[u8; 32], WorkspaceError> {
+        let (effects, digest) = {
+            let mut state = self.inner.state.lock().await;
+            state.checkpoint(name, message, &mut rand::rngs::OsRng, now())?
+        };
+        apply_effects(&self.inner, effects).await;
+        persist(&self.inner).await;
+        Ok(digest)
+    }
+
+    /// Every checkpoint this node holds, newest first.
+    pub async fn checkpoints(&self) -> Vec<Checkpoint> {
+        self.inner.state.lock().await.checkpoints()
+    }
+
+    /// Put every entry a checkpoint names back to the version it names.
+    ///
+    /// Returns one [`RestoreOutcome`] per named entry, because a caller that is
+    /// told only "done" cannot tell a restored workspace from one missing a file
+    /// that was deleted in the meantime.
+    ///
+    /// # Errors
+    ///
+    /// Propagates encryption and storage failures, and returns
+    /// [`WorkspaceError::Core`] wrapping `UnknownVersion` if this node has not
+    /// merged that checkpoint.
+    pub async fn restore_checkpoint(
+        &self,
+        digest: &[u8; 32],
+    ) -> Result<Vec<RestoreOutcome>, WorkspaceError> {
+        let (effects, outcomes) = {
+            let mut state = self.inner.state.lock().await;
+            state.restore_checkpoint(digest, &mut rand::rngs::OsRng, now())?
+        };
+        apply_effects(&self.inner, effects).await;
+        persist(&self.inner).await;
+        Ok(outcomes)
     }
 
     /// Append text to a document.
@@ -1947,6 +2181,7 @@ async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
                 report_rejection(state.handle(
                     Event::ControlOp(AuthorizedOp::new(*op, proof)),
                     &mut rand::rngs::OsRng,
+                    now(),
                 ))
             };
             apply_effects(inner, effects).await;
@@ -1962,7 +2197,11 @@ async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
             }
             let effects = {
                 let mut state = inner.state.lock().await;
-                report_rejection(state.handle(Event::CertsArrived(certs), &mut rand::rngs::OsRng))
+                report_rejection(state.handle(
+                    Event::CertsArrived(certs),
+                    &mut rand::rngs::OsRng,
+                    now(),
+                ))
             };
             apply_effects(inner, effects).await;
             ingest_all(inner).await;
@@ -1983,13 +2222,16 @@ async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
                 // the log, so replaying the operations against an empty
                 // closure would refuse the history this exchange exists to
                 // hand over.
-                effects.append(&mut report_rejection(
-                    state.handle(Event::CertsArrived(certs), &mut rand::rngs::OsRng),
-                ));
+                effects.append(&mut report_rejection(state.handle(
+                    Event::CertsArrived(certs),
+                    &mut rand::rngs::OsRng,
+                    now(),
+                )));
                 for op in ops {
                     let outcome = state.handle(
                         Event::ControlOp(AuthorizedOp::bare(Arc::new(op))),
                         &mut rand::rngs::OsRng,
+                        now(),
                     );
                     effects.append(&mut report_rejection(outcome));
                 }
@@ -2014,6 +2256,7 @@ async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
                 report_rejection(state.handle(
                     Event::NamespaceArrived { epoch, chunk },
                     &mut rand::rngs::OsRng,
+                    now(),
                 ))
             };
             apply_effects(inner, effects).await;
@@ -2069,6 +2312,7 @@ async fn answer_repair(inner: &Arc<Inner>, member: [u8; 32], target: RepairTarge
                 epoch,
             },
             &mut rand::rngs::OsRng,
+            now(),
         ))
     };
     apply_effects(inner, effects).await;
@@ -2202,7 +2446,11 @@ async fn evict_uncertified(inner: &Arc<Inner>, member: MemberId) {
     let effects = {
         let mut state = inner.state.lock().await;
         state
-            .handle(Event::RemoveMember { member }, &mut rand::rngs::OsRng)
+            .handle(
+                Event::RemoveMember { member },
+                &mut rand::rngs::OsRng,
+                now(),
+            )
             .unwrap_or_default()
     };
     apply_effects(inner, effects).await;
@@ -2224,7 +2472,7 @@ async fn republish(inner: &Arc<Inner>) {
         let effects = {
             let mut state = inner.state.lock().await;
             state
-                .handle(Event::Resync { doc }, &mut rand::rngs::OsRng)
+                .handle(Event::Resync { doc }, &mut rand::rngs::OsRng, now())
                 .unwrap_or_default()
         };
         apply_effects(inner, effects).await;
@@ -2240,7 +2488,7 @@ async fn republish(inner: &Arc<Inner>) {
         let effects = {
             let mut state = inner.state.lock().await;
             state
-                .handle(event, &mut rand::rngs::OsRng)
+                .handle(event, &mut rand::rngs::OsRng, now())
                 .unwrap_or_default()
         };
         apply_effects(inner, effects).await;
@@ -2430,6 +2678,7 @@ async fn mint_namespace(inner: &Arc<Inner>, epoch: u32) {
                     ticket: ticket.clone(),
                 },
                 &mut rand::rngs::OsRng,
+                now(),
             )
             .unwrap_or_default()
     };
@@ -3013,6 +3262,7 @@ async fn ingest_all(inner: &Arc<Inner>) {
                     chunk: Box::new(chunk),
                 },
                 &mut rand::rngs::OsRng,
+                now(),
             ))
         };
         apply_effects(inner, effects).await;
@@ -3041,10 +3291,44 @@ async fn ingest_all(inner: &Arc<Inner>) {
                         chunk: Box::new(chunk),
                     },
                     &mut rand::rngs::OsRng,
+                    now(),
                 ))
             };
             apply_effects(inner, effects).await;
         }
+    }
+
+    // Anything the core could not apply must be offered again next pass, so
+    // forget that it was ever delivered.
+    //
+    // `seen_entries` caches what has been *fetched*, and a parked chunk has been
+    // fetched and not applied. Left cached, it is never handed to the core again
+    // — and a chunk waiting on CRDT dependencies is rescued only by the
+    // `DocumentHistory` repair the core raises after enough retries, so no
+    // retries means no repair and the edit is missing on this peer permanently.
+    // The window for this is small and entirely ordinary: a document's index slot
+    // holds one chunk per author, so two writes in quick succession replace the
+    // first chunk with a delta before a peer has synced the base.
+    //
+    // Scoped to documents that are actually stuck, so the cache still does its
+    // job — which is to stop a quiescent workspace re-fetching and re-decrypting
+    // everything on every sync event.
+    let stuck = {
+        let state = inner.state.lock().await;
+        state.pending_docs()
+    };
+    if stuck.is_empty() {
+        // The ordinary case: everything delivered was applied.
+    } else {
+        let keys: Vec<[u8; 32]> = stuck
+            .into_iter()
+            .map(|doc| *inner.secret.storage_key(doc).as_bytes())
+            .collect();
+        inner
+            .seen_entries
+            .lock()
+            .await
+            .retain(|(key, _), _| !keys.contains(key));
     }
 
     // Once per pass, not once per document: an ingest touches every document the

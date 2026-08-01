@@ -1720,3 +1720,319 @@ mod an_action_needs_a_quorum {
         .await;
     }
 }
+
+/// Versioning over real endpoints: history, revert, checkpoints and asset
+/// versions.
+///
+/// What the simulator cannot show is that the facade actually wires these to the
+/// transport — that a revert travels as an ordinary edit, that a checkpoint rides
+/// the manifest, and that a superseded asset version stays fetchable after a
+/// newer one is attached.
+mod versions_travel_over_the_wire {
+    use std::time::Duration;
+
+    use iroh_beekem_core::{RestoreOutcome, version::AssetVersion};
+
+    use super::{Pair, eventually, invited_pair};
+
+    /// Given a document a member reverted, when the network settles, we expect
+    /// the other member to converge on the reverted text.
+    ///
+    /// A revert is published as a forward edit, so nothing here should need a
+    /// mechanism the ordinary edit path does not already have — which is exactly
+    /// what this proves rather than assumes.
+    #[tokio::test]
+    async fn a_revert_reaches_the_other_member() {
+        let Pair {
+            alice, bob, doc, ..
+        } = invited_pair(90).await;
+
+        alice
+            .append(doc, "keep this\n")
+            .await
+            .expect("alice writes");
+        // Bob takes delivery of the first write before the second is made, and
+        // that is not idle politeness. A document's index slot holds one chunk
+        // per author, so two writes in quick succession replace the first chunk
+        // with a delta the peer has no base for — a condition this file does not
+        // own and a repair is meant to answer. Waiting keeps this test about the
+        // revert.
+        eventually(
+            "bob sees the first line",
+            Duration::from_secs(30),
+            || async {
+                bob.ingest().await;
+                bob.read(doc).await.contains("keep this")
+            },
+        )
+        .await;
+        alice
+            .append(doc, "undo this\n")
+            .await
+            .expect("alice writes again");
+
+        eventually("bob sees both lines", Duration::from_secs(30), || async {
+            bob.ingest().await;
+            bob.read(doc).await.contains("undo this")
+        })
+        .await;
+
+        // The state after the first write, which is what to go back to.
+        let first = alice.versions(doc).await[0].id.clone();
+        assert_eq!(
+            alice
+                .read_at(doc, &first)
+                .await
+                .expect("alice holds the version she just listed"),
+            "keep this\n",
+            "reading at a version must give the text as it stood there"
+        );
+        alice.revert(doc, &first).await.expect("alice reverts");
+
+        eventually(
+            "bob converges on the reverted document",
+            Duration::from_secs(30),
+            || async {
+                bob.ingest().await;
+                bob.read(doc).await == "keep this\n"
+            },
+        )
+        .await;
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+
+    /// Given two writes made faster than the peer can sync, when the network
+    /// settles, we expect the peer to hold both.
+    ///
+    /// This is the delta path's one hazard, and it is ordinary rather than
+    /// exotic. A document's index slot holds one chunk per author, so the second
+    /// write replaces the first chunk with a delta — and a peer that had not yet
+    /// synced the base cannot apply it. The core answers that by parking the
+    /// chunk and, after enough retries, asking for the history.
+    ///
+    /// It could not get there. The transport caches what it has *fetched* to
+    /// avoid re-decrypting a quiescent workspace on every sync event, and a parked
+    /// chunk has been fetched; cached, it was never handed to the core again, so
+    /// the retries never happened, so the repair was never requested and the edit
+    /// was lost on that peer for good. Nothing reported it: the peer simply had
+    /// an older document than everybody else.
+    #[tokio::test]
+    async fn a_peer_that_misses_the_base_of_a_delta_still_catches_up() {
+        let Pair {
+            alice, bob, doc, ..
+        } = invited_pair(94).await;
+
+        // Deliberately with no sync in between, which is what leaves bob holding
+        // a delta whose base he never saw.
+        alice.append(doc, "first\n").await.expect("alice writes");
+        alice
+            .append(doc, "second\n")
+            .await
+            .expect("alice writes again");
+
+        eventually(
+            "bob catches up on a delta whose base he missed",
+            Duration::from_mins(1),
+            || async {
+                bob.ingest().await;
+                let text = bob.read(doc).await;
+                text.contains("first") && text.contains("second")
+            },
+        )
+        .await;
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+
+    /// Given a checkpoint one member took, when the network settles, we expect
+    /// the other to be able to restore it.
+    ///
+    /// Checkpoints ride the manifest and mint no operation of their own, so this
+    /// is also the check that the manifest publish actually carries them.
+    #[tokio::test]
+    async fn a_checkpoint_taken_by_one_member_is_restorable_by_the_other() {
+        let Pair {
+            alice, bob, doc, ..
+        } = invited_pair(91).await;
+
+        alice
+            .append(doc, "as tagged\n")
+            .await
+            .expect("alice writes");
+        let digest = alice
+            .checkpoint("v1", "before the rewrite")
+            .await
+            .expect("alice tags");
+
+        eventually("bob sees the tag", Duration::from_secs(30), || async {
+            bob.ingest().await;
+            bob.checkpoints().await.iter().any(|c| c.name == "v1")
+                && bob.read(doc).await.contains("as tagged")
+        })
+        .await;
+
+        bob.append(doc, "and then some regret\n")
+            .await
+            .expect("bob writes");
+        let outcomes = bob
+            .restore_checkpoint(&digest)
+            .await
+            .expect("bob restores a tag he merged");
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, RestoreOutcome::Restored(_))),
+            "restoring must report what it did to each named entry: {outcomes:?}"
+        );
+        assert_eq!(
+            bob.read(doc).await,
+            "as tagged\n",
+            "restoring the tag must undo the write made after it"
+        );
+
+        eventually(
+            "alice converges on the restored document",
+            Duration::from_secs(30),
+            || async {
+                alice.ingest().await;
+                alice.read(doc).await == "as tagged\n"
+            },
+        )
+        .await;
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+
+    /// Given an asset attached twice, when the newer version has synced, we
+    /// expect the other member to be able to export *either* version.
+    ///
+    /// Each version has its own key space precisely so that attaching a new one
+    /// does not overwrite the index entries protecting the old one's blobs. If it
+    /// did, this test would fail on the older export — and only there.
+    #[tokio::test]
+    async fn an_older_asset_version_is_still_exportable_after_a_newer_one() {
+        let Pair { alice, bob, .. } = invited_pair(92).await;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let first = dir.path().join("first.bin");
+        let second = dir.path().join("second.bin");
+        tokio::fs::write(&first, b"the original bytes")
+            .await
+            .expect("writing the first version");
+        tokio::fs::write(&second, b"the replacement bytes")
+            .await
+            .expect("writing the second version");
+
+        let entry = alice
+            .attach_file(&first, "/big.bin", "application/octet-stream")
+            .await
+            .expect("alice attaches");
+        alice
+            .attach_version(entry, &second)
+            .await
+            .expect("alice attaches a second version");
+
+        eventually(
+            "bob sees both versions of the asset",
+            Duration::from_secs(30),
+            || async {
+                bob.ingest().await;
+                bob.asset_versions(entry).await.len() == 2
+            },
+        )
+        .await;
+
+        let versions = bob.asset_versions(entry).await;
+        let oldest = versions.first().expect("two versions were listed").clone();
+        let newest = versions
+            .iter()
+            .max_by_key(|v| AssetVersion::precedence(v))
+            .expect("two versions were listed")
+            .clone();
+
+        let out_new = dir.path().join("out-new.bin");
+        eventually(
+            "bob exports the current version",
+            Duration::from_secs(30),
+            || async {
+                bob.ingest().await;
+                bob.export_asset(entry, &out_new).await.is_ok()
+            },
+        )
+        .await;
+        assert_eq!(
+            tokio::fs::read(&out_new).await.expect("reading the export"),
+            b"the replacement bytes",
+            "exporting an entry must give its current version"
+        );
+
+        let out_old = dir.path().join("out-old.bin");
+        eventually(
+            "bob exports the superseded version",
+            Duration::from_secs(30),
+            || async {
+                bob.ingest().await;
+                bob.export_asset_version(&oldest, &out_old).await.is_ok()
+            },
+        )
+        .await;
+        assert_eq!(
+            tokio::fs::read(&out_old).await.expect("reading the export"),
+            b"the original bytes",
+            "a superseded version must still be readable, or attaching a new one \
+             silently destroyed the old one"
+        );
+
+        // And reverting re-points at bytes that are already there.
+        alice
+            .revert_asset(entry, oldest.content)
+            .await
+            .expect("alice reverts the asset");
+        assert_ne!(
+            newest.content, oldest.content,
+            "the two versions must occupy different key spaces"
+        );
+        eventually("bob sees the revert", Duration::from_secs(30), || async {
+            bob.ingest().await;
+            bob.asset_versions(entry)
+                .await
+                .iter()
+                .max_by_key(|v| AssetVersion::precedence(v))
+                .is_some_and(|v| v.content == oldest.content)
+        })
+        .await;
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+
+    /// A document's versions name the member that wrote them, across the wire.
+    #[tokio::test]
+    async fn a_version_names_the_member_that_wrote_it() {
+        let Pair {
+            alice, bob, doc, ..
+        } = invited_pair(93).await;
+        let bob_member = bob.member_id().await.to_bytes();
+
+        bob.append(doc, "from bob\n").await.expect("bob writes");
+        eventually(
+            "alice attributes bob's change to bob",
+            Duration::from_secs(30),
+            || async {
+                alice.ingest().await;
+                alice
+                    .versions(doc)
+                    .await
+                    .iter()
+                    .any(|v| v.author == Some(bob_member))
+            },
+        )
+        .await;
+
+        alice.shutdown().await.expect("alice shuts down");
+        bob.shutdown().await.expect("bob shuts down");
+    }
+}

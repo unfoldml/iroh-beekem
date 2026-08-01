@@ -36,6 +36,31 @@ fn asset_contents() -> Vec<u8> {
     bytes
 }
 
+/// How many bytes of payload the store is holding right now.
+///
+/// Summed rather than counted, because a rotation's legitimate cost and the cost
+/// this test is watching for differ by orders of magnitude in size and not at all
+/// in blob count. A hash the store lists but cannot produce bytes for contributes
+/// nothing, which is the right answer: it is not occupying space here.
+async fn blob_bytes(ws: &Workspace) -> usize {
+    let hashes = ws
+        .node()
+        .blobs()
+        .list()
+        .hashes()
+        .await
+        .expect("listing blobs should succeed");
+    let mut total = 0;
+    for hash in hashes {
+        if let Ok(bytes) = ws.node().blobs().get_bytes(hash).await {
+            total += bytes.len();
+        } else {
+            // Listed but not readable here; see above.
+        }
+    }
+    total
+}
+
 async fn eventually<F, Fut>(what: &str, timeout: Duration, mut check: F)
 where
     F: FnMut() -> Fut,
@@ -200,13 +225,24 @@ async fn an_asset_round_trips_between_two_endpoints() {
 /// everything has to be carried into the new one — and for a document that means
 /// re-encrypting, which is cheap. Doing the same for an asset would re-encrypt
 /// and re-upload every segment on every removal. Asset entries are re-indexed
-/// against the hash the old replica already named, so the blob count is what
-/// says whether that is really what happened: a re-encryption would produce a
-/// fresh ciphertext per segment and the count would climb.
+/// against the hash the old replica already named, and the *bytes* the store
+/// holds are what say whether that is really what happened.
+///
+/// Bytes rather than a blob count, and the difference is what makes this test
+/// mean something. A rotation legitimately re-encrypts the manifest and every
+/// document, each of which is a blob — and the republish loop can run more than
+/// once on a slow machine, so the *number* of new blobs is noise of the same
+/// order as the three segments being watched for. It was: under `make coverage`
+/// this failed at exactly the boundary, on the baseline as well as on any
+/// change. The sizes are not comparable in the same way. Three padded segments
+/// are megabytes; a manifest and a short document are hundreds of bytes, so a
+/// budget of one segment separates the two cases by three orders of magnitude
+/// and cannot be eaten by an extra republish.
 #[tokio::test]
 async fn a_rotation_reindexes_an_asset_instead_of_re_encrypting_it() {
     let pair = attached_pair(2).await;
 
+    let bytes_before = blob_bytes(&pair.alice).await;
     let blobs_before = pair
         .alice
         .node()
@@ -254,16 +290,62 @@ async fn a_rotation_reindexes_an_asset_instead_of_re_encrypting_it() {
         .await
         .expect("listing alice's blobs")
         .len();
-    // The manifest and the documents are genuinely re-encrypted, so a few new
-    // blobs are expected; the asset's segments are not, and there are three of
-    // them. A re-encrypting rotation would add at least that many.
+    let bytes_after = blob_bytes(&pair.alice).await;
+    // One segment of headroom covers the manifest and documents a rotation does
+    // re-encrypt, with room to spare; re-encrypting the asset would cost three.
+    let budget = ASSET_SEGMENT_BYTES;
     assert!(
-        blobs_after < blobs_before + 3,
+        bytes_after < bytes_before + budget,
         "the asset's segments must be re-indexed rather than re-encrypted: the \
-         blob count went from {blobs_before} to {blobs_after}, which is at least \
-         one fresh ciphertext per segment"
+         store grew from {bytes_before} to {bytes_after} bytes across the \
+         rotation ({} blobs to {blobs_after}), and a fresh ciphertext per segment \
+         would cost about {}",
+        blobs_before,
+        ASSET_SEGMENT_BYTES * 3
     );
 
     pair.alice.shutdown().await.expect("alice shuts down");
     pair.bob.shutdown().await.expect("bob shuts down");
+}
+
+/// In a workspace where an attachment fails, upon listing the files, we expect
+/// no trace of it.
+///
+/// The entry has to be written *before* the version that declares the segments —
+/// a version of a file the manifest has never heard of is refused, which is what
+/// stops indexed segments existing with nothing naming them. That ordering makes
+/// a failure leave an entry with no versions, and an entry with no versions reads
+/// as an empty *document*, because that is exactly what "no versions" means. So
+/// the failure path has to withdraw it: a caller whose attachment failed must not
+/// be left holding a phantom file it never asked for.
+#[tokio::test]
+async fn a_failed_attachment_leaves_no_entry_behind() {
+    let node = Node::spawn().await.expect("binding");
+    let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(7));
+    let ws = Workspace::create(
+        node,
+        &identity,
+        info("failed attach"),
+        &mut ChaCha20Rng::seed_from_u64(7),
+    )
+    .await
+    .expect("founding a workspace");
+
+    let before = ws.files().await.len();
+    let missing = std::path::Path::new("/nonexistent/definitely-not-here.bin");
+    let result = ws
+        .attach_file(missing, "/scans/ghost.bin", "application/octet-stream")
+        .await;
+    assert!(
+        result.is_err(),
+        "attaching a file that does not exist must fail"
+    );
+    assert_eq!(
+        ws.files().await.len(),
+        before,
+        "a failed attachment left an entry behind: {:?}",
+        ws.files().await
+    );
+
+    ws.shutdown().await.expect("shutting down");
 }

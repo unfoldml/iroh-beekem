@@ -45,9 +45,10 @@ pub use iroh_beekem_core::Role;
 use iroh_beekem_core::{
     AdminAction, AssetMeta, AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect,
     EpochId, Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey,
-    WorkspaceSecret, WorkspaceState,
+    UnixSeconds, WorkspaceSecret, WorkspaceState,
     asset::{ContentDigest, open_segment, seal_segment},
     state::AssetKeyVerdict,
+    version::AssetVersion,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -79,8 +80,17 @@ pub const DOCS: [DocumentUuid; 3] = [
     DocumentUuid([9u8; 16]),
 ];
 
-/// The asset the [`Assets`] scenarios attach.
+/// The asset entry the [`Assets`] scenarios attach.
 pub const ASSET: DocumentUuid = DocumentUuid([11u8; 16]);
+
+/// The key space of that asset's first version.
+///
+/// Distinct from [`ASSET`] on purpose, and the distinction is the point: an
+/// entry is an identity, a *version* is a body of segments, and each version is
+/// blinded under a UUID of its own so that attaching a new one cannot overwrite
+/// the index entries protecting the previous one's blobs. Using the entry's own
+/// UUID here would model a shape the facade no longer writes.
+pub const ASSET_V1: DocumentUuid = DocumentUuid([12u8; 16]);
 
 /// Plaintext bytes per segment in the simulator.
 ///
@@ -781,6 +791,23 @@ pub enum WsOp {
         /// Index into [`DOCS`].
         doc: usize,
     },
+    /// Put a document back to a version this node holds.
+    ///
+    /// `back` counts versions from the newest: 0 is the state the document is
+    /// already in, 1 the state before the last change, and so on, clamped to what
+    /// this node's history actually holds. Expressed that way because the
+    /// generated workload cannot know a [`VersionId`](iroh_beekem_core::VersionId)
+    /// — those are minted by the very edits the workload is producing — and
+    /// because "undo the last thing" is what an application offers a person.
+    ///
+    /// A node holding no history for the document applies nothing, which is the
+    /// same answer the real facade gives.
+    Revert {
+        /// Index into [`DOCS`].
+        doc: usize,
+        /// How many changes to step back from the newest.
+        back: usize,
+    },
 }
 
 impl WsOp {
@@ -792,6 +819,7 @@ impl WsOp {
             | Self::Write { doc, .. }
             | Self::Insert { doc, .. }
             | Self::Remove { doc, .. }
+            | Self::Revert { doc, .. }
             | Self::Read { doc } => *doc,
         }
     }
@@ -1057,6 +1085,24 @@ impl<S: Scenario> std::fmt::Debug for WorkspaceNode<S> {
 fn tree_id() -> TreeId {
     TreeId::from(MemorySigner::generate(&mut ChaCha20Rng::seed_from_u64(0xFEED)).verifying_key())
 }
+
+/// The simulated wall clock every node reads, from propsim's virtual time.
+///
+/// The core takes the instant of an event as a parameter rather than reading a
+/// clock, which is what lets this harness date a version history: virtual time is
+/// a pure function of the seed, so two runs of one seed produce byte-identical
+/// timestamps and a property may assert on them.
+///
+/// Offset from [`SIM_EPOCH`] rather than used raw so the dates a test prints are
+/// plausible ones. Every node reads the same virtual clock, which makes this
+/// harness *kinder* than production on one point worth remembering: a real group
+/// has skewed clocks, and a timestamp is a claim for that reason.
+fn wall_clock(elapsed: Duration) -> UnixSeconds {
+    UnixSeconds::new(SIM_EPOCH.saturating_add(i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)))
+}
+
+/// The wall-clock instant a simulated run starts at: 2026-01-01T00:00:00Z.
+const SIM_EPOCH: i64 = 1_767_225_600;
 
 /// Per-node deterministic randomness.
 ///
@@ -1772,6 +1818,35 @@ impl<S: Scenario> WorkspaceNode<S> {
                 pos: *pos,
                 len: *len,
             },
+            // Deliberately *not* recorded as contributed, for the same reason a
+            // whole-document write is not: a revert can remove text an earlier
+            // append added, so counting it would make the "own edits survive"
+            // property assert something false.
+            WsOp::Revert { back, .. } => {
+                let versions = self
+                    .state
+                    .as_ref()
+                    .map(|state| state.document_versions(doc))
+                    .unwrap_or_default();
+                // Clamped rather than refused, exactly as a text offset is: the
+                // workload names a step back without knowing how much history
+                // this node holds, and on a partitioned node that is less than
+                // the author of the edits has.
+                let Some(target) = versions
+                    .len()
+                    .checked_sub(1 + *back)
+                    .and_then(|i| versions.get(i))
+                else {
+                    // Nothing to revert to yet. A no-op rather than a failure,
+                    // since a node that has merged one change has no earlier
+                    // state to name.
+                    return WsResp::Applied;
+                };
+                Event::RevertDocument {
+                    doc,
+                    to: target.id.clone(),
+                }
+            }
         };
         self.drive(event, cx, 11);
         WsResp::Applied
@@ -2053,7 +2128,7 @@ impl<S: Scenario> WorkspaceNode<S> {
             return;
         };
         let mut rng = node_rng(me, 0xA55E7);
-        let Ok((key, effects)) = state.seal_asset_key(ASSET, &mut rng) else {
+        let Ok((key, effects)) = state.seal_asset_key(ASSET_V1, &mut rng) else {
             return;
         };
         self.apply_effects(effects, cx, 0xA55E8);
@@ -2071,11 +2146,12 @@ impl<S: Scenario> WorkspaceNode<S> {
             let end = (start + SIM_SEGMENT_BYTES as usize).min(plaintext.len());
             let piece = &plaintext[start..end];
             digest.update(piece);
-            let Ok(sealed) = seal_segment(&key, ASSET, index, segments, SIM_SEGMENT_BYTES, piece)
+            let Ok(sealed) =
+                seal_segment(&key, ASSET_V1, index, segments, SIM_SEGMENT_BYTES, piece)
             else {
                 return;
             };
-            let key_at = secret.asset_part_key(ASSET, index);
+            let key_at = secret.asset_part_key(ASSET_V1, index);
             // Held locally as well as broadcast, exactly as a real node holds
             // what it wrote.
             self.segments.insert(key_at, sealed.clone());
@@ -2087,23 +2163,42 @@ impl<S: Scenario> WorkspaceNode<S> {
             });
         }
 
+        // The entry first, empty, then the version that declares the segments —
+        // the order `Workspace::attach_file` uses, and it has to be this way
+        // round: a version of a file the manifest has never heard of is refused,
+        // which is what stops indexed segments existing with nothing naming them.
         self.drive(
             Event::UpsertFile {
                 entry: FileEntry {
                     uuid: ASSET,
                     logical_path: "/asset.bin".into(),
                     mime_type: "application/octet-stream".into(),
-                    asset: Some(AssetMeta {
-                        size,
-                        segments,
-                        segment_bytes: SIM_SEGMENT_BYTES,
-                        content_hash: digest.finish(),
-                    }),
+                    asset: None,
                 },
             },
             cx,
             0xA55E9,
         );
+        let now = wall_clock(cx.now());
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let mut rng = node_rng(me, 0xA55EA);
+        let Ok(effects) = state.add_asset_version(
+            ASSET,
+            ASSET_V1,
+            AssetMeta {
+                size,
+                segments,
+                segment_bytes: SIM_SEGMENT_BYTES,
+                content_hash: digest.finish(),
+            },
+            &mut rng,
+            now,
+        ) else {
+            return;
+        };
+        self.apply_effects(effects, cx, 0xA55EB);
     }
 
     /// Reassemble the scenario's asset, or say why this node cannot.
@@ -2116,26 +2211,29 @@ impl<S: Scenario> WorkspaceNode<S> {
     #[must_use]
     pub fn read_asset(&mut self) -> Option<Vec<u8>> {
         let secret = WorkspaceSecret::new(workspace_secret_bytes());
-        let meta = self
+        // The current version by precedence, exactly as `Workspace::export_asset`
+        // picks it — never "the last one recorded", which is a fact about merge
+        // order rather than about what anybody attached.
+        let current = self
             .state
             .as_ref()?
-            .manifest()
-            .files()
+            .asset_versions(ASSET)
             .into_iter()
-            .find(|entry| entry.uuid == ASSET)
-            .and_then(|entry| entry.asset)?;
+            .max_by_key(AssetVersion::precedence)?;
+        let meta = current.meta;
+        let content = current.content;
 
-        let (_, key_chunk) = self.replica.get(&secret.asset_key_key(ASSET))?.clone();
+        let (_, key_chunk) = self.replica.get(&secret.asset_key_key(content))?.clone();
         let AssetKeyVerdict::Ready(key) = self.state.as_mut()?.open_asset_key(&key_chunk) else {
             return None;
         };
 
         let mut out = Vec::with_capacity(usize::try_from(meta.size).unwrap_or_default());
         for index in 0..meta.segments {
-            let sealed = self.segments.get(&secret.asset_part_key(ASSET, index))?;
+            let sealed = self.segments.get(&secret.asset_part_key(content, index))?;
             let piece = open_segment(
                 &key,
-                ASSET,
+                content,
                 index,
                 meta.segments,
                 meta.segment_bytes,
@@ -2226,11 +2324,12 @@ impl<S: Scenario> WorkspaceNode<S> {
     /// Feed an event to the local state machine, gossiping whatever it emits.
     fn drive(&mut self, event: Event, cx: &mut dyn Ctx<Self>, salt: u64) {
         let me = cx.me();
+        let now = wall_clock(cx.now());
         let Some(state) = self.state.as_mut() else {
             return;
         };
         let mut rng = node_rng(me, salt);
-        let Ok(effects) = state.handle(event, &mut rng) else {
+        let Ok(effects) = state.handle(event, &mut rng, now) else {
             return;
         };
         self.apply_effects(effects, cx, salt);
@@ -3097,6 +3196,13 @@ impl<S: Scenario> ClientCodec<WorkspaceNode<S>> for WorkspaceSpec {
                     len: idx(l)?,
                 },
             )),
+            [Value::Keyword(f), d, b] if f == "revert" => Some((
+                Function::new("revert"),
+                WsOp::Revert {
+                    doc: idx(d)?,
+                    back: idx(b)?,
+                },
+            )),
             [Value::Keyword(f), d] if f == "read" => {
                 Some((Function::new("read"), WsOp::Read { doc: idx(d)? }))
             }
@@ -3146,6 +3252,13 @@ pub fn crud_workload(nodes: usize) -> BoxedStrategy<FrozenOp> {
             ])),
         1 => (doc(), small(), small())
             .prop_map(|(d, p, l)| Value::List(vec![Value::keyword("remove"), d, p, l])),
+        // Reverts, drawn as often as whole-document writes. They are what makes
+        // the convergence properties cover the feature at all: a revert is an
+        // ordinary forward edit, and if it were ever implemented as a rewrite of
+        // history, a peer that had already merged the operations being undone
+        // would diverge permanently — which is what these plans detect.
+        1 => (doc(), small())
+            .prop_map(|(d, b)| Value::List(vec![Value::keyword("revert"), d, b])),
         2 => doc().prop_map(|d| Value::List(vec![Value::keyword("read"), d])),
     ];
 

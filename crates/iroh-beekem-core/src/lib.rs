@@ -35,6 +35,7 @@ pub mod manifest;
 pub mod snapshot;
 pub mod state;
 pub mod sync_poll;
+pub mod version;
 
 pub use asset::{ASSET_SEGMENT_BYTES, AssetKey, AssetMeta, SegmentVerdict};
 pub use blinding::{DocumentUuid, StorageKey, WorkspaceSecret};
@@ -48,3 +49,4 @@ pub use keys::{AuthorizedOp, CgkaController, ControlOp, DecryptOutcome, EpochId,
 pub use manifest::{DeviceDisplay, DeviceRecord, FileEntry, Manifest, UserRecord, WorkspaceInfo};
 pub use snapshot::{CgkaSnapshot, SNAPSHOT_VERSION, WorkspaceSnapshot};
 pub use state::{Effect, Event, NamespaceEpoch, RepairTarget, WorkspaceState};
+pub use version::{Checkpoint, RestoreOutcome, UnixSeconds, VersionId, VersionInfo};
