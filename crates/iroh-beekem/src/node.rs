@@ -13,7 +13,10 @@
 //!   themselves, fetched on demand over QUIC and verified end-to-end by BLAKE3.
 //!
 //! Spawn order matters: blobs and gossip must exist before docs, which is
-//! handed both.
+//! handed both. Since blob collection landed there is a third thing that must
+//! come first: the [`ProtectCallbackHandler`] pair, because one half is an
+//! option on the blob store and the other an option on the docs engine. See
+//! [`gc_pair`].
 //!
 //! All three are wrapped in a [`RosterGuard`] before being registered, so a peer
 //! that is not a member of the workspace is refused at the connection level on
@@ -25,15 +28,16 @@ use std::{
     ops::Deref,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
 use iroh_blobs::{
     BlobsProtocol,
     api::Store as BlobStore,
-    store::{fs::FsStore, mem::MemStore},
+    store::{GcConfig, fs::FsStore, mem::MemStore},
 };
-use iroh_docs::protocol::Docs;
+use iroh_docs::{engine::ProtectCallbackHandler, protocol::Docs};
 use iroh_gossip::net::Gossip;
 
 use crate::{
@@ -85,6 +89,69 @@ pub struct Node {
 /// The spent-nonce ledger as the node holds it: shared, and mutable in place.
 type RedeemedInvites = Arc<Mutex<SpentNonces>>;
 
+/// How often the blob store sweeps for content no document references.
+///
+/// Not aggressive, deliberately. A sweep walks every record in the replica store
+/// to build the live set, so the cost is proportional to the workspace rather
+/// than to what was superseded since the last run. Five minutes bounds the store
+/// at roughly one republish cycle's worth of dead blobs, which is a far smaller
+/// number than the unbounded growth it replaces.
+///
+/// Spelled in seconds rather than with `Duration::from_mins`, which clippy
+/// prefers: that constructor is newer than this crate's MSRV of 1.91.
+#[allow(
+    clippy::duration_suboptimal_units,
+    reason = "Duration::from_mins postdates the 1.91 MSRV"
+)]
+pub const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Tunables a [`Node`] is spawned with.
+///
+/// Exists because the sweep interval is the only way to observe collection at
+/// all: `iroh-blobs` runs it on a timer inside the store and exposes no
+/// single-shot sweep, so a test — or an application that wants a tighter bound on
+/// disk than [`DEFAULT_GC_INTERVAL`] gives — has nothing else to reach for.
+#[derive(Debug, Clone)]
+pub struct NodeOptions {
+    /// How often to reclaim blobs no document entry references.
+    ///
+    /// Shortening this trades CPU and store reads for a tighter bound on disk
+    /// used by superseded content; it never affects correctness, because what a
+    /// sweep may delete is decided by the protection callback rather than by how
+    /// often it runs.
+    pub gc_interval: Duration,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self {
+            gc_interval: DEFAULT_GC_INTERVAL,
+        }
+    }
+}
+
+/// The two halves of blob collection, which must be created before either store.
+///
+/// A blob is reachable if some `iroh-docs` record names its hash, and neither
+/// crate knows that on its own: the sweep lives in `iroh-blobs` and the records
+/// live in `iroh-docs`. [`ProtectCallbackHandler::new`] returns the two ends of
+/// the channel that joins them — the [`ProtectCb`](iroh_blobs::store::ProtectCb)
+/// goes into the blob store's
+/// [`GcConfig`], the handler into the docs builder — and a store built with only
+/// one of them either collects nothing (no config) or collects **everything not
+/// currently being written** (config without the callback), because an unanswered
+/// protect callback yields an empty live set.
+///
+/// Returned as a pair from one call site so the two cannot drift apart.
+fn gc_pair(interval: Duration) -> (ProtectCallbackHandler, GcConfig) {
+    let (handler, protect_cb) = ProtectCallbackHandler::new();
+    let config = GcConfig {
+        interval,
+        add_protected: Some(protect_cb),
+    };
+    (handler, config)
+}
+
 impl Node {
     /// Bind an endpoint and start the blobs, gossip and docs protocols.
     ///
@@ -93,14 +160,27 @@ impl Node {
     /// Returns [`WorkspaceError::Bind`] if the endpoint cannot bind, or
     /// [`WorkspaceError::Storage`] if the docs engine fails to start.
     pub async fn spawn() -> Result<Self, WorkspaceError> {
+        Self::spawn_with_options(NodeOptions::default()).await
+    }
+
+    /// [`Self::spawn`], with the tunables in [`NodeOptions`] chosen explicitly.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::spawn`].
+    pub async fn spawn_with_options(options: NodeOptions) -> Result<Self, WorkspaceError> {
         let endpoint = Endpoint::builder(presets::N0)
             .bind()
             .await
             .map_err(|e| WorkspaceError::Bind(e.to_string()))?;
 
-        let blobs = MemStore::new();
+        let (protect_handler, gc) = gc_pair(options.gc_interval);
+        let blobs = MemStore::new_with_opts(iroh_blobs::store::mem::Options {
+            gc_config: Some(gc),
+        });
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs = Docs::memory()
+            .protect_handler(protect_handler)
             .spawn(endpoint.clone(), blobs.deref().clone(), gossip.clone())
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
@@ -149,6 +229,19 @@ impl Node {
     /// stored endpoint key is unreadable, or if either backing store fails to
     /// open; [`WorkspaceError::Bind`] if the endpoint cannot bind.
     pub async fn spawn_persistent(root: impl AsRef<Path>) -> Result<Self, WorkspaceError> {
+        Self::spawn_persistent_with_options(root, NodeOptions::default()).await
+    }
+
+    /// [`Self::spawn_persistent`], with the tunables in [`NodeOptions`] chosen
+    /// explicitly.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::spawn_persistent`].
+    pub async fn spawn_persistent_with_options(
+        root: impl AsRef<Path>,
+        options: NodeOptions,
+    ) -> Result<Self, WorkspaceError> {
         let store = Store::open(root)?;
 
         // Bound to the stored key rather than a fresh one. This is the single
@@ -159,11 +252,22 @@ impl Node {
             .await
             .map_err(|e| WorkspaceError::Bind(e.to_string()))?;
 
-        let blobs = FsStore::load(store.subdir(BLOBS_DIR))
+        let (protect_handler, gc) = gc_pair(options.gc_interval);
+        // `FsStore::load` is `load_with_opts` with `gc: None`; spelling it out is
+        // the only way to hand the store a sweep configuration, and the database
+        // filename must match what `load` would have chosen or a restart opens a
+        // different store.
+        let blob_root = store.subdir(BLOBS_DIR);
+        let blob_options = iroh_blobs::store::fs::options::Options {
+            gc: Some(gc),
+            ..iroh_blobs::store::fs::options::Options::new(&blob_root)
+        };
+        let blobs = FsStore::load_with_opts(blob_root.join("blobs.db"), blob_options)
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs = Docs::persistent(store.subdir(DOCS_DIR))
+            .protect_handler(protect_handler)
             .spawn(endpoint.clone(), blobs.deref().clone(), gossip.clone())
             .await
             .map_err(|e| WorkspaceError::Storage(e.to_string()))?;

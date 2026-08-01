@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -16,11 +17,17 @@ use beekem::id::{MemberId, TreeId};
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    AdminAction, AuthorizedOp, CgkaController, DEFAULT_THRESHOLD, DeviceRecord, DocumentUuid,
-    Effect, EpochId, Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, Role,
-    WorkspaceInfo, WorkspaceSecret, WorkspaceState,
+    ASSET_SEGMENT_BYTES, AdminAction, AssetKey, AssetMeta, AuthorizedOp, CgkaController,
+    DEFAULT_THRESHOLD, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
+    NamespaceEpoch, ProposalStatus, RepairTarget, Role, WorkspaceInfo, WorkspaceSecret,
+    WorkspaceState,
+    asset::{ContentDigest, open_segment, seal_segment},
+    state::AssetKeyVerdict,
 };
-use iroh_blobs::api::Store as BlobStore;
+use iroh_blobs::{
+    HashAndFormat,
+    api::{Store as BlobStore, downloader::Shuffled},
+};
 use iroh_docs::{
     Author, AuthorId, NamespaceId,
     api::{
@@ -28,7 +35,7 @@ use iroh_docs::{
         protocol::{AddrInfoOptions, ShareMode},
     },
     engine::LiveEvent,
-    store::Query,
+    store::{DownloadPolicy, FilterKind, Query},
 };
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipSender},
@@ -945,6 +952,10 @@ impl Workspace {
         // straight away; a joiner derives an empty one and relies on the
         // bootstrap entry until its first manifest arrives.
         refresh_roster(&inner).await;
+        // Before any entry can reconcile, so a workspace that already holds
+        // assets does not fetch their payloads on the way up.
+        refresh_download_policy(&inner).await;
+        sweep_orphaned_assets(&inner).await;
 
         // Control plane: CGKA operations arriving over gossip.
         let control = Arc::clone(&inner);
@@ -1359,6 +1370,10 @@ impl Workspace {
                 uuid,
                 logical_path: path.to_string(),
                 mime_type: mime_type.to_string(),
+                // A CRDT document, not a binary asset. Assets are created by
+                // their own entry point, which knows the size and segment count
+                // this field has to carry.
+                asset: None,
             },
         })
         .await?;
@@ -1380,6 +1395,253 @@ impl Workspace {
     /// Every document the manifest records, with its logical path.
     pub async fn files(&self) -> Vec<FileEntry> {
         self.inner.state.lock().await.manifest().files()
+    }
+
+    /// Attach a local file as a binary asset, streaming it a segment at a time.
+    ///
+    /// The plaintext is never resident: it is read, sealed and stored in
+    /// [`ASSET_SEGMENT_BYTES`] pieces, so attaching a ten-gigabyte file costs one
+    /// segment of memory. That is the whole reason assets do not go through the
+    /// CRDT path, which would have to export the entire document to publish it.
+    ///
+    /// # Ordering
+    ///
+    /// The asset's content key is published **before** its first segment, and
+    /// the manifest entry naming the asset **after** its last. Both halves
+    /// matter. Key first is the standing rule — a peer that fetches a segment
+    /// with no key chunk to unwrap cannot read it. Manifest last is what makes
+    /// the operation atomic to a reader: until the entry exists the asset is not
+    /// in `files()`, so a crash halfway leaves segments nobody references rather
+    /// than a truncated file somebody can open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::AssetIo`] if the local file cannot be read,
+    /// [`WorkspaceError::Core`] if this node may not write, and
+    /// [`WorkspaceError::Storage`] if a segment cannot be stored. On any failure
+    /// the entries already written are withdrawn, so the blobs behind them fall
+    /// out of the index and the next sweep reclaims them.
+    ///
+    /// [`ASSET_SEGMENT_BYTES`]: iroh_beekem_core::ASSET_SEGMENT_BYTES
+    pub async fn attach_file(
+        &self,
+        local: impl AsRef<Path>,
+        logical_path: &str,
+        mime_type: &str,
+    ) -> Result<DocumentUuid, WorkspaceError> {
+        let path = local.as_ref();
+        let size = tokio::fs::metadata(path).await?.len();
+        // The default segmentation. Recorded in the entry rather than assumed by
+        // the reader, so a future default does not make today's assets
+        // unreadable.
+        let segment_bytes = u32::try_from(ASSET_SEGMENT_BYTES).unwrap_or(u32::MAX);
+        let segments = AssetMeta::segments_for(size, segment_bytes);
+        let uuid = DocumentUuid::generate(&mut rand::rngs::OsRng);
+
+        // Key material first, exactly as `publish_keyed` does for a document.
+        let (key, effects) = {
+            let mut state = self.inner.state.lock().await;
+            state.seal_asset_key(uuid, &mut rand::rngs::OsRng)?
+        };
+        apply_effects(&self.inner, effects).await;
+        // Durably, and before the first segment: if this process does not
+        // survive to declare the asset, this is the only record that its
+        // segments exist.
+        note_pending_asset(&self.inner, uuid);
+
+        match self
+            .write_segments(uuid, &key, size, segments, segment_bytes, path)
+            .await
+        {
+            Ok(content_hash) => {
+                self.drive(Event::UpsertFile {
+                    entry: FileEntry {
+                        uuid,
+                        logical_path: logical_path.to_string(),
+                        mime_type: mime_type.to_string(),
+                        asset: Some(AssetMeta {
+                            size,
+                            segments,
+                            segment_bytes,
+                            content_hash,
+                        }),
+                    },
+                })
+                .await?;
+                refresh_download_policy(&self.inner).await;
+                // Declared, so it is no longer an orphan in waiting.
+                clear_pending_assets(&self.inner, &[uuid.0]);
+                Ok(uuid)
+            }
+            Err(err) => {
+                // Withdraw what was written. Without this a failed ten-gigabyte
+                // upload leaks ten gigabytes: the segments are indexed, the
+                // index is what protects a blob from collection, and no manifest
+                // entry will ever name them.
+                self.discard_partial_asset(uuid).await;
+                clear_pending_assets(&self.inner, &[uuid.0]);
+                Err(err)
+            }
+        }
+    }
+
+    /// Seal and store every segment of `path`, returning the plaintext digest.
+    async fn write_segments(
+        &self,
+        uuid: DocumentUuid,
+        key: &AssetKey,
+        size: u64,
+        segments: u64,
+        segment_bytes: u32,
+        path: &Path,
+    ) -> Result<[u8; 32], WorkspaceError> {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut digest = ContentDigest::new();
+        let width = segment_bytes as usize;
+        let mut buffer = vec![0u8; width];
+        let mut remaining = size;
+
+        for index in 0..segments {
+            let want = usize::try_from(remaining.min(u64::from(segment_bytes))).unwrap_or(width);
+            // `read_exact` rather than `read`: a short read is not end-of-file
+            // here, it is a partial fill, and treating it as the segment would
+            // silently truncate the asset.
+            file.read_exact(&mut buffer[..want]).await?;
+            remaining -= want as u64;
+
+            digest.update(&buffer[..want]);
+            let sealed = seal_segment(key, uuid, index, segments, segment_bytes, &buffer[..want])?;
+            store_segment(
+                &self.inner,
+                self.inner.secret.asset_part_key(uuid, index).as_bytes(),
+                sealed,
+            )
+            .await?;
+        }
+        Ok(digest.finish())
+    }
+
+    /// Withdraw every index entry an interrupted attachment left behind.
+    async fn discard_partial_asset(&self, uuid: DocumentUuid) {
+        let secret = &self.inner.secret;
+        let (key_entry, prefix) = (secret.asset_key_key(uuid), secret.asset_prefix(uuid));
+        let handle = doc(&self.inner).await;
+        let _ = handle
+            .del(
+                self.inner.author,
+                Bytes::copy_from_slice(key_entry.as_bytes()),
+            )
+            .await;
+        let _ = handle
+            .del(self.inner.author, Bytes::copy_from_slice(&prefix))
+            .await;
+    }
+
+    /// Write a binary asset out to a local file, a segment at a time.
+    ///
+    /// The reverse of [`Self::attach_file`], with the same memory bound, and it
+    /// **verifies**: the plaintext digest recorded in the manifest is recomputed
+    /// over what was written and compared before this returns `Ok`. That check is
+    /// what makes the manifest's mutability harmless. The manifest is an
+    /// unconditional CRDT merge, so any member can rewrite an asset's recorded
+    /// size or segment count; doing so makes the export fail rather than hand the
+    /// caller a different file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::NotAnAsset`] if the entry is a document,
+    /// [`WorkspaceError::AssetKeyUnavailable`] if this node cannot yet unwrap the
+    /// content key — a repair is requested, and a later attempt succeeds —
+    /// [`WorkspaceError::MissingSegment`] if a segment has not reached this node,
+    /// [`WorkspaceError::CorruptAsset`] if the reassembled bytes do not match the
+    /// recorded digest, and [`WorkspaceError::AssetIo`] if `target` cannot be
+    /// written.
+    pub async fn export_asset(
+        &self,
+        asset: DocumentUuid,
+        target: impl AsRef<Path>,
+    ) -> Result<(), WorkspaceError> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let meta = self
+            .files()
+            .await
+            .into_iter()
+            .find(|entry| entry.uuid == asset)
+            .and_then(|entry| entry.asset)
+            .ok_or(WorkspaceError::NotAnAsset)?;
+
+        let key = self.open_asset_key(asset).await?;
+
+        let mut out = tokio::fs::File::create(target.as_ref()).await?;
+        let mut digest = ContentDigest::new();
+        for index in 0..meta.segments {
+            let sealed = fetch_indexed_bytes(
+                &self.inner,
+                self.inner.secret.asset_part_key(asset, index).as_bytes(),
+            )
+            .await
+            .ok_or(WorkspaceError::MissingSegment { index })?;
+
+            let plaintext = open_segment(
+                &key,
+                asset,
+                index,
+                meta.segments,
+                meta.segment_bytes,
+                meta.payload_len(index),
+                &sealed,
+            )
+            .map_err(|_| WorkspaceError::CorruptAsset)?;
+            digest.update(&plaintext);
+            out.write_all(&plaintext).await?;
+        }
+        out.flush().await?;
+
+        if digest.finish() == meta.content_hash {
+            Ok(())
+        } else {
+            Err(WorkspaceError::CorruptAsset)
+        }
+    }
+
+    /// Fetch and unwrap an asset's content key, asking for a repair if it is
+    /// keyed under an epoch this node cannot derive.
+    async fn open_asset_key(&self, asset: DocumentUuid) -> Result<AssetKey, WorkspaceError> {
+        let bytes = fetch_indexed_bytes(
+            &self.inner,
+            self.inner.secret.asset_key_key(asset).as_bytes(),
+        )
+        .await
+        .ok_or(WorkspaceError::AssetKeyUnavailable)?;
+        let chunk = decode_chunk(&bytes)?;
+
+        let verdict = {
+            let mut state = self.inner.state.lock().await;
+            state.open_asset_key(&chunk)
+        };
+        match verdict {
+            AssetKeyVerdict::Ready(key) => Ok(key),
+            // The epoch predates this node's membership, which no waiting fixes.
+            // One 32-byte chunk re-encrypted under a fresh epoch is the entire
+            // cost of repairing an asset of any size — the reason the content key
+            // is behind an envelope in the first place.
+            AssetKeyVerdict::Unreachable => {
+                request_repair(
+                    &self.inner,
+                    RepairTarget::AssetKey(asset),
+                    EpochId::of(&chunk),
+                )
+                .await;
+                Err(WorkspaceError::AssetKeyUnavailable)
+            }
+            // The establishing operation is still in flight; the control plane
+            // delivers it on its own and a later attempt succeeds.
+            AssetKeyVerdict::AwaitingKey => Err(WorkspaceError::AssetKeyUnavailable),
+            AssetKeyVerdict::Corrupt => Err(WorkspaceError::CorruptAsset),
+        }
     }
 
     /// Resolve a logical path to the document it names.
@@ -1765,37 +2027,79 @@ async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
             member,
             target,
             epoch,
-        } => {
-            let Some(requester) = member_id_from_bytes(&member) else {
-                tracing::warn!("discarding a repair request naming an unparseable member");
-                return;
-            };
-            // Checked before the core is asked to do anything, because what
-            // is being limited is the *work*: a member ignoring its own
-            // sending cooldown must not be able to buy more re-keys by
-            // shouting.
-            let allowed = {
-                let mut cooldown = inner.repair_answer_cooldown.lock().await;
-                cooldown.claim(member, Instant::now())
-            };
-            if !allowed {
-                tracing::debug!("suppressing a repeat repair answer for one peer");
-                return;
-            }
-            let effects = {
-                let mut state = inner.state.lock().await;
-                report_rejection(state.handle(
-                    Event::RepairRequested {
-                        requester,
-                        target,
-                        epoch,
-                    },
-                    &mut rand::rngs::OsRng,
-                ))
-            };
-            apply_effects(inner, effects).await;
-        }
+        } => answer_repair(inner, member, target, epoch).await,
     }
+}
+
+/// Answer one peer's repair request, if it is allowed to make it.
+///
+/// Split out of [`apply_control_msg`] because it is the only arm with a policy
+/// decision of its own: answering costs the group a tree operation, so the rate
+/// limit is a denial-of-service control rather than a tuning knob.
+async fn answer_repair(inner: &Arc<Inner>, member: [u8; 32], target: RepairTarget, epoch: EpochId) {
+    let Some(requester) = member_id_from_bytes(&member) else {
+        tracing::warn!("discarding a repair request naming an unparseable member");
+        return;
+    };
+    // Checked before the core is asked to do anything, because what is being
+    // limited is the *work*: a member ignoring its own sending cooldown must not
+    // be able to buy more re-keys by shouting.
+    let allowed = {
+        let mut cooldown = inner.repair_answer_cooldown.lock().await;
+        cooldown.claim(member, Instant::now())
+    };
+    if !allowed {
+        tracing::debug!("suppressing a repeat repair answer for one peer");
+        return;
+    }
+
+    // An asset key is the one repair target whose ciphertext is not in the
+    // core's state — it lives in a blob any member can fetch, and caching it
+    // there would mean persisting a secret to avoid a decryption. So it is
+    // fetched here and handed in, rather than routed through
+    // `Event::RepairRequested` like the other three.
+    let effects = if let RepairTarget::AssetKey(asset) = target {
+        answer_asset_key_repair(inner, requester, asset).await
+    } else {
+        let mut state = inner.state.lock().await;
+        report_rejection(state.handle(
+            Event::RepairRequested {
+                requester,
+                target,
+                epoch,
+            },
+            &mut rand::rngs::OsRng,
+        ))
+    };
+    apply_effects(inner, effects).await;
+}
+
+/// Re-encrypt one asset's content key for a peer that cannot derive its epoch.
+///
+/// The cheapest repair in the system, and deliberately so: an asset's segments
+/// are keyed by a per-asset content key rather than by the CGKA, so restoring a
+/// ten-gigabyte asset to a newly admitted member costs one 32-byte chunk under a
+/// fresh epoch. Encrypting the segments to the group directly would have cost
+/// ten gigabytes.
+async fn answer_asset_key_repair(
+    inner: &Inner,
+    requester: MemberId,
+    asset: DocumentUuid,
+) -> Vec<Effect> {
+    let Some(bytes) =
+        fetch_indexed_bytes(inner, inner.secret.asset_key_key(asset).as_bytes()).await
+    else {
+        // This node does not hold the key chunk either. Not an error: some other
+        // member will answer, exactly as with a document repair a viewer cannot
+        // serve.
+        return Vec::new();
+    };
+    let Ok(chunk) = decode_chunk(&bytes) else {
+        tracing::warn!("an asset key entry did not decode; ignoring the repair request");
+        return Vec::new();
+    };
+    let mut state = inner.state.lock().await;
+    report_rejection(state.reseal_asset_key(requester, asset, &chunk, &mut rand::rngs::OsRng))
 }
 
 /// Pump the data plane: entries and payloads arriving over docs and blobs.
@@ -2003,11 +2307,37 @@ async fn apply_effects(inner: &Arc<Inner>, effects: Vec<Effect>) {
                     tracing::error!(%err, "failed to withdraw an index entry");
                 }
             }
+            // Every segment of a deleted asset, in one ranged write. `Doc::del`
+            // takes a *prefix*, which is why the segment key space of one asset
+            // is contiguous by construction: a multi-gigabyte asset has
+            // thousands of segments, and withdrawing them one at a time would
+            // make deleting one file thousands of index writes.
+            Effect::DeleteAssetSegments { prefix, .. } => {
+                inner
+                    .seen_entries
+                    .lock()
+                    .await
+                    .retain(|(k, _), _| !k.starts_with(&prefix));
+                if let Err(err) = doc(inner)
+                    .await
+                    .del(inner.author, Bytes::copy_from_slice(&prefix))
+                    .await
+                {
+                    tracing::error!(%err, "failed to withdraw an asset's segment entries");
+                }
+            }
             // A manifest arrival is the only way membership changes reach a node
             // that did not issue them, so it is also the only place a peer
             // learns it should stop accepting a removed device — or start
             // accepting a newly admitted one.
-            Effect::ManifestUpdated => refresh_roster(inner).await,
+            Effect::ManifestUpdated => {
+                refresh_roster(inner).await;
+                // The manifest is also where assets are declared, and the
+                // download policy is derived from that list. A peer that
+                // attaches an asset must not have every other member start
+                // fetching it the moment the entries reconcile.
+                refresh_download_policy(inner).await;
+            }
             Effect::RequestRepair { target, epoch } => {
                 request_repair(inner, target, epoch).await;
             }
@@ -2236,6 +2566,11 @@ async fn adopt_namespace(inner: &Arc<Inner>, node: &Node, ticket: &[u8], role_ma
     };
 
     let previous = std::mem::replace(&mut *inner.doc.write().await, replacement);
+
+    // Carry the assets across *before* leaving the old replica, which is the
+    // only place their index entries can still be read from.
+    reindex_assets(inner, &previous).await;
+
     // Stop reconciling the abandoned namespace. Not dropped: peers that have
     // not yet seen the rotation may still be catching up on it.
     if let Err(err) = previous.leave().await {
@@ -2250,7 +2585,74 @@ async fn adopt_namespace(inner: &Arc<Inner>, node: &Node, ticket: &[u8], role_ma
     } else {
         // The pump is live on the new namespace.
     }
+    refresh_download_policy(inner).await;
     republish(inner).await;
+}
+
+/// Copy this node's asset index entries into the namespace it has just adopted.
+///
+/// # Why assets are re-indexed and documents are re-encrypted
+///
+/// The new replica starts empty, so everything has to be carried across somehow.
+/// For a document that means republishing: it is a CRDT, its state is small, and
+/// `republish` below re-exports it. Doing the same for an asset would mean
+/// re-encrypting and re-uploading gigabytes that have not changed a byte — on
+/// every removal, for every member.
+///
+/// It is unnecessary, and the reason is not an optimisation argument but a
+/// security one. An asset segment is immutable ciphertext, and the removed
+/// device could already decrypt everything published before its removal;
+/// re-announcing the same bytes under a new namespace tells it nothing it did
+/// not have, and it cannot reach the new replica in any case — it holds no
+/// capability for it and the roster refuses it. What the rotation protects is
+/// everything published *after*, which is keyed under an epoch the removed leaf
+/// can no longer derive. So the same `(hash, size)` is simply written into the
+/// new index.
+///
+/// Only entries whose payload this node actually holds are carried, because an
+/// index entry is a promise to serve: advertising a blob this node cannot
+/// provide would answer a peer's fetch with nothing. Every member does this on
+/// adoption, so between them the group carries the asset across even though no
+/// single node may hold all of it.
+async fn reindex_assets(inner: &Inner, previous: &Doc) {
+    let keys = {
+        let state = inner.state.lock().await;
+        state.asset_index_keys()
+    };
+    let target = doc(inner).await;
+    let mut carried = 0_usize;
+    for key in keys {
+        let Ok(Some(entry)) = previous
+            .get_one(Query::key_exact(Bytes::copy_from_slice(key.as_bytes())))
+            .await
+        else {
+            continue;
+        };
+        let hash = entry.content_hash();
+        if inner.blobs.get_bytes(hash).await.is_err() {
+            // Indexed here but not held here. Some other member has it and will
+            // carry it; promising it would be a lie.
+            continue;
+        }
+        if let Err(err) = target
+            .set_hash(
+                inner.author,
+                Bytes::copy_from_slice(key.as_bytes()),
+                hash,
+                entry.content_len(),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to carry an asset entry into the new namespace");
+        } else {
+            carried += 1;
+        }
+    }
+    if carried > 0 {
+        tracing::info!(carried, "re-indexed asset entries without re-encrypting");
+    } else {
+        // No assets, or none this node can serve.
+    }
 }
 
 /// The replicated index this node currently syncs.
@@ -2278,6 +2680,23 @@ async fn refresh_roster(inner: &Inner) {
 }
 
 /// Write one encrypted chunk to blobs and index it in docs.
+///
+/// # Why a temporary tag, and why it is held exactly this long
+///
+/// Awaiting `AddProgress` directly resolves through `with_tag()`, which creates a
+/// **permanent** tag under an auto-generated name. Every chunk this node ever
+/// published would then be pinned for the life of the store and garbage
+/// collection would reclaim nothing at all — the blob budget would grow without
+/// bound however well the sweep were configured. `temp_tag()` instead protects
+/// the blob only while the returned guard is alive.
+///
+/// The guard has to outlive the `set_hash` below and no longer. Before it, the
+/// blob is referenced by nothing and a sweep landing in between would delete
+/// content this node is about to advertise; after it, the docs entry is the
+/// reference, surfaced to the sweep by the protection callback
+/// [`Node`](crate::Node) installs. Dropping it earlier reopens the race; holding
+/// it longer would pin the blob past the point where a later write supersedes it,
+/// which is the one thing the sweep exists to clean up.
 async fn store_chunk(
     inner: &Inner,
     key: &[u8; 32],
@@ -2288,20 +2707,226 @@ async fn store_chunk(
     let tag = inner
         .blobs
         .add_bytes(bytes)
+        .temp_tag()
         .await
         .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
 
     doc(inner)
         .await
-        .set_hash(inner.author, Bytes::copy_from_slice(key), tag.hash, size)
+        .set_hash(inner.author, Bytes::copy_from_slice(key), tag.hash(), size)
         .await
         .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+    // The index entry now references the blob, so the temporary protection has
+    // done its job. Dropped explicitly rather than at end of scope to say so.
+    drop(tag);
 
     // Nudge peers rather than waiting for the next reconciliation round.
     if let Ok(msg) = (ControlMsg::Announce { key: *key }).encode() {
         let _ = inner.gossip_tx.broadcast(Bytes::from(msg)).await;
     }
     Ok(())
+}
+
+/// Write one sealed asset segment to blobs and index it in docs.
+///
+/// The raw-bytes counterpart of [`store_chunk`], and it exists because an asset
+/// segment is *not* a beekem `EncryptedContent`: it is XChaCha20-Poly1305
+/// ciphertext under the asset's own content key, and wrapping it in a chunk
+/// envelope would add a second, redundant description of a key the segment does
+/// not use.
+///
+/// No `Announce` nudge, deliberately. That message tells peers to ingest a key
+/// immediately, which is right for a document and wrong for an asset: payloads
+/// are fetched only when somebody asks for the file, and nudging every peer to
+/// pull a multi-gigabyte segment is the behaviour the download policy exists to
+/// prevent.
+async fn store_segment(
+    inner: &Inner,
+    key: &[u8; 32],
+    ciphertext: Vec<u8>,
+) -> Result<(), WorkspaceError> {
+    let size = ciphertext.len() as u64;
+    let tag = inner
+        .blobs
+        .add_bytes(ciphertext)
+        .temp_tag()
+        .await
+        .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+    doc(inner)
+        .await
+        .set_hash(inner.author, Bytes::copy_from_slice(key), tag.hash(), size)
+        .await
+        .map_err(|e| WorkspaceError::Storage(e.to_string()))?;
+    drop(tag);
+    Ok(())
+}
+
+/// Read the bytes indexed at one blinded key, fetching the blob if it is absent.
+///
+/// The on-demand half of the asset path. Document payloads arrive by themselves
+/// because `iroh-docs` downloads what its policy admits; asset segments are
+/// excluded from that policy precisely so they do *not*, which means the index
+/// entry is present and the blob is not until somebody asks. Peers come from the
+/// derived roster, which is the same set admission already accepts.
+///
+/// Returns `None` when no entry exists at all, which a caller reads as "not
+/// here yet" rather than as an error — asset delivery is pull-based and a
+/// segment whose entry has not reconciled is an ordinary catch-up state.
+async fn fetch_indexed_bytes(inner: &Inner, key: &[u8; 32]) -> Option<Bytes> {
+    let entry = doc(inner)
+        .await
+        .get_one(Query::key_exact(Bytes::copy_from_slice(key)))
+        .await
+        .ok()
+        .flatten()?;
+    let hash = entry.content_hash();
+
+    if inner.blobs.get_bytes(hash).await.is_err() {
+        // Not local. Ask the roster for it; failure here is indistinguishable
+        // from "nobody has it yet", which is why it is not propagated.
+        let peers: Vec<EndpointId> = {
+            let state = inner.state.lock().await;
+            state
+                .roster()
+                .iter()
+                .filter_map(|bytes| EndpointId::from_bytes(bytes).ok())
+                .filter(|peer| *peer != inner.node.endpoint().id())
+                .collect()
+        };
+        if peers.is_empty() {
+            return None;
+        }
+        let downloader = inner.blobs.downloader(inner.node.endpoint());
+        let _ = downloader
+            .download(HashAndFormat::raw(hash), Shuffled::new(peers))
+            .await;
+    } else {
+        // Already in the local store.
+    }
+    inner.blobs.get_bytes(hash).await.ok()
+}
+
+/// Tell `iroh-docs` not to fetch asset payloads it happens to index.
+///
+/// Without this every member downloads every asset the moment its entries
+/// reconcile — gigabytes, onto machines that may never open the file, competing
+/// with the document traffic the workspace actually needs. That is exactly the
+/// "slowing down document synchronization" the large-asset user story rules out.
+///
+/// Expressed as `EverythingExcept` rather than `NothingExcept` so that a
+/// document added by a peer running a future version is still fetched: the rule
+/// is "everything but these known asset key spaces", not "only what I recognise".
+async fn refresh_download_policy(inner: &Inner) {
+    let prefixes = {
+        let state = inner.state.lock().await;
+        state.asset_prefixes()
+    };
+    let filters = prefixes
+        .into_iter()
+        .map(|prefix| FilterKind::Prefix(Bytes::copy_from_slice(&prefix)))
+        .collect();
+    if let Err(err) = doc(inner)
+        .await
+        .set_download_policy(DownloadPolicy::EverythingExcept(filters))
+        .await
+    {
+        // Not fatal: the cost of a stale policy is eager fetching, not
+        // incorrectness, and the next manifest change sets it again.
+        tracing::warn!(%err, "failed to update the asset download policy");
+    }
+}
+
+/// Withdraw the entries left behind by an attachment the process did not finish.
+///
+/// Run once on startup, and it closes the one leak the asset path can produce.
+/// `attach_file` indexes segments *before* the manifest entry that declares them
+/// — it must, since that entry records a digest over bytes it has not read yet —
+/// and an index entry is precisely what keeps a blob from being collected. A
+/// process killed halfway therefore leaves segments no manifest will ever name.
+///
+/// They cannot be found by inspection: a segment key is a blinded MAC and looks
+/// like any other key, which is the entire point of blinding. So the UUID is
+/// written to a local intent log *before* the first segment, and this is what
+/// reads it back. Without the log, a crash during a ten-gigabyte attachment
+/// costs ten gigabytes permanently, under a key derived from a UUID that only
+/// ever existed in memory.
+///
+/// Only entries this node authored are withdrawn, because `iroh-docs` deletion
+/// is per author — another member's orphans are cleaned up on that member's own
+/// next start — and the deletion is by asset *prefix*, so it costs one ranged
+/// write per orphaned asset rather than one per segment.
+///
+/// A no-op on an in-memory node, which has no log to read and nothing that
+/// survives the crash it would be recovering from.
+async fn sweep_orphaned_assets(inner: &Inner) {
+    let Some(store) = inner.node.store() else {
+        return;
+    };
+    let pending = match store.load_pending_assets() {
+        Ok(pending) => pending,
+        Err(err) => {
+            tracing::warn!(%err, "could not read the pending-asset log");
+            return;
+        }
+    };
+    let mine: Vec<[u8; 16]> = pending
+        .iter()
+        .filter(|(tree, _)| *tree == inner.workspace_key)
+        .map(|(_, uuid)| *uuid)
+        .collect();
+    if mine.is_empty() {
+        return;
+    }
+
+    let handle = doc(inner).await;
+    for uuid in &mine {
+        let asset = DocumentUuid(*uuid);
+        let key = inner.secret.asset_key_key(asset);
+        let prefix = inner.secret.asset_prefix(asset);
+        let _ = handle
+            .del(inner.author, Bytes::copy_from_slice(key.as_bytes()))
+            .await;
+        let _ = handle
+            .del(inner.author, Bytes::copy_from_slice(&prefix))
+            .await;
+    }
+    tracing::info!(
+        assets = mine.len(),
+        "withdrew the entries of attachments that did not finish"
+    );
+    clear_pending_assets(inner, &mine);
+}
+
+/// Record, durably, that an attachment has begun.
+///
+/// Written before the first segment so that [`sweep_orphaned_assets`] can find
+/// the segments again if this process does not survive to declare them.
+fn note_pending_asset(inner: &Inner, asset: DocumentUuid) {
+    let Some(store) = inner.node.store() else {
+        return;
+    };
+    let mut pending = store.load_pending_assets().unwrap_or_default();
+    pending.insert((inner.workspace_key, asset.0));
+    if let Err(err) = store.store_pending_assets(&pending) {
+        // Not fatal. The cost is an orphan that survives a crash, which is
+        // storage rather than correctness — and refusing the attachment over it
+        // would be the worse trade.
+        tracing::warn!(%err, "could not record a pending asset");
+    }
+}
+
+/// Forget attachments that have either completed or been cleaned up.
+fn clear_pending_assets(inner: &Inner, assets: &[[u8; 16]]) {
+    let Some(store) = inner.node.store() else {
+        return;
+    };
+    let mut pending = store.load_pending_assets().unwrap_or_default();
+    for uuid in assets {
+        pending.remove(&(inner.workspace_key, *uuid));
+    }
+    if let Err(err) = store.store_pending_assets(&pending) {
+        tracing::warn!(%err, "could not update the pending-asset log");
+    }
 }
 
 /// Write this workspace's snapshot, if the node it runs on persists at all.

@@ -69,7 +69,7 @@ use std::fmt::Write as _;
 
 use loro::{ExportMode, LoroDoc, LoroMap};
 
-use crate::{blinding::DocumentUuid, error::CoreError};
+use crate::{asset::AssetMeta, blinding::DocumentUuid, error::CoreError};
 
 /// Root container holding document metadata, keyed by hex document UUID.
 const FILES_CONTAINER: &str = "files";
@@ -162,7 +162,7 @@ pub struct WorkspaceInfo {
     pub description: String,
 }
 
-/// Metadata for one logical document.
+/// Metadata for one entry: a CRDT document, or a binary asset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     /// Stable identifier; the blinded storage key is derived from this.
@@ -171,6 +171,16 @@ pub struct FileEntry {
     pub logical_path: String,
     /// Media type, for applications that care.
     pub mime_type: String,
+    /// Present exactly when this entry is a binary asset rather than a document.
+    ///
+    /// Which of the two an entry is decides everything about how it is carried:
+    /// a document is a Loro replica reconciled through the parked-chunk path and
+    /// fetched eagerly, an asset is a run of immutable segments fetched only when
+    /// somebody asks for it. `None` therefore has to mean *document* rather than
+    /// *unknown* — an entry written before assets existed, or by a peer that does
+    /// not know about them, is a document, and reading it as anything else would
+    /// make an old manifest unreadable.
+    pub asset: Option<AssetMeta>,
 }
 
 /// The workspace manifest.
@@ -479,6 +489,18 @@ impl Manifest {
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
         node.insert("mime_type", entry.mime_type.as_str())
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        // Encoded to a hex string rather than spread over three Loro fields.
+        // The three move together or not at all — a size that converged without
+        // its segment count describes no asset — and a single value is the only
+        // way to say that in a map whose fields merge independently.
+        if let Some(meta) = entry.asset {
+            let encoded = postcard::to_stdvec(&meta)?;
+            node.insert("asset", hex(&encoded).as_str())
+                .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        } else {
+            // A document. The field stays absent, which is what every entry
+            // written before assets existed also looks like.
+        }
         self.doc.commit();
         Ok(())
     }
@@ -555,10 +577,24 @@ impl Manifest {
                     .map(|s| s.to_string())
                     .unwrap_or_default()
             };
+            // An unreadable `asset` field reads as `None`, i.e. as a document.
+            // The alternative is dropping the entry, which would hide a file
+            // from its owner because somebody else wrote nonsense into a field
+            // any member can write — the manifest holds claims, and a bad claim
+            // must degrade rather than delete.
+            let asset = {
+                let raw = get("asset");
+                if raw.is_empty() {
+                    None
+                } else {
+                    unhex(&raw).and_then(|bytes| postcard::from_bytes::<AssetMeta>(&bytes).ok())
+                }
+            };
             out.push(FileEntry {
                 uuid: DocumentUuid(uuid),
                 logical_path: get("logical_path"),
                 mime_type: get("mime_type"),
+                asset,
             });
         });
         out
@@ -608,6 +644,7 @@ mod tests {
             uuid: DocumentUuid([uuid; 16]),
             logical_path: path.to_string(),
             mime_type: "application/json".to_string(),
+            asset: None,
         }
     }
 

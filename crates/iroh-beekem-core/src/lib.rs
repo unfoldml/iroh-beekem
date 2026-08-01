@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod asset;
 pub mod blinding;
 pub mod capability;
 pub mod content;
@@ -35,6 +36,7 @@ pub mod snapshot;
 pub mod state;
 pub mod sync_poll;
 
+pub use asset::{ASSET_SEGMENT_BYTES, AssetKey, AssetMeta, SegmentVerdict};
 pub use blinding::{DocumentUuid, StorageKey, WorkspaceSecret};
 pub use capability::{
     AdminAction, AdminProposal, Approval, CapabilityStore, Certificate, DEFAULT_THRESHOLD,

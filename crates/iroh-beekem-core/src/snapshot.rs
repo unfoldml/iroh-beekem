@@ -148,10 +148,16 @@ pub struct WorkspaceSnapshot {
     pub(crate) namespace: NamespaceEpoch,
     /// The capability for that generation, kept so it can be re-announced.
     pub(crate) namespace_ticket: Vec<u8>,
-    /// Reserved for phase 9's per-document `published_up_to` version vector.
+    /// The encoded Loro version vector this node has already published, per
+    /// document.
     ///
-    /// Present and empty rather than absent so that adding delta publishing does
-    /// not need a version bump and a migration for every existing snapshot.
+    /// The field was reserved — written empty and never read — before delta
+    /// publishing existed, which is why wiring it up needed no
+    /// [`SNAPSHOT_VERSION`] bump and no migration.
+    ///
+    /// Losing it is not a correctness failure but it is not free either: a node
+    /// resuming with an empty map republishes each document in full on its first
+    /// write, which is the same cost the old behaviour paid every time.
     pub(crate) published_up_to: Vec<(DocumentUuid, Vec<u8>)>,
 }
 

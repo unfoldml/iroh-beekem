@@ -31,6 +31,19 @@ const MANIFEST_LABEL: &[u8] = b"iroh-beekem/manifest/v1";
 /// Domain separator for per-workspace author-key derivation.
 const AUTHOR_SEED_CONTEXT: &str = "iroh-beekem/author-seed/v1";
 
+/// Domain separator for the entry holding an asset's wrapped content key.
+const ASSET_KEY_LABEL: &[u8] = b"iroh-beekem/asset-key/v1";
+
+/// Domain separator for the blinded prefix an asset's segments share.
+const ASSET_PART_LABEL: &[u8] = b"iroh-beekem/asset-part/v1";
+
+/// How many bytes of an asset segment key are the blinded per-asset prefix.
+///
+/// The remaining eight carry the segment index, big-endian so the keys sort into
+/// segment order — which is what makes a range query over one asset's segments
+/// contiguous.
+const ASSET_PREFIX_BYTES: usize = 24;
+
 /// A random, stable identifier for one logical document.
 ///
 /// Unlike a path, this never changes over a document's lifetime.
@@ -129,6 +142,59 @@ impl WorkspaceSecret {
         StorageKey(blake3::keyed_hash(&self.0, MANIFEST_LABEL).into())
     }
 
+    /// Derive the blinded key at which an asset's wrapped content key lives.
+    ///
+    /// A full-width MAC like [`Self::storage_key`], because there is exactly one
+    /// of these per asset and nothing needs to enumerate them by prefix.
+    #[must_use]
+    pub fn asset_key_key(&self, asset: DocumentUuid) -> StorageKey {
+        let mut input = Vec::with_capacity(ASSET_KEY_LABEL.len() + 16);
+        input.extend_from_slice(ASSET_KEY_LABEL);
+        input.extend_from_slice(&asset.0);
+        StorageKey(blake3::keyed_hash(&self.0, &input).into())
+    }
+
+    /// The blinded prefix every segment of one asset shares.
+    ///
+    /// # Why a prefix at all, when every other key here is a full-width MAC
+    ///
+    /// Because `iroh-docs` decides what to *download* by matching key prefixes,
+    /// and without a prefix to name there is no way to say "index these entries
+    /// but do not fetch their payloads". Every member would then auto-download
+    /// every asset the moment its entries reconciled — which is exactly the
+    /// "slowing down document synchronization" the large-asset user story rules
+    /// out, and it would do it with multi-gigabyte payloads on machines that may
+    /// never open the file.
+    ///
+    /// The cost is that a syncing peer can tell which entries belong to one
+    /// asset, and therefore count its segments. That is a size to segment
+    /// granularity, which the padding already concedes, and it is visible in the
+    /// traffic regardless: blinding conceals names, not volume.
+    #[must_use]
+    pub fn asset_prefix(&self, asset: DocumentUuid) -> [u8; ASSET_PREFIX_BYTES] {
+        let mut input = Vec::with_capacity(ASSET_PART_LABEL.len() + 16);
+        input.extend_from_slice(ASSET_PART_LABEL);
+        input.extend_from_slice(&asset.0);
+        let full: [u8; 32] = blake3::keyed_hash(&self.0, &input).into();
+        let mut prefix = [0u8; ASSET_PREFIX_BYTES];
+        prefix.copy_from_slice(&full[..ASSET_PREFIX_BYTES]);
+        prefix
+    }
+
+    /// Derive the blinded key for one segment of an asset.
+    ///
+    /// Still exactly 32 bytes, like every other key here: 24 of blinded prefix
+    /// and 8 of big-endian index. Fixed width is the same property
+    /// [`Self::storage_key`] needs — a variable-length key leaks through the
+    /// range reconciliation that carries it.
+    #[must_use]
+    pub fn asset_part_key(&self, asset: DocumentUuid, part: u64) -> StorageKey {
+        let mut key = [0u8; 32];
+        key[..ASSET_PREFIX_BYTES].copy_from_slice(&self.asset_prefix(asset));
+        key[ASSET_PREFIX_BYTES..].copy_from_slice(&part.to_be_bytes());
+        StorageKey(key)
+    }
+
     /// Derive this member's author seed for this workspace.
     ///
     /// `iroh-docs` signs every entry with an `AuthorId` that syncs in the
@@ -216,6 +282,76 @@ mod tests {
             manifest,
             s.storage_key(DocumentUuid([0u8; 16])),
             "the manifest must not share a key with a document"
+        );
+    }
+
+    #[test]
+    fn asset_segment_keys_are_contiguous_under_one_prefix() {
+        // What makes a download policy expressible: the segments of one asset
+        // share a prefix, and nothing else does.
+        let s = secret(1);
+        let asset = DocumentUuid([3u8; 16]);
+        let prefix = s.asset_prefix(asset);
+        for part in [0u64, 1, 7, u64::MAX] {
+            assert!(
+                s.asset_part_key(asset, part).0.starts_with(&prefix),
+                "segment {part} must fall under its asset's prefix, or no \
+                 download policy can name the asset's key space"
+            );
+        }
+    }
+
+    #[test]
+    fn asset_segment_keys_are_distinct_per_segment_and_per_asset() {
+        let s = secret(1);
+        let first = DocumentUuid([3u8; 16]);
+        let second = DocumentUuid([4u8; 16]);
+        assert_ne!(
+            s.asset_part_key(first, 0),
+            s.asset_part_key(first, 1),
+            "two segments of one asset must not collide, or the second \
+             overwrites the first in the index"
+        );
+        assert_ne!(
+            s.asset_part_key(first, 0),
+            s.asset_part_key(second, 0),
+            "two assets must not share a segment key"
+        );
+    }
+
+    #[test]
+    fn an_assets_key_entry_is_distinct_from_its_segments_and_from_a_document() {
+        // Three key spaces derived from the same secret and the same UUID, kept
+        // apart by their domain separators. Sharing one would have an asset's
+        // wrapped content key silently overwrite a document, or a segment
+        // overwrite the key that decrypts it.
+        let s = secret(1);
+        let uuid = DocumentUuid([5u8; 16]);
+        assert_ne!(
+            s.asset_key_key(uuid),
+            s.asset_part_key(uuid, 0),
+            "an asset's key entry must not collide with its first segment"
+        );
+        assert_ne!(
+            s.asset_key_key(uuid),
+            s.storage_key(uuid),
+            "an asset's key entry must not collide with a document of the same uuid"
+        );
+        assert_ne!(
+            s.asset_key_key(uuid),
+            s.manifest_key(),
+            "an asset's key entry must not collide with the manifest"
+        );
+    }
+
+    #[test]
+    fn asset_keys_differ_across_workspaces() {
+        let uuid = DocumentUuid([7u8; 16]);
+        assert_ne!(
+            secret(1).asset_part_key(uuid, 0),
+            secret(2).asset_part_key(uuid, 0),
+            "a peer without the workspace secret must not be able to recognise \
+             an asset segment"
         );
     }
 

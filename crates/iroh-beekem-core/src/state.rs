@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
+    asset::AssetKey,
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
     capability::{AdminAction, CapabilityStore, Certificate, DEFAULT_THRESHOLD, Role},
     content::{Chunk, ChunkRef},
@@ -92,7 +93,34 @@ pub enum RepairTarget {
     /// way to ask, a single lost announcement strands a member permanently.
     Namespace,
     /// One document, named by the UUID both sides already agree on.
+    ///
+    /// Asked for by a peer that cannot derive the epoch the content was keyed
+    /// under, and answered by minting a fresh one. Contrast
+    /// [`Self::DocumentHistory`], which is the same document and a different
+    /// problem.
     Document(DocumentUuid),
+    /// The history of one document, for a peer that can decrypt but cannot apply.
+    ///
+    /// Delta publishing makes this reachable and nothing else does. A chunk
+    /// carrying updates since the publisher's last version is useless to a
+    /// receiver that never saw the base, and the two failures are indistinguishable
+    /// from the outside: both leave the document unreadable. They are opposite
+    /// inside, though, and answering the wrong one is expensive or useless.
+    /// [`Self::Document`] is a key problem, answered with `Keying::Fresh`, which
+    /// charges the whole group a CGKA operation. This is a *history* problem: the
+    /// requester holds the key perfectly well, so re-keying would cost the group a
+    /// rotation and still not deliver the operations it is missing. The answer is
+    /// a full export under the current epoch.
+    DocumentHistory(DocumentUuid),
+    /// The wrapped content key of one binary asset.
+    ///
+    /// The asset counterpart of [`Self::Document`], and it is cheap in a way that
+    /// one is not. An asset's segments are keyed by a per-asset content key
+    /// rather than by the CGKA directly, so a member admitted after the asset was
+    /// published is stuck on exactly 32 bytes of ciphertext — the key chunk — and
+    /// repairing it means re-encrypting those 32 bytes under a fresh epoch, not
+    /// the gigabytes behind them.
+    AssetKey(DocumentUuid),
     /// The workspace manifest.
     Manifest,
 }
@@ -558,6 +586,26 @@ pub enum Effect {
         /// Which document was deleted.
         doc: DocumentUuid,
     },
+    /// Withdraw this node's index entries for every segment of a deleted asset.
+    ///
+    /// A prefix rather than a list of keys, and the difference is not cosmetic: a
+    /// multi-gigabyte asset has thousands of segments, and naming them
+    /// individually would make deleting one file thousands of index writes. The
+    /// segment key space of one asset is contiguous by construction — see
+    /// [`WorkspaceSecret::asset_prefix`] — precisely so that a single ranged
+    /// deletion covers it.
+    ///
+    /// The asset's *key* entry is withdrawn by an ordinary [`Self::DeleteEntry`]
+    /// beside this one; it lives under a different derivation and is not in the
+    /// range.
+    ///
+    /// [`WorkspaceSecret::asset_prefix`]: crate::blinding::WorkspaceSecret::asset_prefix
+    DeleteAssetSegments {
+        /// The blinded prefix every segment of the asset shares.
+        prefix: [u8; 24],
+        /// Which asset was deleted.
+        asset: DocumentUuid,
+    },
     /// A remote chunk was decrypted and merged into a local document.
     Applied {
         /// Which document changed.
@@ -666,6 +714,71 @@ enum ChunkVerdict {
     Corrupt,
 }
 
+/// What came of trying to unwrap an asset's content key.
+///
+/// The same four answers [`ChunkVerdict`] gives, for the same reason: "not yet"
+/// and "never" call for different responses, and only one of them is worth
+/// asking the group about. It is a separate type because the remedies differ —
+/// an undecryptable document chunk asks for [`RepairTarget::Document`], an
+/// undecryptable asset key for [`RepairTarget::AssetKey`], and the second is
+/// thousands of times cheaper to answer.
+#[derive(Debug)]
+pub enum AssetKeyVerdict {
+    /// Unwrapped. The caller can now open segments with it.
+    Ready(AssetKey),
+    /// The operation establishing the key chunk's epoch has not arrived. It may
+    /// still, so there is nothing to ask for yet.
+    AwaitingKey,
+    /// Keyed under an epoch this node can never derive — the ordinary state of a
+    /// member admitted after the asset was written. Only a re-encryption helps.
+    Unreachable,
+    /// The key was derived and what came out was not a 32-byte key, or
+    /// authentication failed.
+    Corrupt,
+}
+
+/// One chunk waiting in [`WorkspaceState::pending_chunks`].
+///
+/// Carries its own age because [`ChunkVerdict::AwaitingDeps`] has no other way
+/// out. `AwaitingKey` resolves itself — the control plane delivers the operation
+/// and the next drain applies the chunk — but a missing *dependency* is a gap in
+/// somebody else's publishing history, and no amount of waiting produces it. The
+/// age is what turns "still waiting" into a repair request; without it a chunk
+/// sits until the pending budget evicts it and the document is silently short of
+/// content nobody ever asked for again.
+#[derive(Debug, Clone)]
+struct Parked {
+    doc: DocumentUuid,
+    chunk: Chunk,
+    /// Drain passes this chunk has survived without applying.
+    ///
+    /// Counted in passes rather than in wall time because the core has no clock,
+    /// and a pass is the better unit anyway: it is one opportunity to apply, so
+    /// the count is "how many chances this has had" rather than "how long the
+    /// process has been up".
+    drains: u32,
+}
+
+/// How many fruitless drain passes a chunk endures before its history is asked
+/// for.
+///
+/// Not one: a chunk and the chunk it depends on routinely arrive in the same
+/// ingest pass in the wrong order, and escalating on the first miss would send a
+/// repair request for every such pair. Not large either — each pass needs new
+/// key material or new operations to arrive, so this is already several rounds of
+/// network activity.
+const MAX_DEP_WAIT_DRAINS: u32 = 8;
+
+/// How many delta publishes a document gets before one carries its whole history.
+///
+/// A delta is only applicable to a receiver holding its base, and a document's
+/// index slot holds exactly one chunk per author — so a receiver that misses one
+/// delta is stuck until a full export comes past. The demand-driven
+/// [`RepairTarget::DocumentHistory`] path exists for exactly that and is the
+/// reliable answer; this is the cheap one that usually gets there first, and it
+/// bounds how long a peer that never speaks up stays behind.
+const FULL_PUBLISH_EVERY: u32 = 16;
+
 /// One node's complete workspace state.
 pub struct WorkspaceState {
     cgka: CgkaController,
@@ -673,7 +786,7 @@ pub struct WorkspaceState {
     manifest: Manifest,
     docs: HashMap<DocumentUuid, LoroDoc>,
     /// Chunks that could not yet be decrypted or merged.
-    pending_chunks: VecDeque<(DocumentUuid, Chunk)>,
+    pending_chunks: VecDeque<Parked>,
     /// Running total of `ciphertext` bytes held in `pending_chunks`.
     ///
     /// Tracked incrementally because the budget is checked on every arrival and
@@ -695,11 +808,15 @@ pub struct WorkspaceState {
     /// peer allowed to write, not an ordering or membership condition. It
     /// should be zero in any honest run.
     corrupt_chunks: u64,
-    /// Repair requests this node answered by minting a fresh epoch.
+    /// Repair requests this node answered.
     ///
-    /// Each one is a tree operation the whole group pays for, which is exactly
-    /// why it is counted: repair must stay proportional to the number of peers
-    /// that are actually stuck, not to how often anti-entropy runs.
+    /// Most of them mint a fresh epoch, which is a tree operation the whole group
+    /// pays for — which is exactly why it is counted: repair must stay
+    /// proportional to the number of peers that are actually stuck, not to how
+    /// often anti-entropy runs. [`RepairTarget::DocumentHistory`] is the one that
+    /// does not, and it is counted with the rest anyway: it still costs a full
+    /// re-encryption and a blob, and the number worth watching is "how much work
+    /// are peers asking of us", not "how many epochs did we mint".
     repairs_answered: u64,
     /// The most recent chunk this node published or applied, per document.
     ///
@@ -709,6 +826,26 @@ pub struct WorkspaceState {
     /// need the predecessor chunk to decrypt — the digest travels inside the
     /// ciphertext's metadata — so this costs nothing in liveness.
     last_ref: HashMap<DocumentUuid, ChunkRef>,
+    /// The Loro version vector this node has already published, per document.
+    ///
+    /// Two things read it, and they are why it has to be *published* rather than
+    /// merely *current*. An ordinary edit exports `ExportMode::updates` from here,
+    /// so the chunk carries the edit rather than the document. And a resync
+    /// compares it against the document's live version to decide whether there is
+    /// anything to say at all — a quiescent workspace re-encrypting every document
+    /// on every republish is pure cost, since `iroh-docs` reconciliation already
+    /// re-delivers an entry to a peer that lacks it.
+    ///
+    /// Stored as encoded bytes rather than as a `VersionVector` because that is
+    /// what the snapshot holds, and decoding once per publish is cheaper than
+    /// keeping two representations honest.
+    published_up_to: HashMap<DocumentUuid, Vec<u8>>,
+    /// Delta publishes since this document last shipped its whole history.
+    ///
+    /// Drives [`FULL_PUBLISH_EVERY`]. Deliberately not persisted: a restart
+    /// starting the count at zero publishes a full export sooner than strictly
+    /// necessary, which is the safe direction to be wrong in.
+    deltas_since_full: HashMap<DocumentUuid, u32>,
     /// This device's transport address, once the caller has announced one.
     ///
     /// Held here as well as in the manifest because the manifest cannot always
@@ -788,6 +925,8 @@ impl Clone for WorkspaceState {
             corrupt_chunks: self.corrupt_chunks,
             repairs_answered: self.repairs_answered,
             last_ref: self.last_ref.clone(),
+            published_up_to: self.published_up_to.clone(),
+            deltas_since_full: self.deltas_since_full.clone(),
             endpoint_id: self.endpoint_id,
             namespace: self.namespace,
             namespace_ticket: self.namespace_ticket.clone(),
@@ -847,6 +986,8 @@ impl WorkspaceState {
             corrupt_chunks: 0,
             repairs_answered: 0,
             last_ref: HashMap::new(),
+            published_up_to: HashMap::new(),
+            deltas_since_full: HashMap::new(),
             endpoint_id: None,
             namespace: NamespaceEpoch {
                 epoch: namespace_epoch,
@@ -929,6 +1070,13 @@ impl WorkspaceState {
             self.last_ref.iter().map(|(k, v)| (*k, *v)).collect();
         last_ref.sort_unstable_by_key(|(uuid, _)| *uuid);
 
+        let mut published_up_to: Vec<(DocumentUuid, Vec<u8>)> = self
+            .published_up_to
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        published_up_to.sort_unstable_by_key(|(uuid, _)| *uuid);
+
         Ok(WorkspaceSnapshot {
             version: SNAPSHOT_VERSION,
             cgka: self.cgka.snapshot(),
@@ -939,7 +1087,7 @@ impl WorkspaceState {
             endpoint_id: self.endpoint_id,
             namespace: self.namespace,
             namespace_ticket: self.namespace_ticket.clone(),
-            published_up_to: Vec::new(),
+            published_up_to,
         })
     }
 
@@ -1006,6 +1154,11 @@ impl WorkspaceState {
             corrupt_chunks: 0,
             repairs_answered: 0,
             last_ref: snapshot.last_ref.into_iter().collect(),
+            published_up_to: snapshot.published_up_to.into_iter().collect(),
+            // Not carried across a restart, so the first publish per document
+            // after one is a full export. See the field's own comment for why
+            // that is the safe direction.
+            deltas_since_full: HashMap::new(),
             endpoint_id: snapshot.endpoint_id,
             namespace: snapshot.namespace,
             namespace_ticket: snapshot.namespace_ticket,
@@ -1158,7 +1311,50 @@ impl WorkspaceState {
         self.namespace
     }
 
-    /// How many members currently hold a leaf.
+    /// How many identities this node currently counts as members.
+    ///
+    /// # Prefer this to [`Self::group_size`] for anything that must be right
+    ///
+    /// The two answer the same question from different sides and **they can
+    /// disagree**. This one counts `CgkaController`'s own `current_members`,
+    /// which is maintained by `merge` and `remove_member` in this crate.
+    /// `group_size` asks beekem for `tree.member_count()`, and a node has been
+    /// observed reporting four there while this reported three — with beekem
+    /// itself then refusing to remove the missing member with
+    /// `CgkaError::IdentifierNotFound`, so the removal had in fact happened.
+    ///
+    /// See [`Self::group_size`] for the reproduction and the standing caveat.
+    #[must_use]
+    pub fn current_member_count(&self) -> usize {
+        self.cgka.current_members().count()
+    }
+
+    /// Whether this node still counts `member` as part of the group.
+    #[must_use]
+    pub fn sees_member(&self, member: MemberId) -> bool {
+        self.cgka.is_current_member(member)
+    }
+
+    /// How many leaves beekem's tree reports.
+    ///
+    /// # This is not always [`Self::current_member_count`], and the difference
+    /// has bitten
+    ///
+    /// Under concurrent removals of the same member — which a quorum action
+    /// produces by construction, since every admin that sees the proposal reach
+    /// its threshold performs it independently — a node has been observed with
+    /// `group_size() == 4` while `current_members` held three and beekem's own
+    /// `remove` answered `IdentifierNotFound` for the fourth. The removal had
+    /// happened; only this counter disagreed.
+    ///
+    /// It is kept because it is the *tree's* view and some properties genuinely
+    /// want that, but anything asserting "is this member still in the group"
+    /// must use [`Self::sees_member`] or [`Self::current_member_count`]. A
+    /// simulator property that used this one failed for seeds where nothing was
+    /// wrong, which is how the divergence was found;
+    /// `beekem_group_size_disagrees_with_current_members` in
+    /// [`tests/beekem_loop.rs`](../../tests/beekem_loop.rs) pins the behaviour so
+    /// a future beekem release changing it is noticed rather than assumed.
     #[must_use]
     pub fn group_size(&self) -> u32 {
         self.cgka.group_size()
@@ -1545,7 +1741,7 @@ impl WorkspaceState {
         self.require_admin()?;
         let cert = self.cgka.certify_approval(proposal, random_nonce(csprng))?;
         let mut effects = vec![Effect::BroadcastCerts(vec![cert])];
-        effects.extend(self.run_quorum_actions()?);
+        effects.extend(self.run_quorum_actions());
         Ok(effects)
     }
 
@@ -1579,7 +1775,7 @@ impl WorkspaceState {
     /// `remove_member` returns `None` for somebody already gone and a repeated
     /// grant is superseded by `seq` — and persisting it would be one more thing
     /// that could disagree with the certificates.
-    fn run_quorum_actions(&mut self) -> Result<Vec<Effect>, CoreError> {
+    fn run_quorum_actions(&mut self) -> Vec<Effect> {
         let pending: Vec<([u8; 32], AdminAction)> = self
             .capabilities()
             .executable()
@@ -1589,25 +1785,56 @@ impl WorkspaceState {
 
         let mut effects = Vec::new();
         for (digest, action) in pending {
-            self.executed_here.insert(digest);
-            // Marked done *before* the attempt: an action that fails here — a
-            // removal of somebody an admin already removed, say — must not be
-            // retried on every subsequent certificate arrival.
             match action {
                 AdminAction::RemoveMember { member } => {
                     let Ok(member) = member_from_bytes(member) else {
+                        // Thirty-two bytes that are not a verifying key. No
+                        // amount of catching up turns them into one, so this is
+                        // final and marking it costs nothing.
+                        self.executed_here.insert(digest);
                         continue;
                     };
-                    effects.extend(self.perform_removal(member)?);
+                    // **Marked done only on success, and a failure is left to
+                    // be retried.** The attempt runs against *this node's*
+                    // CGKA, which may not yet hold the leaf the quorum voted to
+                    // remove — certificates and operations travel on the same
+                    // plane but not in lockstep — so `Cgka(IdentifierNotFound)`
+                    // here means "not yet", not "never".
+                    //
+                    // Marking first, which is what this used to do, turned that
+                    // transient failure into a permanent one: the digest was
+                    // burned, every later pass skipped it, and the node kept a
+                    // member the rest of the group had removed. Forever,
+                    // silently, on a node that agreed the proposal was
+                    // executable — the "performed there and refused everywhere"
+                    // split the quorum design exists to prevent, reached from
+                    // the other direction.
+                    //
+                    // Retrying is safe because a failed `perform_removal` has
+                    // no partial effect: every fallible step runs before the
+                    // namespace generation is bumped or any effect is built.
+                    // And it is cheap — one closure walk per unexecuted
+                    // proposal per certificate arrival — which is the right
+                    // price for not diverging. A genuinely permanent refusal
+                    // (the last admin) costs that walk forever, bounded by the
+                    // number of proposals.
+                    if let Ok(produced) = self.perform_removal(member) {
+                        self.executed_here.insert(digest);
+                        effects.extend(produced);
+                    } else {
+                        // Retried on the next pass. See above.
+                    }
                 }
                 // Nothing to perform. An executed `SetRole` proposal *is* the
                 // role — `CapabilityStore` reads it straight out of the closure
                 // — and minting a grant on top would have every replica sign a
                 // different certificate for one decision.
-                AdminAction::SetRole { .. } => {}
+                AdminAction::SetRole { .. } => {
+                    self.executed_here.insert(digest);
+                }
             }
         }
-        Ok(effects)
+        effects
     }
 
     /// Refuse to enrol a device for a user the local device may not act for.
@@ -1804,8 +2031,10 @@ impl WorkspaceState {
         // The data plane re-offers the same entry on every sync round, so
         // without this the parked list would grow without bound and every drain
         // would redo the same failed decryptions.
-        let already_parked = self.pending_chunks.iter().any(|(d, c)| {
-            *d == doc && c.content_ref == chunk.content_ref && c.pcs_key_hash == chunk.pcs_key_hash
+        let already_parked = self.pending_chunks.iter().any(|parked| {
+            parked.doc == doc
+                && parked.chunk.content_ref == chunk.content_ref
+                && parked.chunk.pcs_key_hash == chunk.pcs_key_hash
         });
         if !already_parked {
             self.park_chunk(doc, chunk);
@@ -2031,6 +2260,8 @@ impl WorkspaceState {
         let (chunk, ops) = self.cgka.encrypt_fresh(ticket, &[], csprng)?;
         self.namespace = minted;
         self.namespace_ticket = ticket.to_vec();
+        // The index this node had published into is the one it just abandoned.
+        self.forget_published();
 
         // The key operations strictly first: they are what let the group derive
         // the key this chunk is under, and a peer receiving them the other way
@@ -2091,6 +2322,7 @@ impl WorkspaceState {
         }
         self.namespace = announced;
         self.namespace_ticket.clone_from(&ticket);
+        self.forget_published();
         Ok(vec![Effect::AdoptNamespace { epoch, ticket }])
     }
 
@@ -2125,23 +2357,54 @@ impl WorkspaceState {
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
         self.require_write()?;
+        // Read before the tombstone lands: the manifest entry is what says
+        // whether this is an asset, and how many segments it occupies.
+        let asset = self
+            .manifest
+            .files()
+            .into_iter()
+            .find(|entry| entry.uuid == doc)
+            .and_then(|entry| entry.asset);
         self.manifest.delete_file(doc)?;
         self.docs.remove(&doc);
         self.last_ref.remove(&doc);
+        // Cleared alongside `last_ref` and for the same reason: they describe a
+        // document that no longer exists, and a stale entry would make the next
+        // publish under a recreated UUID export a delta from a version vector
+        // belonging to the deleted one.
+        self.published_up_to.remove(&doc);
+        self.deltas_since_full.remove(&doc);
         // Drop anything parked for it too, or a chunk still in flight would
         // silently resurrect the document once its key arrived.
         let pending_bytes = &mut self.pending_bytes;
-        self.pending_chunks.retain(|(d, chunk)| {
-            let keep = *d != doc;
+        self.pending_chunks.retain(|parked| {
+            let keep = parked.doc != doc;
             if !keep {
-                *pending_bytes = pending_bytes.saturating_sub(chunk.ciphertext.len());
+                *pending_bytes = pending_bytes.saturating_sub(parked.chunk.ciphertext.len());
             }
             keep
         });
-        let mut effects = vec![Effect::DeleteEntry {
-            key: self.secret.storage_key(doc),
-            doc,
-        }];
+        let mut effects = Vec::new();
+        if asset.is_some() {
+            // An asset occupies two key spaces and both have to go: the entry
+            // holding its wrapped content key, and the contiguous range of its
+            // segments. Withdrawing only the first would leave the payloads
+            // indexed — and therefore protected from blob collection — for a
+            // file that no longer exists.
+            effects.push(Effect::DeleteEntry {
+                key: self.secret.asset_key_key(doc),
+                doc,
+            });
+            effects.push(Effect::DeleteAssetSegments {
+                prefix: self.secret.asset_prefix(doc),
+                asset: doc,
+            });
+        } else {
+            effects.push(Effect::DeleteEntry {
+                key: self.secret.storage_key(doc),
+                doc,
+            });
+        }
         effects.extend(self.publish_manifest(Keying::Current, csprng)?);
         Ok(effects)
     }
@@ -2244,18 +2507,77 @@ impl WorkspaceState {
     /// change on everyone's behalf. A member who may not write has nothing
     /// legitimate to re-announce anyway, since peers reject its entries either
     /// way.
+    ///
+    /// # A quiescent document re-announces nothing
+    ///
+    /// If everything this node holds is already published, this returns no
+    /// effects at all. That is not an optimisation of the anti-entropy, it is a
+    /// correction of it: the index entry naming the existing chunk is still
+    /// there, and `iroh-docs` range reconciliation re-delivers it to any peer
+    /// that lacks it without anybody republishing. Encrypting the same content
+    /// again produced a *new* blob with a new hash on every republish cycle, for
+    /// every document, forever — which is most of what made publishing cost grow
+    /// with the workspace rather than with the changes to it.
+    ///
+    /// What this does **not** cover is a peer that cannot decrypt or cannot
+    /// apply what is already there; both of those are repairs, and both are
+    /// demand-driven precisely because anti-entropy cannot answer them.
+    ///
+    /// When the document *has* moved, the re-announcement is
+    /// [`Extent::Full`]: unlike an edit, a resync exists for peers that are
+    /// behind by an unknown amount, and a delta keyed to this node's own
+    /// publishing history is not what they are missing.
     fn on_resync<R: CryptoRng + RngCore>(
         &mut self,
         doc: DocumentUuid,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
         self.require_write()?;
-        if self.docs.contains_key(&doc) {
-            self.publish(doc, csprng)
-        } else {
+        if !self.docs.contains_key(&doc) {
             // Nothing known about this document yet; nothing to re-announce.
-            Ok(Vec::new())
+            return Ok(Vec::new());
         }
+        if self.is_published(doc) {
+            return Ok(Vec::new());
+        }
+        self.publish_keyed(doc, Keying::Current, Extent::Full, csprng)
+    }
+
+    /// Forget what has been published, because the replica it was published to
+    /// is gone.
+    ///
+    /// `published_up_to` is not a claim about this node's documents, it is a
+    /// claim about **a namespace**: "the entries in that index already carry
+    /// these operations". A rotation abandons the index for an empty one, so
+    /// every such claim becomes false at once.
+    ///
+    /// Missing this is silent and total. The adoption path re-announces every
+    /// document into the new namespace by driving [`Event::Resync`] — which,
+    /// since a quiescent resync publishes nothing, would emit nothing at all for
+    /// a node that had published everything before the rotation. Its documents
+    /// would never reach the new replica, and the group would converge on a
+    /// namespace containing only whatever happened to be edited afterwards.
+    fn forget_published(&mut self) {
+        self.published_up_to.clear();
+        self.deltas_since_full.clear();
+    }
+
+    /// Whether everything this node holds for `doc` has already been published.
+    ///
+    /// Compares the live oplog version against the one recorded at the last
+    /// publish. A document this node has never published answers `false`, which
+    /// is the safe direction: the cost of being wrong here is one redundant
+    /// chunk, and the cost of being wrong the other way is content nobody ever
+    /// announces.
+    fn is_published(&self, doc: DocumentUuid) -> bool {
+        let Some(loro) = self.docs.get(&doc) else {
+            return false;
+        };
+        let Some(published) = self.published_up_to.get(&doc) else {
+            return false;
+        };
+        loro.commit();
+        loro.oplog_vv().encode() == *published
     }
 
     /// Answer a peer that reports it can never read what we publish.
@@ -2299,11 +2621,32 @@ impl WorkspaceState {
             RepairTarget::Namespace => self.republish_namespace(Keying::Fresh, csprng)?,
             RepairTarget::Document(doc) => {
                 if self.docs.contains_key(&doc) && self.require_write().is_ok() {
-                    self.publish_keyed(doc, Keying::Fresh, csprng)?
+                    self.publish_keyed(doc, Keying::Fresh, Extent::Full, csprng)?
                 } else {
                     Vec::new()
                 }
             }
+            // A history problem, not a key problem: the requester can decrypt
+            // what we publish and simply lacks operations some delta depended
+            // on. `Keying::Current` because re-keying would charge the whole
+            // group for something no key change fixes, and `Extent::Full`
+            // because a delta from *our* publishing history is exactly the thing
+            // that already failed.
+            RepairTarget::DocumentHistory(doc) => {
+                if self.docs.contains_key(&doc) && self.require_write().is_ok() {
+                    self.publish_keyed(doc, Keying::Current, Extent::Full, csprng)?
+                } else {
+                    Vec::new()
+                }
+            }
+            // Answered by [`Self::reseal_asset_key`] and not from here, because
+            // it is the one repair target whose ciphertext is not in state: an
+            // asset's content key lives in a blob, recoverable by any member, and
+            // is deliberately not cached. The caller fetches that blob and calls
+            // the method; reaching this arm means a request arrived through a
+            // path that has not been taught to, which is worth no effects rather
+            // than a silent partial answer.
+            RepairTarget::AssetKey(_) => Vec::new(),
         };
         if effects.is_empty() {
             // Nothing to offer: no epoch was minted, so nothing is counted.
@@ -2411,19 +2754,47 @@ impl WorkspaceState {
     /// chunk may be keyed under an epoch established by such an operation. Only
     /// bothering when something was new keeps a re-sent store from costing a full
     /// drain on every log exchange.
+    ///
+    /// # The quorum pass runs whether or not anything was new
+    ///
+    /// It used to sit behind the same early return, and that was a liveness
+    /// defect rather than an optimisation. The two questions are not the same
+    /// one: "did this message teach me a certificate I did not have" and "is
+    /// there an executable proposal I have not carried out". A node can answer
+    /// *no* to the first and *yes* to the second — most obviously when the
+    /// approval that completed the quorum arrived in a batch this node had
+    /// already absorbed from another peer, and every later exchange is then a
+    /// duplicate that returns early.
+    ///
+    /// The consequence was permanent and silent. `run_quorum_actions` has only
+    /// two triggers, this and `on_approve`; a node that misses both never
+    /// re-evaluates, so the removal is performed on the peers that happened to
+    /// see a new certificate at the right moment and never on the rest — which is
+    /// exactly the "action performed there and refused everywhere" split the
+    /// whole quorum design exists to avoid. It surfaced as
+    /// `a_proposal_with_enough_approvals_is_eventually_performed_everywhere`
+    /// failing on some seeds and not others.
+    ///
+    /// The cost of running it unconditionally is a walk over the certificate
+    /// closure, which is small and bounded; the expensive part behind the early
+    /// return is the queue drain, and that stays behind it.
     fn on_certs_arrived(&mut self, certs: Vec<Certificate>) -> Result<Vec<Effect>, CoreError> {
-        if self.cgka.absorb_certificates(certs) == 0 {
-            return Ok(Vec::new());
+        let mut effects = Vec::new();
+        if self.cgka.absorb_certificates(certs) > 0 {
+            self.cgka.merge_pending()?;
+            effects = self.drain_pending()?;
+        } else {
+            // A re-sent store with nothing new in it. Nothing to merge and
+            // nothing to drain — but see above for why that does not mean there
+            // is nothing to do.
         }
-        self.cgka.merge_pending()?;
-        let mut effects = self.drain_pending()?;
         // Newly arrived approvals may have tipped a proposal over the threshold.
         // Performed here rather than only in `on_approve` because the approval
         // that completes a quorum is usually somebody *else's*: without this, a
         // proposal would execute only on the node that happened to cast the last
         // vote, and every other replica would wait for an announcement that the
         // design deliberately does not send.
-        effects.extend(self.run_quorum_actions()?);
+        effects.extend(self.run_quorum_actions());
         Ok(effects)
     }
 
@@ -2461,37 +2832,256 @@ impl WorkspaceState {
         }
     }
 
-    /// Encrypt and emit the current state of a document under the current epoch.
+    /// Draw a content key for a new asset and emit the chunk that wraps it.
+    ///
+    /// Returns the key **and** the effects that publish it, and the caller must
+    /// apply the effects before storing a single segment. This is the ordinary
+    /// key-material-before-content rule with a longer fuse than usual: a peer
+    /// that fetches a segment before the key chunk exists cannot decrypt it and,
+    /// unlike a document chunk, has nothing to park — asset delivery is pull-based,
+    /// so the read simply fails and is retried by a human.
+    ///
+    /// # Why the key comes back to the caller at all
+    ///
+    /// Because the core does no I/O and an asset does not fit in memory. Sealing
+    /// happens a segment at a time, next to whatever is reading them, which means
+    /// the bulk AEAD cannot live here. What does live here is the part that needs
+    /// the group's key material: drawing the content key and encrypting it to the
+    /// CGKA. The caller gets a [`AssetKey`], which zeroizes on drop, and hands
+    /// each segment to [`crate::asset::seal_segment`].
+    ///
+    /// Each call draws a *fresh* key, which is what keeps forward secrecy at the
+    /// granularity it has for documents: a new version of an asset is unreadable
+    /// to anyone removed before it was written. Re-using a key across versions
+    /// would also reuse the derived per-segment nonces, which for a stream cipher
+    /// is fatal rather than merely untidy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::NotAWriter`] if this node holds no writing role, or a
+    /// CGKA error if the key chunk cannot be encrypted.
+    pub fn seal_asset_key<R: CryptoRng + RngCore>(
+        &mut self,
+        asset: DocumentUuid,
+        csprng: &mut R,
+    ) -> Result<(AssetKey, Vec<Effect>), CoreError> {
+        self.require_write()?;
+        let key = AssetKey::generate(csprng);
+        let effects = self.publish_asset_key(asset, &key, Keying::Current, csprng)?;
+        Ok((key, effects))
+    }
+
+    /// Recover an asset's content key from the chunk that wraps it.
+    ///
+    /// Takes the key chunk rather than reading a cached copy, deliberately. The
+    /// key is recoverable by any member from a blob any member can fetch, so
+    /// holding it in state would be storing a secret to save a decryption — and
+    /// it would then have to be persisted, snapshot-versioned, and reasoned about
+    /// on every membership change.
+    #[must_use]
+    pub fn open_asset_key(&mut self, key_chunk: &Chunk) -> AssetKeyVerdict {
+        match self.cgka.decrypt(key_chunk) {
+            Ok(DecryptOutcome::Plaintext(bytes)) => <[u8; 32]>::try_from(bytes.as_slice())
+                .map_or(AssetKeyVerdict::Corrupt, |raw| {
+                    AssetKeyVerdict::Ready(AssetKey::from_bytes(raw))
+                }),
+            Ok(DecryptOutcome::AwaitingOp) => AssetKeyVerdict::AwaitingKey,
+            Ok(DecryptOutcome::Unreachable) => AssetKeyVerdict::Unreachable,
+            Err(_) => AssetKeyVerdict::Corrupt,
+        }
+    }
+
+    /// Answer a peer stuck on an asset it cannot decrypt.
+    ///
+    /// The counterpart of [`Self::on_repair_requested`] for
+    /// [`RepairTarget::AssetKey`], and a separate method for the reason
+    /// [`Self::open_asset_key`] takes its chunk as an argument: the key being
+    /// repaired is not in state, so answering needs the caller to supply the
+    /// ciphertext it is re-encrypting. Every other repair target is answered from
+    /// state alone, which is why they all fit one event and this does not.
+    ///
+    /// The gate is the same one, and for the same reason: re-keying costs the
+    /// whole group a tree operation, so a device that is no longer a member must
+    /// not be able to ask for one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unauthorized`] if `requester` is not a current
+    /// member, [`CoreError::NotAWriter`] if this node may not publish, and a CGKA
+    /// error if the key cannot be recovered or re-encrypted.
+    pub fn reseal_asset_key<R: CryptoRng + RngCore>(
+        &mut self,
+        requester: MemberId,
+        asset: DocumentUuid,
+        key_chunk: &Chunk,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        if !self.cgka.is_current_member(requester) {
+            return Err(CoreError::Unauthorized {
+                issuer: requester.to_bytes(),
+            });
+        }
+        self.require_write()?;
+        let AssetKeyVerdict::Ready(key) = self.open_asset_key(key_chunk) else {
+            // This node cannot read the key either, so it has nothing to offer.
+            // Not an error: some other member will answer, exactly as with a
+            // document repair a viewer cannot serve.
+            return Ok(Vec::new());
+        };
+        let effects = self.publish_asset_key(asset, &key, Keying::Fresh, csprng)?;
+        if effects.is_empty() {
+            // Nothing was minted, so nothing is counted.
+        } else {
+            self.repairs_answered += 1;
+        }
+        Ok(effects)
+    }
+
+    /// Encrypt an asset's content key to the group and emit it for storage.
+    ///
+    /// `Keying::Fresh` on the repair path for the identical reason a document
+    /// repair uses it: re-encrypting under the epoch the stuck peer already
+    /// failed on reproduces a ciphertext it cannot read.
+    fn publish_asset_key<R: CryptoRng + RngCore>(
+        &mut self,
+        asset: DocumentUuid,
+        key: &AssetKey,
+        keying: Keying,
+        csprng: &mut R,
+    ) -> Result<Vec<Effect>, CoreError> {
+        let wrapped = key.to_bytes();
+        let (chunk, ops) = self.encrypt_keyed(wrapped.as_ref(), &[], keying, csprng)?;
+        // Key material first, as everywhere else.
+        let mut effects: Vec<Effect> = ops.into_iter().map(Effect::broadcast).collect();
+        effects.push(Effect::StoreChunk {
+            key: self.secret.asset_key_key(asset),
+            doc: asset,
+            chunk: Box::new(chunk),
+        });
+        Ok(effects)
+    }
+
+    /// Every blinded key an asset occupies in the index: its key chunk, then
+    /// each of its segments in order.
+    ///
+    /// Used by a namespace rotation. The new replica starts empty, and documents
+    /// are carried into it by being re-encrypted — which for an asset would mean
+    /// re-encrypting and re-uploading gigabytes that have not changed. Asset
+    /// entries are re-*indexed* instead, by writing the hash the old replica
+    /// already names, and this is the list of keys to do it for.
+    #[must_use]
+    pub fn asset_index_keys(&self) -> Vec<StorageKey> {
+        let mut keys = Vec::new();
+        for entry in self.manifest.files() {
+            let Some(meta) = entry.asset else {
+                continue;
+            };
+            keys.push(self.secret.asset_key_key(entry.uuid));
+            for index in 0..meta.segments {
+                keys.push(self.secret.asset_part_key(entry.uuid, index));
+            }
+        }
+        keys
+    }
+
+    /// The blinded prefix of every asset the manifest records.
+    ///
+    /// What a caller turns into an `iroh-docs` download policy. Without one every
+    /// member fetches every asset's payload the moment its entries reconcile,
+    /// which is the "slowing down document synchronization" the large-asset user
+    /// story exists to rule out.
+    #[must_use]
+    pub fn asset_prefixes(&self) -> Vec<[u8; 24]> {
+        self.manifest
+            .files()
+            .into_iter()
+            .filter(|entry| entry.asset.is_some())
+            .map(|entry| self.secret.asset_prefix(entry.uuid))
+            .collect()
+    }
+
+    /// Encrypt and emit an ordinary edit to a document.
+    ///
+    /// [`Extent::Delta`] every [`FULL_PUBLISH_EVERY`] publishes but the last, so
+    /// a receiver that missed a delta is carried by the next full export without
+    /// having to ask.
     fn publish<R: CryptoRng + RngCore>(
         &mut self,
         doc: DocumentUuid,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
-        self.publish_keyed(doc, Keying::Current, csprng)
+        let extent = if self.published_up_to.contains_key(&doc)
+            && self.deltas_since_full.get(&doc).copied().unwrap_or(0) < FULL_PUBLISH_EVERY
+        {
+            Extent::Delta
+        } else {
+            // Nothing published yet, or the delta run is long enough that a peer
+            // which missed one has been stuck for a while.
+            Extent::Full
+        };
+        self.publish_keyed(doc, Keying::Current, extent, csprng)
     }
 
-    /// Encrypt and emit the current state of a document.
+    /// Encrypt and emit a document.
+    ///
+    /// `keying` decides which epoch key the chunk is under; `extent` decides how
+    /// much history is inside it. The two are orthogonal and all four
+    /// combinations are used:
+    ///
+    /// | Caller | `keying` | `extent` |
+    /// |---|---|---|
+    /// | an ordinary edit | `Current` | `Delta` |
+    /// | every `FULL_PUBLISH_EVERY`th edit | `Current` | `Full` |
+    /// | a resync of a document that moved | `Current` | `Full` |
+    /// | `RepairTarget::Document` — cannot decrypt | `Fresh` | `Full` |
+    /// | `RepairTarget::DocumentHistory` — cannot apply | `Current` | `Full` |
+    ///
+    /// A repair is always `Full`: a peer that asked for help has already shown
+    /// that what it holds is not enough, and answering with a delta keyed to
+    /// *this* node's publishing history would be answering a different question.
     fn publish_keyed<R: CryptoRng + RngCore>(
         &mut self,
         doc: DocumentUuid,
         keying: Keying,
+        extent: Extent,
         csprng: &mut R,
     ) -> Result<Vec<Effect>, CoreError> {
+        let published = self.published_up_to.get(&doc).cloned();
         let loro = self.docs.entry(doc).or_default();
 
-        // Ship the whole document history. A production build would export
-        // updates since the last acknowledged version vector; shipping
-        // everything keeps this deterministic and correct while the transport
-        // has no per-peer acknowledgement to key off, and makes each chunk
-        // self-sufficient under loss.
+        // `all_updates()` is what makes a chunk self-sufficient under loss, and
+        // that is exactly what a `Delta` gives up in exchange for costing the
+        // edit rather than the document. What makes the trade safe is that a
+        // receiver stuck on a delta says so — see `RepairTarget::DocumentHistory`.
+        let mode = match extent {
+            Extent::Delta => published
+                .as_deref()
+                .and_then(|bytes| loro::VersionVector::decode(bytes).ok())
+                .map_or(ExportMode::all_updates(), |vv| {
+                    ExportMode::updates_owned(vv)
+                }),
+            Extent::Full => ExportMode::all_updates(),
+        };
         let update = loro
-            .export(ExportMode::all_updates())
+            .export(mode)
             .map_err(|e| CoreError::Manifest(e.to_string()))?;
+        // Recorded before the encryption can fail, because it describes what this
+        // node is *about* to hand out and the caller cannot retry a partial
+        // publish: a failure here leaves the document unpublished either way, and
+        // the next publish exporting from an older version merely repeats work.
+        let now_at = loro.oplog_vv().encode();
 
         // Bind this chunk to the last state we know of for this document.
         let preds: Vec<ChunkRef> = self.last_ref.get(&doc).copied().into_iter().collect();
         let (chunk, ops) = self.encrypt_keyed(&update, &preds, keying, csprng)?;
         self.last_ref.insert(doc, chunk.content_ref);
+        self.published_up_to.insert(doc, now_at);
+        match extent {
+            Extent::Delta => *self.deltas_since_full.entry(doc).or_insert(0) += 1,
+            Extent::Full => {
+                self.deltas_since_full.insert(doc, 0);
+            }
+        }
 
         // Key material must go out *before* anything else can read the chunk,
         // so it is emitted first — whether it is an implicit update beekem
@@ -2516,13 +3106,19 @@ impl WorkspaceState {
             && (self.pending_chunks.len() >= MAX_PENDING_CHUNKS
                 || self.pending_bytes + size > MAX_PENDING_CHUNK_BYTES)
         {
-            if let Some((_, evicted)) = self.pending_chunks.pop_front() {
-                self.pending_bytes = self.pending_bytes.saturating_sub(evicted.ciphertext.len());
+            if let Some(evicted) = self.pending_chunks.pop_front() {
+                self.pending_bytes = self
+                    .pending_bytes
+                    .saturating_sub(evicted.chunk.ciphertext.len());
                 self.evicted_chunks += 1;
             }
         }
         self.pending_bytes += size;
-        self.pending_chunks.push_back((doc, chunk));
+        self.pending_chunks.push_back(Parked {
+            doc,
+            chunk,
+            drains: 0,
+        });
     }
 
     /// Retry every parked chunk, repeating while progress is being made.
@@ -2530,13 +3126,28 @@ impl WorkspaceState {
     /// Progress is counted as *applications*, not as effects: a repair request
     /// is an effect too, and counting it would spin this loop forever over a
     /// chunk that can never apply.
+    ///
+    /// # Why the two "keep it" verdicts are no longer treated alike
+    ///
+    /// `AwaitingKey` needs nothing from anybody: the operation establishing the
+    /// epoch is already in flight on the control plane, and the next drain after
+    /// it lands applies the chunk. `AwaitingDeps` needs a *publisher* to send
+    /// something it has not sent, and with delta publishing that is a state a
+    /// chunk can sit in forever — a delta whose base this node never received is
+    /// not going to become applicable by waiting, because the index slot holding
+    /// it has already been overwritten. Both are re-queued, but the second is
+    /// aged, and past [`MAX_DEP_WAIT_DRAINS`] it asks. Without that a delta lost
+    /// in transit costs the receiver that document until the next full publish,
+    /// silently, with a satisfied `no chunk stays parked forever` property right
+    /// up until the pending budget evicts it.
     fn drain_pending(&mut self) -> Result<Vec<Effect>, CoreError> {
         let mut effects = Vec::new();
         loop {
             let candidates = std::mem::take(&mut self.pending_chunks);
             self.pending_bytes = 0;
             let mut applied = 0_usize;
-            for (doc, chunk) in candidates {
+            for parked in candidates {
+                let Parked { doc, chunk, drains } = parked;
                 match self.try_apply(doc, &chunk) {
                     ChunkVerdict::Applied => {
                         applied += 1;
@@ -2547,9 +3158,23 @@ impl WorkspaceState {
                     // through the plain path rather than `park_chunk`, because
                     // these chunks were already admitted under the budget and
                     // re-checking it here could evict a chunk mid-drain.
-                    ChunkVerdict::AwaitingKey | ChunkVerdict::AwaitingDeps => {
+                    verdict @ (ChunkVerdict::AwaitingKey | ChunkVerdict::AwaitingDeps) => {
+                        let drains = drains.saturating_add(1);
+                        if verdict == ChunkVerdict::AwaitingDeps && drains >= MAX_DEP_WAIT_DRAINS {
+                            // Asked for repeatedly rather than once: the request
+                            // itself can be lost, and the backends rate-limit on
+                            // `(target, epoch)` so a repeat costs nothing until
+                            // the window closes.
+                            effects.push(Effect::RequestRepair {
+                                target: RepairTarget::DocumentHistory(doc),
+                                epoch: EpochId::of(&chunk),
+                            });
+                        } else {
+                            // Still within the window where the missing chunk
+                            // may simply be behind this one in the same pass.
+                        }
                         self.pending_bytes += chunk.ciphertext.len();
-                        self.pending_chunks.push_back((doc, chunk));
+                        self.pending_chunks.push_back(Parked { doc, chunk, drains });
                     }
                     // Never applicable. Holding it would occupy the budget for
                     // the life of the process and retry a decryption that
@@ -2661,4 +3286,27 @@ enum Keying {
     Current,
     /// Mint a new epoch, so every leaf now in the tree can read the result.
     Fresh,
+}
+
+/// How much of a document's history a publish carries.
+///
+/// Orthogonal to [`Keying`], and the two answer genuinely different questions:
+/// *which key* the chunk is encrypted under, and *how much* is inside it. Every
+/// one of the four combinations is reachable and means something — see the table
+/// on [`WorkspaceState::publish_keyed`].
+///
+/// [`Extent::Delta`] is what makes an ordinary edit cost the edit rather than the
+/// document. [`Extent::Full`] is what makes a chunk **self-sufficient under
+/// loss**, which is the property `all_updates()` was chosen for in the first
+/// place: a receiver can apply it without holding anything that came before. A
+/// document's index slot holds one chunk per author, so a receiver that misses a
+/// delta cannot go back for it — the only way through is a later `Full`, either
+/// on the periodic schedule or on demand via
+/// [`RepairTarget::DocumentHistory`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extent {
+    /// Only what this node has not published yet.
+    Delta,
+    /// Everything, so the chunk stands alone.
+    Full,
 }

@@ -80,6 +80,19 @@ pub enum CoreError {
     #[error("AEAD operation failed")]
     Aead(chacha20poly1305::Error),
 
+    /// An asset segment was not the shape a segment has to be.
+    ///
+    /// Two causes, and neither is an authentication failure — which is why this
+    /// is separate from [`Self::Aead`]. A plaintext longer than
+    /// [`ASSET_SEGMENT_BYTES`] is a caller bug on the writing side; a ciphertext
+    /// too short to contain its authentication tag is a truncated or fabricated
+    /// blob on the reading side. Reporting either as an AEAD failure would hide
+    /// a local mistake among the ordinary hostile-input cases.
+    ///
+    /// [`ASSET_SEGMENT_BYTES`]: crate::asset::ASSET_SEGMENT_BYTES
+    #[error("malformed asset segment: {0}")]
+    MalformedSegment(String),
+
     /// A signing future yielded instead of completing immediately.
     ///
     /// See [`crate::sync_poll`] — with a synchronous signer this is impossible,

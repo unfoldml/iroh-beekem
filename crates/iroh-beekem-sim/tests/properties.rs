@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use iroh_beekem_sim::{Honest, Role, Scenario, WorkspaceNode, member_bytes_of};
+use iroh_beekem_sim::{Honest, Role, Scenario, WorkspaceNode, asset_plaintext, member_bytes_of};
 use propsim::prelude::*;
 
 const NODES: usize = 3;
@@ -1787,6 +1787,104 @@ mod an_offline_node_catches_up {
     }
 }
 
+/// User story 4: a multi-gigabyte binary asset attached to a workspace entry.
+///
+/// What is asserted here is **distribution**, not sealing. Whether a padded
+/// segment round-trips, whether its AAD pins it to a position, whether a
+/// rewritten manifest is caught — all of that is a pure function of some bytes
+/// and is specified in `iroh_beekem_core::asset`, where it can be stated without
+/// a network. What only a simulated group can say is whether every member ends
+/// up able to read the thing, under partitions and reordering, and whether a
+/// removed one does not.
+///
+/// The asset is deliberately keyed differently from a document: its segments are
+/// sealed under a per-asset content key, and only that 32-byte key is encrypted
+/// to the group. So "can this member read the asset" is really "can this member
+/// unwrap one small chunk", which is what makes repairing an asset for a
+/// late-joining member cheap — and what these properties are ultimately about.
+mod an_asset_reaches_every_member {
+    use iroh_beekem_sim::{AssetChurn, Assets};
+
+    /// The node `AssetChurn` removes, matching `Scenario::REVOKE`.
+    const VICTIM: u64 = 2;
+
+    use propsim::prelude::*;
+
+    use super::{Duration, NODES, WorkspaceNode, asset_plaintext, joined, plan};
+
+    fn asset_plan(
+        properties: Vec<Property<WorkspaceNode<Assets>>>,
+    ) -> TestPlan<WorkspaceNode<Assets>> {
+        plan(properties)
+    }
+
+    /// In a workspace where the founder attached a binary asset, upon the
+    /// network settling, we expect every member to reassemble it byte for byte.
+    ///
+    /// The user story in one assertion. Reassembling requires all of it: the
+    /// manifest entry naming the asset, the content key unwrapped through the
+    /// CGKA, every segment present, and the recorded digest matching — a member
+    /// that lost a segment or applied one at the wrong offset fails the digest
+    /// rather than returning something plausible.
+    #[test]
+    fn every_member_eventually_reads_the_whole_asset() {
+        asset_plan(vec![property::eventually_within(
+            "every joined node reassembles the attached asset",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Assets>>| {
+                let expected = asset_plaintext();
+                let nodes = joined(w);
+                nodes.len() == NODES
+                    && nodes
+                        .iter()
+                        .all(|n| n.read_asset_view() == Some(expected.as_slice()))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace holding an asset, upon a member being removed, we expect
+    /// the survivors to still read it.
+    ///
+    /// The counterweight to the removal property below, and the one that would
+    /// catch a rotation implemented as "abandon the replica and forget the
+    /// asset". A member that lost its attachment every time somebody left would
+    /// satisfy every confidentiality property in this file.
+    #[test]
+    fn a_removal_does_not_cost_the_survivors_their_asset() {
+        plan::<AssetChurn>(vec![property::eventually_within(
+            "every remaining member still reassembles the asset",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<AssetChurn>>| {
+                let expected = asset_plaintext();
+                let staying: Vec<_> = joined(w).into_iter().filter(|n| n.id() != VICTIM).collect();
+                staying.len() == NODES - 1
+                    && staying
+                        .iter()
+                        .all(|n| n.read_asset_view() == Some(expected.as_slice()))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace holding an asset, upon the network settling, we expect no
+    /// node to have parked a chunk on account of it.
+    ///
+    /// Asset delivery is pull-based and does not go through the CRDT, so it must
+    /// not consume the parked-chunk budget — which is a shared, bounded resource
+    /// that content genuinely in flight depends on. An implementation that
+    /// pushed segments through `Event::ChunkArrived` would pass every other
+    /// property here and quietly evict documents under load.
+    #[test]
+    fn an_asset_never_occupies_the_parked_chunk_budget() {
+        asset_plan(vec![property::always(
+            "no node evicts a chunk while an asset is being distributed",
+            |w: &World<'_, WorkspaceNode<Assets>>| w.nodes().all(|n| n.evicted_chunks() == 0),
+        )])
+        .run(deterministic());
+    }
+}
+
 /// A member that walks away, as distinct from one the group throws out.
 ///
 /// Every other membership change in this suite is issued by the founder. A
@@ -2002,10 +2100,17 @@ mod an_action_needs_a_quorum {
             Duration::from_secs(12),
             |w: &World<'_, WorkspaceNode<Quorum>>| {
                 let staying = survivors(w);
+                // `current_member_count` rather than `group_size`, and the
+                // difference is not stylistic: beekem's tree count is read
+                // without replaying its operations graph, so a node that has
+                // merged the removal still reports the removed member until
+                // something happens to replay. This property failed on seeds
+                // where every node had in fact carried out the removal. See
+                // `beekem_group_size_disagrees_with_current_members`.
                 staying.len() == NODES_WITH_VICTIM - 1
-                    && staying.iter().all(|n| {
-                        u32::try_from(NODES_WITH_VICTIM).is_ok_and(|all| n.group_size() < all)
-                    })
+                    && staying
+                        .iter()
+                        .all(|n| n.current_member_count() < NODES_WITH_VICTIM)
             },
         )])
         .run(deterministic());

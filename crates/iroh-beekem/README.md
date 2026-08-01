@@ -17,11 +17,17 @@ documents, every edit versioned, signed and concurrent-safe, with no trusted ser
 ```
        CONTROL PLANE (iroh-gossip)              DATA PLANE (iroh-docs + iroh-blobs)
    Signed<CgkaOperation> broadcast on a       Blinded 32-byte keys → BLAKE3 hashes of
-   topic derived from the CGKA tree id;       serialized EncryptedContent chunks;
-   membership, key rotation, log repair       RBSR index sync + verified blob streaming
+   topic derived from the CGKA tree id;       chunks, and of asset segments sealed
+   membership, key rotation, log repair       under a per-asset content key;
+                                              RBSR index sync + verified blob streaming
                         \                    /
                          iroh Endpoint (QUIC, hole punching, relays)
 ```
+
+A workspace entry is either a CRDT **document**, replicated as encrypted Loro updates, or a binary
+**asset** — attached from a path and written back to one, a segment at a time, so a multi-gigabyte
+file is bounded by the disk rather than by memory. Peers index an asset's segments without fetching
+them and pull only what somebody opens.
 
 This crate is the `iroh` wiring and the async `Workspace` facade. All cryptography and state live in
 [`iroh-beekem-core`](https://crates.io/crates/iroh-beekem-core), which is I/O-free and therefore

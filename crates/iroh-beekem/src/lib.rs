@@ -35,6 +35,6 @@ pub use iroh_beekem_core::{AdminAction, ProposalStatus, Role};
 /// [`Identity::share_key`] produces one and [`Enrollment`] carries it; ordinary
 /// callers never need to name it, because [`Identity::enrollment`] packages both.
 pub use keyhive_crypto::share_key::ShareKey;
-pub use node::Node;
+pub use node::{DEFAULT_GC_INTERVAL, Node, NodeOptions};
 pub use wire::ControlMsg;
 pub use workspace::{Workspace, WorkspaceSummary};

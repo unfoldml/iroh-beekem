@@ -63,6 +63,9 @@ const WORKSPACES_DIR: &str = "workspaces";
 const ENDPOINT_KEY: &str = "endpoint.key";
 /// File holding the spent-invite-nonce ledger.
 const REDEEMED: &str = "redeemed";
+
+/// Assets whose segments were being written when the process last stopped.
+const PENDING_ASSETS: &str = "pending-assets";
 /// Extension for a workspace snapshot.
 const SNAPSHOT_EXT: &str = "snapshot";
 
@@ -76,6 +79,22 @@ pub(crate) const DOCS_DIR: &str = "docs";
 /// The tree id is part of the key so two workspaces on one node cannot collide,
 /// however their inviters happen to generate nonces.
 pub(crate) type SpentNonces = HashSet<([u8; 32], [u8; 16])>;
+
+/// Assets this node has begun writing and not yet declared, by
+/// `(tree id, asset uuid)`.
+///
+/// An intent log, and the only thing that makes an interrupted attachment
+/// recoverable. `Workspace::attach_file` indexes segments *before* the manifest
+/// entry that declares them — it must, since the entry records a digest over
+/// bytes it has not read yet — and an index entry is exactly what protects a
+/// blob from collection. A process killed halfway would otherwise leave segments
+/// no manifest will ever name, under a blinded key derived from a UUID that
+/// existed only in memory: unreachable, unnameable, and never reclaimed.
+///
+/// Recording the UUID first turns that into a startup sweep. Per workspace as
+/// well as per asset, because one node can hold several and each has its own
+/// blinding secret.
+pub(crate) type PendingAssets = HashSet<([u8; 32], [u8; 16])>;
 
 /// A workspace snapshot plus the facade-level state the core does not hold.
 ///
@@ -202,6 +221,41 @@ impl Store {
         let bytes = postcard::to_stdvec(redeemed)
             .map_err(|e| WorkspaceError::Storage(format!("encoding the invite ledger: {e}")))?;
         write_private(&self.root.join(REDEEMED), &bytes)
+    }
+
+    /// Read the pending-asset intent log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Storage`] only if the file exists and cannot be
+    /// read at all. Unreadable contents are treated as an empty log, matching
+    /// [`Self::load_redeemed`]: the cost of forgetting an orphan is storage, and
+    /// the cost of refusing to start is the workspace.
+    pub(crate) fn load_pending_assets(&self) -> Result<PendingAssets, WorkspaceError> {
+        let path = self.root.join(PENDING_ASSETS);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(postcard::from_bytes(&bytes).unwrap_or_default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+            Err(e) => Err(WorkspaceError::Storage(format!(
+                "reading {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Record the pending-asset intent log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::Storage`] if the log cannot be encoded or
+    /// written.
+    pub(crate) fn store_pending_assets(
+        &self,
+        pending: &PendingAssets,
+    ) -> Result<(), WorkspaceError> {
+        let bytes = postcard::to_stdvec(pending)
+            .map_err(|e| WorkspaceError::Storage(format!("encoding the pending-asset log: {e}")))?;
+        write_private(&self.root.join(PENDING_ASSETS), &bytes)
     }
 
     /// Where one workspace's snapshot lives.

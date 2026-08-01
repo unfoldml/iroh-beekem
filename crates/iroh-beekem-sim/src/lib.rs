@@ -43,9 +43,11 @@ use beekem::{
 // simulator is the thing under test.
 pub use iroh_beekem_core::Role;
 use iroh_beekem_core::{
-    AdminAction, AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect, EpochId,
-    Event, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey, WorkspaceSecret,
-    WorkspaceState,
+    AdminAction, AssetMeta, AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect,
+    EpochId, Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey,
+    WorkspaceSecret, WorkspaceState,
+    asset::{ContentDigest, open_segment, seal_segment},
+    state::AssetKeyVerdict,
 };
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
@@ -76,6 +78,34 @@ pub const DOCS: [DocumentUuid; 3] = [
     DocumentUuid([8u8; 16]),
     DocumentUuid([9u8; 16]),
 ];
+
+/// The asset the [`Assets`] scenarios attach.
+pub const ASSET: DocumentUuid = DocumentUuid([11u8; 16]);
+
+/// Plaintext bytes per segment in the simulator.
+///
+/// Small on purpose. Padding to the four-mebibyte default would make every
+/// broadcast in a run megabytes wide for no gain: nothing asserted here depends
+/// on the segment size, only on whether a member can obtain the segments at all.
+pub const SIM_SEGMENT_BYTES: u32 = 256;
+
+/// The asset's plaintext, spanning several segments with a padded tail.
+#[must_use]
+pub fn asset_plaintext() -> Vec<u8> {
+    // Deterministic and non-uniform, so a reassembly that lost or reordered a
+    // segment cannot pass by accident.
+    (0..(SIM_SEGMENT_BYTES as usize * 2 + 37))
+        .map(|i| u8::try_from(i % 251).unwrap_or(0))
+        .collect()
+}
+
+/// When the founder attaches its asset.
+///
+/// After the group has formed and before any revocation, so that a member
+/// removed later was demonstrably able to read it beforehand — otherwise "the
+/// victim cannot read the asset" would be true for a reason that has nothing to
+/// do with the removal.
+const ATTACH_AT: Duration = Duration::from_millis(900);
 
 /// The document the timer-driven scenarios edit.
 pub const DOC: DocumentUuid = DOCS[0];
@@ -130,6 +160,23 @@ const MAX_RESYNCS_UNDER_WORKLOAD: u32 = 24;
 /// simulation. Production is event-driven and cooldown-limited here; this is the
 /// closest cheap analogue.
 const LOG_REPAIR_EVERY: u32 = 4;
+
+/// How many anti-entropy rounds pass between data-plane reconciliations.
+///
+/// Sparser than every round for the same reason [`LOG_REPAIR_EVERY`] is, and the
+/// error it guards against is the *opposite* of the one reconciliation exists to
+/// fix. `iroh-docs` reconciles pairwise and differentially: two peers compare key
+/// ranges and transfer only what one of them lacks, which is usually nothing.
+/// The harness has no range structure to compare, so it re-offers everything to
+/// everyone — and doing that on every round makes the simulated data plane far
+/// **more** talkative than production, crowding out the control plane under a
+/// fault plan that drops and delays messages. A quorum whose approvals lose that
+/// race then fails a liveness property, which is an artefact of the model in
+/// exactly the way a missing reconciliation was.
+///
+/// Four rounds still leaves several reconciliations inside [`MAX_RESYNCS`], which
+/// is what the lost-entry recovery needs; it does not need one per round.
+const RECONCILE_EVERY: u32 = 4;
 
 /// How long one repair request is suppressed before the same one is re-sent.
 ///
@@ -311,6 +358,17 @@ pub trait Scenario: Clone + Default + 'static {
     /// is judged at the threshold in force *before* it.
     const THRESHOLD: u32 = 1;
 
+    /// Whether the founder attaches a binary asset partway through the run.
+    ///
+    /// Modelled with a small segmentation rather than the four-mebibyte default,
+    /// because what these properties are about is *distribution* — whether the
+    /// content key reaches a member, whether a removed one is locked out, whether
+    /// an asset survives a rotation — and none of that depends on how big a
+    /// segment is. The sealing itself is specified where it belongs, in
+    /// `iroh_beekem_core::asset`'s own tests, and the real segmentation is
+    /// exercised over real `iroh` in `tests/assets.rs`.
+    const ATTACH_ASSET: bool = false;
+
     /// A second node the founder promotes to admin, so a quorum is reachable.
     ///
     /// Without one, raising the threshold to two would deadlock the workspace:
@@ -323,6 +381,27 @@ pub trait Scenario: Clone + Default + 'static {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Honest;
 impl Scenario for Honest {}
+
+/// The founder attaches a binary asset that every member must be able to read.
+///
+/// User story 4. Beside [`Honest`] rather than derived from it because the
+/// asset path shares almost nothing with the document path: it does not go
+/// through the CRDT, it is not parked, and it is keyed by an envelope rather
+/// than by the CGKA directly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Assets;
+impl Scenario for Assets {
+    const ATTACH_ASSET: bool = true;
+}
+
+/// An asset attached before a member is removed, so the removal must not cost
+/// the survivors their attachment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AssetChurn;
+impl Scenario for AssetChurn {
+    const ATTACH_ASSET: bool = true;
+    const REVOKE: Option<u64> = Some(2);
+}
 
 /// Concurrent key rotation and membership revocation.
 #[derive(Clone, Copy, Debug, Default)]
@@ -619,6 +698,31 @@ pub enum Msg {
         /// The ciphertext.
         chunk: Box<Chunk>,
     },
+    /// One sealed segment of a binary asset.
+    ///
+    /// Separate from [`Self::Entry`] because an asset segment is not a beekem
+    /// `EncryptedContent`: it is sealed under the asset's own content key, and
+    /// the CGKA protects that key rather than the bytes. Modelling it as a
+    /// `Chunk` would mean inventing an epoch it does not have.
+    ///
+    /// Broadcast rather than pulled, which is where the model is deliberately
+    /// *less* faithful than production: `iroh-docs` indexes an asset segment
+    /// without downloading it, and a peer fetches the payload only when somebody
+    /// opens the file. Pull-on-demand cannot make a property fail that broadcast
+    /// would pass — it delays availability, it does not change what is
+    /// available — and modelling the fetch would mean modelling a request/response
+    /// exchange the harness has no notion of. What the download policy actually
+    /// does is proved over real `iroh` in `tests/assets.rs`.
+    Segment {
+        /// Which replicated index this segment belongs to.
+        namespace: NamespaceEpoch,
+        /// The blinded key this segment is stored under.
+        key: StorageKey,
+        /// Which node wrote it.
+        author: NodeId,
+        /// The sealed segment.
+        bytes: Vec<u8>,
+    },
     /// A rotation to a fresh replicated index.
     ///
     /// The capability travels encrypted under the group key, so a device
@@ -727,6 +831,8 @@ pub enum Tick {
     Edit,
     /// Time to re-announce local document state (anti-entropy).
     Resync,
+    /// Time for the founder to attach a binary asset.
+    Attach,
     /// Time to re-key this node's leaf.
     Rotate,
     /// Time for the founder to revoke the scenario's victim.
@@ -775,6 +881,44 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     /// distinguish "cannot read the content" from "cannot even tell the content
     /// exists" — and a revoked member is supposed to be denied both.
     index: BTreeMap<StorageKey, EntryMeta>,
+    /// The payloads behind [`Self::index`] — what this node could serve a peer.
+    ///
+    /// # Why the harness has to hold these at all
+    ///
+    /// Without them the simulated data plane is **pure broadcast**: an entry that
+    /// misses a peer is gone unless its author encrypts and announces it again.
+    /// `iroh-docs` does not work that way. It reconciles key ranges between any
+    /// two peers, so a node that lacks an entry gets it from whoever has it, and
+    /// the blob follows by hash — no republish, and not necessarily from the
+    /// author. Modelling only the broadcast makes the harness strictly more
+    /// fragile than production, and every failure that follows is an artefact of
+    /// the model rather than a defect in the library. It is the same trap
+    /// [`Msg::Log`] exists to avoid on the control plane.
+    ///
+    /// This became load-bearing with delta publishing. Before it, a republish
+    /// re-exported the whole history, so re-announcing *was* accidentally a
+    /// repair for a lost entry; now a re-announcement of an unchanged document
+    /// emits nothing at all, and reconciliation is the only thing that carries a
+    /// lost entry. See [`WorkspaceNode::reconcile`].
+    ///
+    /// Kept beside [`Self::index`] rather than inside it because `EntryMeta` is
+    /// the *metadata* view properties assert over, and it is `Copy`.
+    replica: BTreeMap<StorageKey, (NodeId, Chunk)>,
+    /// Sealed asset segments this node holds, by blinded key.
+    ///
+    /// Kept apart from [`Self::replica`] because they survive a namespace
+    /// rotation. That is the point of the rotation change: an asset segment is
+    /// immutable ciphertext, so it is re-*indexed* into the new replica rather
+    /// than re-encrypted, and a model that dropped it on adoption would be
+    /// modelling the behaviour that change removed.
+    segments: BTreeMap<StorageKey, Vec<u8>>,
+    /// The asset as this node last managed to reassemble it.
+    ///
+    /// Cached because reading it needs `&mut` — unwrapping the content key goes
+    /// through the CGKA, which caches derived keys — and a property is handed a
+    /// shared reference. Refreshed whenever new segments or key material could
+    /// have changed the answer, which models an application opening the file.
+    asset_view: Option<Vec<u8>>,
     /// The modelled overlay: peers this node currently accepts messages from.
     ///
     /// Recomputed from [`WorkspaceState::roster`] — the same derivation the real
@@ -883,6 +1027,11 @@ struct Disk {
     state: Vec<u8>,
     /// The modelled replica, which is redb-backed in production and so durable.
     index: BTreeMap<StorageKey, EntryMeta>,
+    /// The payloads behind [`Self::index`], durable for the same reason: in
+    /// production they are blobs on disk.
+    replica: BTreeMap<StorageKey, (NodeId, Chunk)>,
+    /// Sealed asset segments, durable for the same reason.
+    segments: BTreeMap<StorageKey, Vec<u8>>,
     /// Peers accepted on faith. Durable because the real bootstrap entry comes
     /// from the invite, and a restarting node has no invite to re-read.
     bootstrap: BTreeSet<NodeId>,
@@ -1124,7 +1273,15 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.state.as_ref().map_or(0, WorkspaceState::pending_len)
     }
 
-    /// Control operations parked awaiting causal predecessors.
+    /// Chunks dropped because the pending budget was exhausted.
+    #[must_use]
+    pub fn evicted_chunks(&self) -> u64 {
+        self.state
+            .as_ref()
+            .map_or(0, WorkspaceState::evicted_chunks)
+    }
+
+    /// Control operations parked awaiting their predecessors.
     #[must_use]
     pub fn parked_ops(&self) -> usize {
         self.state.as_ref().map_or(0, WorkspaceState::parked_ops)
@@ -1216,9 +1373,27 @@ impl<S: Scenario> WorkspaceNode<S> {
     }
 
     /// How many members this node believes are in the group.
+    ///
+    /// beekem's tree count, and **not** the one to assert a membership change
+    /// over: it is read without replaying the operations graph, so between
+    /// merging a concurrent removal and the next replay it still counts the
+    /// removed member. Use [`Self::current_member_count`] for that. See
+    /// `beekem_group_size_disagrees_with_current_members` in
+    /// `iroh-beekem-core/tests/beekem_loop.rs`.
     #[must_use]
     pub fn group_size(&self) -> u32 {
         self.state.as_ref().map_or(0, WorkspaceState::group_size)
+    }
+
+    /// How many members this node counts, from the set this crate maintains.
+    ///
+    /// Updated by `merge` the moment a removal is applied, so unlike
+    /// [`Self::group_size`] it is never behind the operations it has accepted.
+    #[must_use]
+    pub fn current_member_count(&self) -> usize {
+        self.state
+            .as_ref()
+            .map_or(0, WorkspaceState::current_member_count)
     }
 
     /// Which generation of the replicated index this node is syncing.
@@ -1445,6 +1620,7 @@ impl<S: Scenario> WorkspaceNode<S> {
             | Msg::Log { .. }
             | Msg::Certs(_)
             | Msg::Entry { .. }
+            | Msg::Segment { .. }
             | Msg::Repair { .. }
             | Msg::Namespace { .. } => {
                 self.roster.contains(&from) || self.bootstrap.contains(&from)
@@ -1465,6 +1641,60 @@ impl<S: Scenario> WorkspaceNode<S> {
                 size: chunk.ciphertext.len(),
             },
         );
+        // The payload as well as the fact of it, so this node can hand the entry
+        // on to a peer that missed it — which is what `iroh-docs` reconciliation
+        // does and what [`Self::reconcile`] models.
+        self.replica.insert(key, (author, chunk.clone()));
+    }
+
+    /// Re-offer every entry this node holds, as range reconciliation would.
+    ///
+    /// The counterpart to [`Self::republish`], and a different thing entirely.
+    /// `republish` asks the *core* to produce fresh chunks for content it has not
+    /// announced; this re-sends chunks that already exist, unchanged, from
+    /// whichever node happens to hold them. Only the second recovers an entry
+    /// lost in transit, because the author has nothing left to say about a
+    /// document it has fully published.
+    ///
+    /// The recorded author travels with the entry rather than being replaced by
+    /// this node's id: `iroh-docs` reconciliation preserves authorship, and the
+    /// receiver's `author_may_write` check is meaningless if a relaying peer can
+    /// launder an entry into its own name.
+    fn reconcile(&mut self, cx: &mut dyn Ctx<Self>) {
+        let namespace = self.namespace;
+        for (key, (author, chunk)) in self.replica.clone() {
+            cx.broadcast(Msg::Entry {
+                namespace,
+                key,
+                author,
+                chunk: Box::new(chunk),
+            });
+        }
+        // Asset segments too, and under the *current* namespace whatever
+        // namespace they were written in: that is precisely what re-indexing
+        // does — the same ciphertext, announced in the replica the group has
+        // moved to, with no re-encryption.
+        let me = self.me;
+        for (key, bytes) in self.segments.clone() {
+            cx.broadcast(Msg::Segment {
+                namespace,
+                key,
+                author: NodeId(me),
+                bytes,
+            });
+        }
+    }
+
+    /// Record an asset segment this node can now serve.
+    fn on_segment(&mut self, namespace: NamespaceEpoch, key: StorageKey, bytes: Vec<u8>) {
+        // Dropped before it is recorded, for the same reason an entry from
+        // another namespace is: a peer that holds no capability for a replica
+        // does not merely decline to read it, it never hears about it.
+        if namespace != self.namespace {
+            return;
+        }
+        self.segments.insert(key, bytes);
+        self.refresh_asset_view();
     }
 
     /// Handle an arriving index entry.
@@ -1569,6 +1799,11 @@ impl<S: Scenario> WorkspaceNode<S> {
         // rather than about the protocol.
         if S::ROTATE && !self.is_revocation_target() {
             cx.set_timer(Tick::Rotate, FIRST_ROTATE);
+        }
+        // The founder attaches, because it is the one node certain to hold a
+        // writing role from the first instant.
+        if S::ATTACH_ASSET && me.0 == FOUNDER {
+            cx.set_timer(Tick::Attach, ATTACH_AT);
         }
         if me.0 == FOUNDER && S::REVOKE.is_some() {
             cx.set_timer(Tick::Revoke, REVOKE_AT);
@@ -1740,6 +1975,8 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.disk = Some(Disk {
             state: bytes.to_vec(),
             index: self.index.clone(),
+            replica: self.replica.clone(),
+            segments: self.segments.clone(),
             bootstrap: self.bootstrap.clone(),
             contributed: self.contributed.clone(),
         });
@@ -1776,6 +2013,8 @@ impl<S: Scenario> WorkspaceNode<S> {
         // genuinely empty rather than half-remembering.
         self.state = None;
         self.index.clear();
+        self.replica.clear();
+        self.segments.clear();
         self.bootstrap.clear();
         self.contributed.clear();
         self.namespace = NamespaceEpoch::INITIAL;
@@ -1793,15 +2032,169 @@ impl<S: Scenario> WorkspaceNode<S> {
         self.namespace = state.namespace();
         self.state = Some(state);
         self.index = disk.index;
+        self.replica = disk.replica;
+        self.segments = disk.segments;
         self.bootstrap = disk.bootstrap;
         self.contributed = disk.contributed;
         self.refresh_roster();
+    }
+
+    /// Attach the scenario's binary asset: seal its key, then its segments, then
+    /// declare it.
+    ///
+    /// The same order the real `attach_file` uses, and for the same two reasons.
+    /// Key material first, because a peer holding a segment and no key chunk
+    /// cannot read it. The manifest entry last, because until it exists the
+    /// asset is not in `files()` — so a run that stops halfway leaves segments
+    /// nobody references rather than a truncated file somebody can open.
+    fn attach_asset(&mut self, cx: &mut dyn Ctx<Self>) {
+        let me = cx.me();
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let mut rng = node_rng(me, 0xA55E7);
+        let Ok((key, effects)) = state.seal_asset_key(ASSET, &mut rng) else {
+            return;
+        };
+        self.apply_effects(effects, cx, 0xA55E8);
+
+        let plaintext = asset_plaintext();
+        let size = plaintext.len() as u64;
+        let segments = AssetMeta::segments_for(size, SIM_SEGMENT_BYTES);
+        let secret = WorkspaceSecret::new(workspace_secret_bytes());
+        let mut digest = ContentDigest::new();
+
+        for index in 0..segments {
+            let start = usize::try_from(index)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(SIM_SEGMENT_BYTES as usize);
+            let end = (start + SIM_SEGMENT_BYTES as usize).min(plaintext.len());
+            let piece = &plaintext[start..end];
+            digest.update(piece);
+            let Ok(sealed) = seal_segment(&key, ASSET, index, segments, SIM_SEGMENT_BYTES, piece)
+            else {
+                return;
+            };
+            let key_at = secret.asset_part_key(ASSET, index);
+            // Held locally as well as broadcast, exactly as a real node holds
+            // what it wrote.
+            self.segments.insert(key_at, sealed.clone());
+            cx.broadcast(Msg::Segment {
+                namespace: self.namespace,
+                key: key_at,
+                author: me,
+                bytes: sealed,
+            });
+        }
+
+        self.drive(
+            Event::UpsertFile {
+                entry: FileEntry {
+                    uuid: ASSET,
+                    logical_path: "/asset.bin".into(),
+                    mime_type: "application/octet-stream".into(),
+                    asset: Some(AssetMeta {
+                        size,
+                        segments,
+                        segment_bytes: SIM_SEGMENT_BYTES,
+                        content_hash: digest.finish(),
+                    }),
+                },
+            },
+            cx,
+            0xA55E9,
+        );
+    }
+
+    /// Reassemble the scenario's asset, or say why this node cannot.
+    ///
+    /// `None` covers every reason a node might not have it *yet* — no manifest
+    /// entry, no key chunk, an unreachable epoch, a missing segment — because a
+    /// property asking "can everyone read this" wants one answer, and the
+    /// distinctions between the not-yet cases are the subject of the facade's own
+    /// tests rather than of a convergence property.
+    #[must_use]
+    pub fn read_asset(&mut self) -> Option<Vec<u8>> {
+        let secret = WorkspaceSecret::new(workspace_secret_bytes());
+        let meta = self
+            .state
+            .as_ref()?
+            .manifest()
+            .files()
+            .into_iter()
+            .find(|entry| entry.uuid == ASSET)
+            .and_then(|entry| entry.asset)?;
+
+        let (_, key_chunk) = self.replica.get(&secret.asset_key_key(ASSET))?.clone();
+        let AssetKeyVerdict::Ready(key) = self.state.as_mut()?.open_asset_key(&key_chunk) else {
+            return None;
+        };
+
+        let mut out = Vec::with_capacity(usize::try_from(meta.size).unwrap_or_default());
+        for index in 0..meta.segments {
+            let sealed = self.segments.get(&secret.asset_part_key(ASSET, index))?;
+            let piece = open_segment(
+                &key,
+                ASSET,
+                index,
+                meta.segments,
+                meta.segment_bytes,
+                meta.payload_len(index),
+                sealed,
+            )
+            .ok()?;
+            out.extend_from_slice(&piece);
+        }
+        // The digest recorded in the manifest, checked over what was
+        // reassembled — the manifest is writable by any member, and this is what
+        // makes a rewritten `size` or `segments` a refusal rather than a
+        // different file.
+        if ContentDigest::new_over(&out) == meta.content_hash {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// The asset as this node last reassembled it, if it could.
+    #[must_use]
+    pub fn read_asset_view(&self) -> Option<&[u8]> {
+        self.asset_view.as_deref()
+    }
+
+    /// Re-attempt the reassembly, recording the result for a property to read.
+    fn refresh_asset_view(&mut self) {
+        if !S::ATTACH_ASSET {
+            return;
+        }
+        if let Some(view) = self.read_asset() {
+            self.asset_view = Some(view);
+        } else {
+            // Left as it was: an asset that has been read once does not stop
+            // existing because a later attempt raced a rotation.
+        }
+    }
+
+    /// Whether this node holds the asset's wrapped content key at all.
+    ///
+    /// The observable a removal property needs: a member locked out of an asset
+    /// is one that cannot obtain the key, whatever it can still see of the
+    /// segments.
+    #[must_use]
+    pub fn holds_asset_key(&self) -> bool {
+        let secret = WorkspaceSecret::new(workspace_secret_bytes());
+        self.replica.contains_key(&secret.asset_key_key(ASSET))
     }
 
     /// Re-announce every document this node holds.
     ///
     /// The simulator's counterpart to the facade's republish-on-neighbour-up.
     fn republish(&mut self, cx: &mut dyn Ctx<Self>) {
+        // Range reconciliation first, and it is not interchangeable with the
+        // resyncs below: those produce nothing for a document already fully
+        // published, which is exactly the state a node is in when one of its
+        // entries was lost in transit. See [`Self::reconcile`].
+        self.reconcile(cx);
         for (i, doc) in DOCS.into_iter().enumerate() {
             self.drive(Event::Resync { doc }, cx, 9000 + i as u64);
         }
@@ -1840,6 +2233,17 @@ impl<S: Scenario> WorkspaceNode<S> {
         let Ok(effects) = state.handle(event, &mut rng) else {
             return;
         };
+        self.apply_effects(effects, cx, salt);
+    }
+
+    /// Perform what the core asked for.
+    ///
+    /// Split from [`Self::drive`] because the asset path produces effects
+    /// without going through an `Event`: sealing a content key is a direct call
+    /// on `WorkspaceState`, since the bulk encryption that follows it cannot live
+    /// in a crate that does no I/O.
+    fn apply_effects(&mut self, effects: Vec<Effect>, cx: &mut dyn Ctx<Self>, salt: u64) {
+        let me = cx.me();
         // Two follow-ups that must happen *after* this loop, because both feed
         // more events into `drive` and the borrow of `state` is still live here.
         let mut pending_mint: Option<(u32, Vec<u8>)> = None;
@@ -1871,6 +2275,18 @@ impl<S: Scenario> WorkspaceNode<S> {
                 }
                 Effect::DeleteEntry { key, .. } => {
                     self.index.remove(&key);
+                    // The payload goes with the record. Keeping it would have
+                    // this node re-offer a withdrawn entry on the next
+                    // reconciliation and resurrect a deleted document.
+                    self.replica.remove(&key);
+                }
+                // The ranged counterpart, which `iroh-docs` performs as a single
+                // prefix deletion. Modelled as a scan because the simulated
+                // replica is a map rather than a range-reconciled store, and the
+                // entry counts here are small.
+                Effect::DeleteAssetSegments { prefix, .. } => {
+                    self.index.retain(|key, _| !key.0.starts_with(&prefix));
+                    self.replica.retain(|key, _| !key.0.starts_with(&prefix));
                 }
                 Effect::RequestRepair { target, epoch } => {
                     self.ask_for_repair(target, epoch, cx);
@@ -1893,7 +2309,22 @@ impl<S: Scenario> WorkspaceNode<S> {
                     // Entries from the abandoned namespace are no longer
                     // reachable, exactly as they would not be after switching
                     // replicas: the index this node can see starts empty again.
-                    self.index.clear();
+                    //
+                    // Except the assets, which are **re-indexed** rather than
+                    // re-encrypted. An asset segment is immutable ciphertext and
+                    // the removed device could already read everything published
+                    // before its removal, so carrying the same bytes into the
+                    // new replica gives it nothing — while re-encrypting would
+                    // cost the group the whole asset on every removal. This is
+                    // the modelled half of `reindex_assets`; the real one is
+                    // proved over `iroh` in `tests/assets.rs`.
+                    let carried: Vec<StorageKey> = self
+                        .state
+                        .as_ref()
+                        .map(WorkspaceState::asset_index_keys)
+                        .unwrap_or_default();
+                    self.index.retain(|key, _| carried.contains(key));
+                    self.replica.retain(|key, _| carried.contains(key));
                     pending_republish = true;
                 }
                 // Purely local; nothing to tell the network about.
@@ -1967,6 +2398,12 @@ impl<S: Scenario> WorkspaceNode<S> {
                     author,
                     chunk,
                 } => self.on_entry(namespace, key, author, chunk, cx, 0),
+                Msg::Segment {
+                    namespace,
+                    key,
+                    bytes,
+                    ..
+                } => self.on_segment(namespace, key, bytes),
                 Msg::Namespace { epoch, chunk } => {
                     self.drive(Event::NamespaceArrived { epoch, chunk }, cx, 0);
                 }
@@ -2407,6 +2844,12 @@ impl<S: Scenario> WorkspaceNode<S> {
                 author,
                 chunk,
             } => self.on_entry(namespace, key, author, chunk, cx, 3),
+            Msg::Segment {
+                namespace,
+                key,
+                bytes,
+                ..
+            } => self.on_segment(namespace, key, bytes),
             // The group has abandoned the namespace this node was syncing. A
             // device removed before the rotation cannot decrypt the capability
             // and stays behind, which is the entire mechanism.
@@ -2472,6 +2915,22 @@ impl<S: Scenario> WorkspaceNode<S> {
                 }
             }
             Tick::Resync => {
+                // Range reconciliation, before the re-announcements below and
+                // not replaceable by them. `Event::Resync` produces a chunk only
+                // for a document this node has *not* fully published, so it
+                // cannot recover an entry that was lost in transit — the author
+                // has nothing left to say. Re-offering what this node already
+                // holds is what `iroh-docs` does between any two peers, and
+                // leaving it out makes the harness strictly more fragile than
+                // production. On a sparser cadence than the resyncs below,
+                // because doing it every round makes it more talkative than
+                // production instead — see [`RECONCILE_EVERY`].
+                if self.resyncs_done.is_multiple_of(RECONCILE_EVERY) {
+                    self.reconcile(cx);
+                } else {
+                    // Not a reconciliation round; the re-announcements below
+                    // still run, as they do every round.
+                }
                 // A distinct salt per document *and* per round. `drive` seeds a
                 // fresh RNG from the salt, so reusing one would hand three
                 // different encryptions the identical random stream, and hand
@@ -2510,6 +2969,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                     cx.set_timer(Tick::Resync, RESYNC_INTERVAL);
                 }
             }
+            Tick::Attach => self.attach_asset(cx),
             Tick::Rotate => {
                 if self.state.is_some() {
                     self.drive(Event::Rotate, cx, 7 + u64::from(self.rotations_done));

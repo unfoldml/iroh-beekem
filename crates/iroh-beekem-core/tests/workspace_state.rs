@@ -199,7 +199,8 @@ impl Bus {
                 | Effect::Applied { .. }
                 | Effect::ManifestUpdated
                 | Effect::EvictUncertified { .. }
-                | Effect::DeleteEntry { .. } => {}
+                | Effect::DeleteEntry { .. }
+                | Effect::DeleteAssetSegments { .. } => {}
             }
         }
         if let Some(epoch) = mint {
@@ -512,7 +513,8 @@ fn concurrent_edits_from_both_members_converge() {
             | Effect::ManifestUpdated
             | Effect::BroadcastCerts(_)
             | Effect::EvictUncertified { .. }
-            | Effect::DeleteEntry { .. } => {}
+            | Effect::DeleteEntry { .. }
+            | Effect::DeleteAssetSegments { .. } => {}
         }
     }
     bus.deliver_all_to_bob();
@@ -610,6 +612,7 @@ mod roles_are_enforced {
                     uuid: DOC,
                     logical_path: "/notes.md".into(),
                     mime_type: "text/markdown".into(),
+                    asset: None,
                 },
             },
             50,
@@ -767,6 +770,7 @@ mod roles_are_enforced {
                             uuid: DOC,
                             logical_path: "/viewer.md".into(),
                             mime_type: "text/markdown".into(),
+                            asset: None,
                         },
                     },
                     &mut rng(82),
@@ -852,6 +856,298 @@ mod roles_are_enforced {
             "a member whose grant has not yet arrived must not be refused, or \
              onboarding deadlocks: it cannot publish, so it cannot announce its author, \
              so no peer ever accepts anything from it; got {result:?}"
+        );
+    }
+}
+
+/// What an edit costs to publish, and what makes the cheap version safe.
+///
+/// A chunk used to carry the document's entire history every time, so the cost
+/// of the *n*th edit grew with *n* and a workspace's publishing cost grew
+/// quadratically in edits. A delta costs the edit — at the price of no longer
+/// being self-sufficient under loss, which is the property the old behaviour was
+/// chosen for. These tests state both halves: that the saving is real, and that
+/// a receiver which loses a delta says so rather than going quietly out of date.
+mod publishing_costs_the_edit_and_not_the_document {
+    use iroh_beekem_core::{Chunk, Effect, Event, RepairTarget};
+
+    use super::{DOC, rng, two_node_workspace};
+
+    /// The chunk in a batch of effects, for the single-document publishes here.
+    fn chunk_in(effects: &[Effect]) -> Option<Chunk> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::StoreChunk { chunk, .. } => Some((**chunk).clone()),
+            _ => None,
+        })
+    }
+
+    /// Given a document that has been edited many times, upon making one more
+    /// edit, we expect the published chunk to be about the size of that edit
+    /// rather than of the accumulated history.
+    ///
+    /// Stated as a ratio rather than an absolute size because both numbers are
+    /// Loro's to choose. What the test pins is the *shape* of the growth: under
+    /// the old `all_updates()` export the last chunk was the largest one, and the
+    /// assertion below is false by construction.
+    #[test]
+    fn a_later_edit_publishes_a_chunk_the_size_of_the_edit() {
+        const EDITS: usize = 40;
+        const LINE: &str = "a line of roughly forty characters here\n";
+
+        let mut bus = two_node_workspace();
+        let mut last = None;
+        for i in 0..EDITS {
+            let effects = bus.alice_emits(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: LINE.into(),
+                },
+                600 + i as u64,
+            );
+            last = chunk_in(&effects);
+        }
+        let last = last.expect("every edit publishes a chunk");
+
+        // The whole history is what a repair still ships, so it is available
+        // here as the honest comparison rather than as a guessed constant.
+        let full = chunk_in(&bus.alice_emits(
+            Event::RepairRequested {
+                requester: bus.bob.member_id(),
+                target: RepairTarget::DocumentHistory(DOC),
+                epoch: iroh_beekem_core::EpochId::of(&last),
+            },
+            700,
+        ))
+        .expect("a history repair republishes the document in full");
+
+        assert!(
+            last.ciphertext.len() * 4 < full.ciphertext.len(),
+            "after {EDITS} edits a delta must be a small fraction of the full \
+             history, got {} bytes against {} — if these are close, the export \
+             mode is still `all_updates()` and the quadratic cost is unchanged",
+            last.ciphertext.len(),
+            full.ciphertext.len()
+        );
+    }
+
+    /// Given a receiver that missed one delta, upon the next delta arriving, we
+    /// expect it to be parked and — after enough fruitless retries — a
+    /// [`RepairTarget::DocumentHistory`] request to be raised for it.
+    ///
+    /// This is the safety half of delta publishing and the only thing that makes
+    /// it sound. A document's index slot holds one chunk per author, so a lost
+    /// delta cannot be fetched again: the slot has already moved on. Without an
+    /// escalation the chunk that follows it sits in `pending_chunks` until the
+    /// budget evicts it, and the receiver is silently short of content with
+    /// every "nothing stays parked forever" property still satisfied, because
+    /// the queue does eventually empty — by discarding.
+    ///
+    /// The request must name `DocumentHistory` and not `Document`: bob can
+    /// decrypt perfectly well, and answering a key problem he does not have
+    /// costs the whole group a CGKA operation while delivering none of the
+    /// operations he is actually missing.
+    #[test]
+    fn a_receiver_that_loses_a_delta_asks_for_the_history() {
+        let mut bus = two_node_workspace();
+
+        // Alice's first publish reaches bob, so both agree on a base.
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "first".into(),
+            },
+            610,
+        );
+        bus.deliver_all_to_bob();
+
+        // The second is lost: emitted, never queued.
+        let lost = bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " second".into(),
+            },
+            611,
+        );
+        assert!(
+            chunk_in(&lost).is_some(),
+            "the edit being dropped has to have produced a chunk, or this test \
+             drops nothing and proves nothing"
+        );
+
+        // The third arrives, and depends on the second.
+        let third = chunk_in(&bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " third".into(),
+            },
+            612,
+        ))
+        .expect("the third edit publishes a chunk");
+        bus.bob_receives(Event::ChunkArrived {
+            doc: DOC,
+            chunk: Box::new(third.clone()),
+        });
+
+        assert_eq!(
+            bus.bob.pending_len(),
+            1,
+            "a delta whose base never arrived must park rather than apply or \
+             be discarded"
+        );
+
+        // Every re-offer of the same entry is another chance to apply, which is
+        // what `iroh-docs` reconciliation supplies in production. Enough of them
+        // and the receiver stops waiting and asks.
+        for _ in 0..16 {
+            bus.bob_receives(Event::ChunkArrived {
+                doc: DOC,
+                chunk: Box::new(third.clone()),
+            });
+        }
+
+        assert!(
+            bus.repairs_from_bob()
+                .iter()
+                .any(|(target, _)| *target == RepairTarget::DocumentHistory(DOC)),
+            "a chunk stuck on missing dependencies must eventually ask for the \
+             history, got {:?}",
+            bus.repairs_from_bob()
+        );
+        assert!(
+            !bus.repairs_from_bob()
+                .iter()
+                .any(|(target, _)| *target == RepairTarget::Document(DOC)),
+            "bob can derive the epoch, so asking for a re-key would charge the \
+             group an operation that fixes nothing"
+        );
+    }
+
+    /// Given a receiver stuck on a missing delta, upon the history repair being
+    /// answered, we expect it to converge on the publisher's text.
+    ///
+    /// The counterweight to the test above: an escalation that fires and is
+    /// answered with something unusable would satisfy every assertion there.
+    #[test]
+    fn the_history_repair_lets_the_receiver_catch_up() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "first".into(),
+            },
+            620,
+        );
+        bus.deliver_all_to_bob();
+        let _lost = bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " second".into(),
+            },
+            621,
+        );
+        let third = chunk_in(&bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " third".into(),
+            },
+            622,
+        ))
+        .expect("the third edit publishes a chunk");
+        bus.bob_receives(Event::ChunkArrived {
+            doc: DOC,
+            chunk: Box::new(third.clone()),
+        });
+        assert_ne!(
+            bus.bob.document_text(DOC),
+            bus.alice.document_text(DOC),
+            "the setup has to actually leave bob behind, or the repair below \
+             would have nothing to fix"
+        );
+
+        bus.alice_does(
+            Event::RepairRequested {
+                requester: bus.bob.member_id(),
+                target: RepairTarget::DocumentHistory(DOC),
+                epoch: iroh_beekem_core::EpochId::of(&third),
+            },
+            623,
+        );
+        bus.deliver_all_to_bob();
+
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            bus.alice.document_text(DOC),
+            "a history repair ships the whole document, so it must resolve a gap \
+             no delta could"
+        );
+        assert_eq!(
+            bus.bob.pending_len(),
+            0,
+            "the parked delta must apply once its dependencies arrive, rather \
+             than sitting behind content that already superseded it"
+        );
+    }
+
+    /// Given a document with nothing unpublished, upon a resync, we expect no
+    /// chunk at all.
+    ///
+    /// The single largest saving of the three, and the one most likely to be
+    /// undone by accident, because re-encrypting looks like the safe thing to do.
+    /// It is not needed: the index entry naming the existing chunk is still
+    /// there, and `iroh-docs` reconciles key ranges between peers, so a peer that
+    /// lacks the entry is served by whoever holds it without the author saying
+    /// anything. Re-encrypting instead produced a fresh blob per document per
+    /// republish cycle, forever, and none of them carried new information.
+    ///
+    /// What a resync legitimately still does is covered by the assertion below
+    /// it: a document that *has* moved is republished.
+    #[test]
+    fn a_resync_of_an_unchanged_document_publishes_nothing() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "settled".into(),
+            },
+            630,
+        );
+
+        let quiescent = bus.alice_emits(Event::Resync { doc: DOC }, 631);
+        assert!(
+            chunk_in(&quiescent).is_none(),
+            "a resync of a fully published document must emit no chunk, got \
+             {quiescent:?}"
+        );
+
+        // And a document that has moved is still re-announced, or anti-entropy
+        // would have been turned off rather than made proportional. The move
+        // comes from a peer, which is the case that matters: merging somebody
+        // else's chunk advances the document without publishing anything, so it
+        // is precisely the state a resync exists to carry onward.
+        bus.deliver_all_to_bob();
+        let from_bob = bus
+            .bob
+            .handle(
+                Event::LocalEdit {
+                    doc: DOC,
+                    text: " and bob's line".into(),
+                },
+                &mut rng(632),
+            )
+            .expect("bob writes as an editor");
+        let bobs_chunk = chunk_in(&from_bob).expect("bob's edit publishes a chunk");
+        bus.queue_from_bob_to_alice(from_bob);
+        bus.deliver_all_to_alice();
+        bus.alice_receives(Event::ChunkArrived {
+            doc: DOC,
+            chunk: Box::new(bobs_chunk),
+        });
+
+        let moved = bus.alice_emits(Event::Resync { doc: DOC }, 633);
+        assert!(
+            chunk_in(&moved).is_some(),
+            "a resync of a document holding operations this node has not \
+             published must still publish, got {moved:?}"
         );
     }
 }
@@ -1137,31 +1433,60 @@ mod repair_reaches_a_member_admitted_late {
         );
     }
 
-    /// Given a document that has not changed, when it is re-announced twice, we
-    /// expect both announcements to be keyed under the same epoch — and a
-    /// repair of the same document to be keyed under a new one.
+    /// Given a document alice keeps publishing, when the ordinary path runs, we
+    /// expect every chunk to be keyed under the same epoch — and a repair of the
+    /// same document to be keyed under a new one.
     ///
     /// This is the defect stated as an assertion. Anti-entropy is a fixed point
     /// with respect to a peer that cannot derive the current epoch: repeating it
-    /// reproduces the ciphertext that peer already failed on. Only the repair
-    /// path is obliged to advance the epoch, and this is what says so.
+    /// reproduces a ciphertext keyed under the epoch that peer already failed on.
+    /// Only the repair path is obliged to advance the epoch, and this is what
+    /// says so. Routing repair back through the ordinary publish path would
+    /// restore the original defect while leaving every other test name intact;
+    /// the final assertion here is the one that would fail.
+    ///
+    /// Since delta publishing landed there is a stronger statement to make about
+    /// the anti-entropy half, and the first assertion makes it: a resync of a
+    /// document nothing has touched does not merely repeat the epoch, it emits no
+    /// chunk whatever. The stuck peer is therefore not even offered a ciphertext
+    /// to fail on again, which is the same conclusion arrived at more cheaply.
     #[test]
     fn anti_entropy_repeats_an_epoch_while_a_repair_advances_it() {
         let (mut bus, _stale) = workspace_written_to_before_bob_joined();
         bus.deliver_all_to_bob();
 
-        let first = only_chunk(&bus.alice_emits(Event::Resync { doc: DOC }, 50));
-        let second = only_chunk(&bus.alice_emits(Event::Resync { doc: DOC }, 51));
+        let quiescent = bus.alice_emits(Event::Resync { doc: DOC }, 50);
+        assert!(
+            !quiescent
+                .iter()
+                .any(|effect| matches!(effect, Effect::StoreChunk { .. })),
+            "a resync of a document whose every operation is already published \
+             must emit nothing: the index entry naming the existing chunk is \
+             still there, and re-encrypting it produces a new blob that tells \
+             nobody anything, got {quiescent:?}"
+        );
+
+        // Two ordinary publishes, which is what anti-entropy amounts to once the
+        // document actually moves. Both must name the epoch alice already holds.
+        let first = only_chunk(&bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " and more".into(),
+            },
+            51,
+        ));
+        let second = only_chunk(&bus.alice_emits(
+            Event::LocalEdit {
+                doc: DOC,
+                text: " and more again".into(),
+            },
+            52,
+        ));
         assert_eq!(
             EpochId::of(&first),
             EpochId::of(&second),
-            "two resyncs of unchanged content must reuse the epoch — if they did \
-             not, this test would be proving nothing about the repair below"
-        );
-        assert_eq!(
-            first.content_ref, second.content_ref,
-            "unchanged content re-exports identically, which is why a receiver \
-             correctly dedupes the second against the first"
+            "the ordinary publish path must reuse the epoch — if it did not, \
+             this test would be proving nothing about the repair below"
         );
 
         let repaired = only_chunk(&bus.alice_emits(
@@ -1170,7 +1495,7 @@ mod repair_reaches_a_member_admitted_late {
                 target: RepairTarget::Document(DOC),
                 epoch: EpochId::of(&second),
             },
-            52,
+            53,
         ));
         assert_ne!(
             EpochId::of(&repaired),
@@ -1477,6 +1802,7 @@ mod file_crud {
             uuid: DOC,
             logical_path: "/notes.md".into(),
             mime_type: "text/markdown".into(),
+            asset: None,
         }
     }
 
@@ -2632,6 +2958,7 @@ mod a_snapshot_restores_the_whole_node {
                         uuid: uuid(doc),
                         logical_path: path,
                         mime_type: "text/plain".into(),
+                        asset: None,
                     },
                 },
                 Step::Rename { doc, path } => Event::RenameFile {
@@ -2748,6 +3075,51 @@ mod a_snapshot_restores_the_whole_node {
                  contribute nothing to any peer's roster"
             );
         }
+    }
+
+    /// In a node that has published everything it holds, upon restoring it from
+    /// a snapshot, we expect a resync to publish nothing — exactly as it would
+    /// have before the restart.
+    ///
+    /// This is what the snapshot's `published_up_to` field is for, and it has no
+    /// other observable. Dropped, the restored node believes it has published
+    /// nothing, and its first resync re-encrypts and re-uploads every document it
+    /// holds. That is not a correctness failure, which is precisely why it needs
+    /// a test: it is silent, it is paid on every restart, and it is the whole
+    /// cost delta publishing was meant to remove.
+    #[test]
+    fn a_restored_node_does_not_republish_what_the_original_had_already_published() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "published before the restart".into(),
+            },
+            710,
+        );
+
+        let quiescent = bus.alice_emits(Event::Resync { doc: DOC }, 711);
+        assert!(
+            !quiescent
+                .iter()
+                .any(|e| matches!(e, Effect::StoreChunk { .. })),
+            "the original must be quiescent first, or the restored node has \
+             nothing to match"
+        );
+
+        let bytes = bus.alice.export().expect("alice can be exported");
+        let mut restored = WorkspaceState::import(&bytes).expect("alice can be imported");
+        let after_restart = restored
+            .handle(Event::Resync { doc: DOC }, &mut rng(712))
+            .expect("a restored node handles a resync");
+
+        assert!(
+            !after_restart
+                .iter()
+                .any(|e| matches!(e, Effect::StoreChunk { .. })),
+            "a restored node must not re-announce what it had already published, \
+             got {after_restart:?}"
+        );
     }
 
     /// In a workspace where content was published before the snapshot, upon

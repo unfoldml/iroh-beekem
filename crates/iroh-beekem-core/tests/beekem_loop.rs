@@ -488,3 +488,118 @@ fn out_of_order_operations_are_parked_then_applied() {
         "once predecessors arrive, no operation should remain parked"
     );
 }
+
+/// Given a node holding a concurrent removal it has merged but not yet replayed,
+/// upon performing the same removal itself, we expect beekem to answer
+/// `IdentifierNotFound` — and `group_size` to have been reporting the removed
+/// member all along.
+///
+/// **This pins a defect in beekem 0.3.0 rather than a property of this crate.**
+/// `Cgka::remove` tests `tree.contains_id` *before* replaying the operations
+/// graph and calls `tree.remove_id` *after*, so when the replay is what removes
+/// the member, the guard passes and the lookup fails. `Cgka::group_size` reads
+/// the same un-replayed tree, which is why it can count a member the node has
+/// already accounted for as gone.
+///
+/// Two things in this crate exist because of it, and both would look arbitrary
+/// without this test:
+///
+/// * `run_quorum_actions` marks a proposal executed only on success. Every admin
+///   performs a quorum removal independently, so concurrent identical removals
+///   are the normal case; treating the first error as final left a node holding a
+///   member the rest of the group had removed, permanently.
+/// * properties assert over `current_member_count`/`sees_member` rather than
+///   `group_size`. One that used `group_size` failed for seeds where nothing was
+///   wrong.
+///
+/// The assertions encode the behaviour as it is today, so a beekem release that
+/// fixes it fails here and says so. A standalone reproduction for upstream is in
+/// [`docs/beekem-repro/`](../../../docs/beekem-repro/).
+#[test]
+fn beekem_group_size_disagrees_with_current_members() {
+    let doc = workspace_id(0);
+    let alice_signer = MemorySigner::generate(&mut rng(1));
+    let bob_signer = MemorySigner::generate(&mut rng(2));
+    let carol_signer = MemorySigner::generate(&mut rng(3));
+    let dave_signer = MemorySigner::generate(&mut rng(4));
+    let bob_id = beekem::id::MemberId::from(bob_signer.verifying_key());
+    let carol_id = beekem::id::MemberId::from(carol_signer.verifying_key());
+    let dave_id = beekem::id::MemberId::from(dave_signer.verifying_key());
+
+    let mut alice = CgkaController::create(doc, alice_signer, &mut rng(10))
+        .expect("alice founds the workspace");
+
+    let admit = |ctl: &mut CgkaController, id: beekem::id::MemberId, seed: u64, tag: u8| {
+        let secret = ShareSecretKey::generate(&mut rng(seed));
+        ctl.certify_device(id.to_bytes(), id.to_bytes(), [tag; 16])
+            .expect("the founder may bind any device");
+        ctl.certify_role(id.to_bytes(), Role::Admin, [tag + 1; 16])
+            .expect("the founder may grant any role");
+        ctl.add_member(id, secret.share_key())
+            .expect("admitting")
+            .expect("each of these is new");
+        secret
+    };
+    let bob_secret = admit(&mut alice, bob_id, 20, 1);
+    let _carol_secret = admit(&mut alice, carol_id, 21, 3);
+    let dave_secret = admit(&mut alice, dave_id, 22, 5);
+
+    let log = alice.op_log().expect("exporting the log");
+    let certs = alice.capabilities().certificates();
+    let mut bob =
+        CgkaController::join(doc, bob_signer, bob_secret, &log, &certs).expect("bob joins");
+    let mut dave =
+        CgkaController::join(doc, dave_signer, dave_secret, &log, &certs).expect("dave joins");
+
+    // Minted from the same head, so genuinely concurrent: alice removes carol
+    // while bob rotates his leaf.
+    let removal = alice
+        .remove_member(carol_id)
+        .expect("alice removes carol")
+        .expect("carol was a member");
+    let rotation = bob.rotate(&mut rng(50)).expect("bob rotates");
+
+    // Dave merges both. beekem queues a concurrent *structural* change in the
+    // operations graph rather than applying it to the tree.
+    dave.merge(AuthorizedOp::bare(Arc::new(rotation)))
+        .expect("dave merges the rotation");
+    dave.merge(AuthorizedOp::bare(Arc::new(removal)))
+        .expect("dave merges the removal");
+
+    assert!(
+        !dave.is_current_member(carol_id),
+        "this crate's own membership set is updated by `merge`, so it is right \
+         immediately — it is what every authorisation decision must be based on"
+    );
+    assert_eq!(
+        dave.group_size(),
+        4,
+        "beekem's tree has not been replayed yet, so it still counts carol — \
+         this is the disagreement, and it is why no property may assert over \
+         `group_size`"
+    );
+
+    let refused = dave.remove_member(carol_id);
+    assert!(
+        refused.is_err(),
+        "beekem's own guard says carol is present and its lookup then says she \
+         is not, so the call fails: {refused:?}"
+    );
+
+    // The replay that caused the failure persists, so the error is spurious.
+    // Retrying is what turns it from a permanent stall into a hiccup, which is
+    // exactly why `run_quorum_actions` does not burn the proposal on failure.
+    assert!(
+        dave.remove_member(carol_id)
+            .expect("the retry succeeds")
+            .is_none(),
+        "carol is already gone by the time the retry runs, so no operation is \
+         minted and none needs to be"
+    );
+    assert_eq!(
+        dave.group_size(),
+        3,
+        "the failed call replayed the graph as a side effect, so the tree count \
+         has caught up"
+    );
+}

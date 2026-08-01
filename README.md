@@ -61,6 +61,13 @@ let invite = ws.add_user(&bob, Role::Editor, "Bob").await?;
 for user in ws.users().await {
     println!("{:?}: {:?} on {} device(s)", user.display_name, user.role, user.devices.len());
 }
+
+// Binary assets are attached from a path and written back to one, a segment at
+// a time: the plaintext is never resident, so the size of the file is bounded by
+// the disk rather than by memory. Peers index an asset's segments but do not
+// fetch them until somebody opens it.
+let scan = ws.attach_file("/data/scan.tiff", "/scans/2026.tiff", "image/tiff").await?;
+ws.export_asset(scan, "/tmp/scan.tiff").await?;
 ```
 
 A person may hold several devices, each with its own leaf and its own
@@ -285,6 +292,28 @@ a leak. The `StolenInvite` scenario in `iroh-beekem-sim` states exactly that bou
 never enters anyone's `users()`, never reconstructs the group, never decrypts a byte, and stops
 seeing entries the moment the group rotates — but it *does* see the replica until then.
 
+### Binary assets are an envelope, not a chunk
+
+A document is a CRDT: every publish is a merge, and its chunks are keyed directly by beekem
+application secrets. A multi-gigabyte asset is not that, and pushing it through the same path would
+be wrong three times over — the plaintext would have to be resident to export it, every republish
+would re-encrypt the whole thing, and it would occupy the parked-chunk budget waiting for
+dependencies it does not have.
+
+So an asset is **sealed under its own content key**, and only that 32-byte key is encrypted to the
+group. Segments are fixed-width XChaCha20-Poly1305 ciphertexts, each authenticating its own position
+and the asset it belongs to, with the tail padded so the exact length stays inside the encrypted
+manifest. They live in their own blinded key space, sharing a prefix so an `iroh-docs` download
+policy can name it: peers index an asset without fetching it, and pull segments only when somebody
+opens the file.
+
+The indirection is what makes an asset affordable to *keep*. A member admitted after the asset was
+written cannot derive the epoch that wrapped its key — so the repair is re-encrypting 32 bytes rather
+than every segment. A namespace rotation abandons the replica — so carrying the asset across is
+re-indexing the same content hash rather than re-uploading. Neither is weaker than keying the
+segments directly: anyone who could decrypt them could decrypt the key, and forward secrecy keeps its
+granularity because an asset is immutable and a new version draws a new key.
+
 ### Two DAGs must both be satisfied
 
 An arriving chunk applies only when the CGKA operation graph has caught up far enough to reach its PCS
@@ -356,7 +385,11 @@ a tag and a line in that test.
 ```bash
 cargo test -p iroh-beekem-core     # unit + handshake spike + state machine + forgery rejection
 cargo test -p iroh-beekem-sim      # propsim: convergence, concurrent rotation/revocation, forging peer
-cargo test -p iroh-beekem          # two real endpoints over real QUIC: revocation, roles, rotation
+cargo test -p iroh-beekem          # two real endpoints over real QUIC: revocation, roles, rotation,
+                                   # blob collection, large-asset round trip
+
+# The real-QUIC suites wait on wall-clock outcomes, so do not run them alongside
+# the simulator: a saturated machine starves them and they report as failures.
 cargo clippy --workspace --all-targets -- -D warnings
 cargo +nightly-2025-11-21 fmt --all --check   # rustfmt.toml uses nightly-only options, so the
                                               # toolchain is pinned: an unpinned nightly changes
@@ -385,15 +418,21 @@ reason enough to revisit the choice underneath.
    removal rotates to a namespace whose capability they never receive, so the replica they can
    still write to is one nobody reconciles with. Between the removal and a peer merging it, that
    peer still accepts their entries — eviction is eventual on both planes.
-2. **A rotation costs a full re-publish.** Every document is re-encrypted and re-announced into
-   the new namespace, and every member re-imports. This is expensive by construction and is the
-   right place to spend it: removal is rare, and the alternative is a removed device that keeps
-   watching. Superseded blobs in the abandoned namespace are not reclaimed until blob GC exists.
+2. **A rotation re-publishes every document, but re-indexes every asset.** The new namespace starts
+   empty, so a document is re-encrypted and re-announced into it — expensive by construction, and
+   the right place to spend it, since removal is rare and the alternative is a removed device that
+   keeps watching. An **asset** is not re-encrypted: its segments are immutable ciphertext, so the
+   same content hash is written into the new index. That is sound rather than merely cheap — the
+   removed device could already read everything published before its removal, and cannot reach the
+   new replica at all — and without it a single removal would cost the group every attached
+   gigabyte. Blobs stranded in the abandoned namespace are still not reclaimed; see *Not yet
+   implemented* #1.
 3. **Viewers hold a write capability after a rotation, though not after an invite.** The
    announcement carries both tickets and each node takes the one its role allows, because beekem
    encrypts to the whole tree and cannot hand writers one secret and viewers another. A viewer who
    ignores their role gains write capability on the replica; `WorkspaceState::author_may_write` still
-   rejects their entries, which is the same guarantee trade-off 9 describes. `build_invite` does
+   rejects their entries — the capability is not withheld, the *action* is refused, which is the
+   split described under *Authorization is verifiable offline*. `build_invite` does
    better — a viewer is handed only a read ticket — and closing the gap needs per-role key material
    the CGKA does not provide.
 4. **A new member cannot read content written before they joined — until somebody re-encrypts it.**
@@ -414,12 +453,25 @@ reason enough to revisit the choice underneath.
 7. **Forward secrecy is bounded by retention.** Decryption keys are recovered from the CGKA operation
    graph, so pruning old operations to gain forward secrecy also destroys the ability to read old
    content. Retention is a policy knob, not a free win.
-8. **The workspace blinding secret does not rotate.** A revoked member can still recognise which
+8. **An asset's segment count is visible, and its exact length is not.** Every segment of one asset
+   is padded to the same width, so a syncing peer learns the length only to that granularity — but
+   the segments share a blinded key prefix, which is what lets a download policy name them, and that
+   prefix makes them countable. The alternative is fetching every asset onto every member, which the
+   large-asset user story rules out. Traffic volume was never hidden anyway; blinding conceals names.
+
+9. **An asset's recorded shape is a claim, like every other manifest field.** `size`, `segments` and
+   `segment_bytes` are in the manifest, which is an unconditional CRDT merge, so any member can
+   rewrite them. What bounds the lie is that each segment authenticates its own position and width,
+   and the whole asset authenticates against a digest recorded beside them — so a rewritten field
+   makes an export *fail*, which is the denial of service any member can already mount, rather than
+   returning different bytes.
+
+10. **The workspace blinding secret does not rotate.** A revoked member can still recognise which
    blinded key belongs to a document UUID they already knew. Rotating it under the current scheme —
    one secret keying every entry — would force every peer to rewrite every entry, which is why it is
    not done. They learn nothing about documents created after their removal, and can read no content
    either way.
-9. **A workspace's admin threshold is fixed when it is created.** `create_with_quorum` sets it and
+11. **A workspace's admin threshold is fixed when it is created.** `create_with_quorum` sets it and
    nothing can change it afterwards. This is what makes the threshold *enforceable by receivers*
    rather than merely by the node issuing an action: the check is stricter the more a node knows, so
    a movable threshold would let a peer holding the certificates that raised it refuse an operation
@@ -427,48 +479,48 @@ reason enough to revisit the choice underneath.
    founding certificate bundle, which every member holds before it can join, removes the asymmetry.
    Raising it later would be that unsound operation; lowering it would let one compromised admin undo
    the protection everyone else is relying on.
-10. **Above a threshold of one, the founder may set roles alone.** Everybody else needs a quorum,
+12. **Above a threshold of one, the founder may set roles alone.** Everybody else needs a quorum,
    including to appoint an admin — which is what stops an admin raising a puppet and approving its
    own actions twice. The founder is exempt because a workspace with one admin and a threshold of two
    could otherwise never reach a quorum, and because the founder is already the axiom every capability
    chain terminates at: `tree_id` *is* its key. The exemption covers roles only, never removals.
-11. **Roles do not constrain what a member can *read*.** Anyone holding a leaf can decrypt, whatever
+13. **Roles do not constrain what a member can *read*.** Anyone holding a leaf can decrypt, whatever
    any certificate says. That is forward secrecy working as designed, and genuine read revocation is
    a CGKA removal. This is deliberately stated as a claim about *reading only*: roles do now
    constrain what a member can **do**, and every receiver enforces it — see
    [Authorization is verifiable offline](#authorization-is-verifiable-offline). Conflating the two
    is what made a defect look like a documented trade.
-12. **Demotion is a courtesy; removal is the enforcement.** A user who has ever held an admin grant
+14. **Demotion is a courtesy; removal is the enforcement.** A user who has ever held an admin grant
    stays `ever_admin`, so certificates it issues are still admitted and it can grant itself a higher
    `seq`. Demoting a *cooperative* admin works and needs no key rotation; stripping a *malicious* one
    means CGKA-removing every device of that user. This mirrors monotone `known_members` exactly, and
    for the same reason: the alternative is an order-dependent predicate that diverges the group.
-13. **A member may enrol unlimited devices for its own user.** Enrolling your own phone is not an act
+15. **A member may enrol unlimited devices for its own user.** Enrolling your own phone is not an act
    of administration, so it needs no role — which means a member can also grow the tree without bound.
    Every such leaf inherits only that member's own role, so it is not an escalation; it is a resource
    cost, and bounding it needs a policy the group has no way to express yet.
-14. **A removed member can splice a leaf in, and read for one eviction window.** It cannot escalate.
+16. **A removed member can splice a leaf in, and read for one eviction window.** It cannot escalate.
    See [A removed member is evicted again](#a-removed-member-is-evicted-again) for why refusing the
    operation outright is not available.
-15. **An invite still carries the workspace secret, and must travel confidentially.** Signing it
+17. **An invite still carries the workspace secret, and must travel confidentially.** Signing it
    binds who may redeem it and for how long; it does not encrypt it. A ticket read in transit hands
    the reader the blinding secret and the `iroh-docs` ticket, and no signature over a plaintext
    struct can change that. Deliver it over an authenticated, confidential channel — a direct `iroh`
    QUIC stream to a known public key qualifies, a public gossip topic does not — and treat a leak as
    a reason to rotate. What signing buys is that a *leaked* ticket is not a *redeemable* one.
-16. **A snapshot is the whole read capability, and it is not encrypted at rest.** `Node::spawn_persistent`
+18. **A snapshot is the whole read capability, and it is not encrypted at rest.** `Node::spawn_persistent`
    writes the signing key, the leaf secret, every cached PCS key, the blinding secret and the
    plaintext-equivalent documents under `<root>`, `0600` and no further. Deliberate rather than
    omitted: `Identity::to_bytes` already made the application responsible for storing an equivalent
    secret, so encrypting the snapshot while the identity beside it sits in the clear would move the
    boundary without raising it. Hold `<root>` on an encrypted volume if that matters — which also
    covers the blobs and docs stores, neither of which this crate controls.
-17. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
+19. **Certificates are never retracted.** The store is grow-only, so a lost or stolen device's
    certificates remain valid documents; what stops them mattering is CGKA removal. There is no
    expiry either: `Grant::not_after` is carried on the wire but deliberately **not** evaluated,
    because an expiry inside an authorization predicate makes admissibility depend on clock skew and
    two peers disagreeing would drop different operations.
-18. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
+20. **Parked queues evict under pressure.** Out-of-order operations and undecryptable chunks are
    bounded (`MAX_PARKED_OPS`, `MAX_PENDING_CHUNK_BYTES`) and evict oldest-first, because an unbounded
    queue is a remote memory-exhaustion vector. Evicted operations return with the next neighbour log
    exchange; evicted chunks wait for a resync. A property test asserts honest runs never evict.
@@ -480,9 +532,18 @@ reason enough to revisit the choice underneath.
 
 These are gaps, not trades. Nothing in the design prevents them.
 
-1. **Publishing re-ships whole document history.** Every edit and every resync exports all updates,
-   re-encrypts them and writes a new blob; superseded blobs are never collected. Cost grows
-   quadratically in edits.
+1. **Blob collection does not reach abandoned namespaces.** Superseded blobs in the *live* namespace
+   are now reclaimed: `store_chunk` protects a new blob with a temporary tag only until the index
+   entry names it, and the sweep's live set comes from `iroh-docs` — so a `set_hash` that replaces a
+   record drops the old hash and the next sweep takes it. `Workspace::delete` drops its replica and
+   is likewise collected. What is *not* collected is anything indexed only in a namespace a rotation
+   abandoned, because those replicas are kept — peers may still be catching up on them — and every
+   record in them still counts as live. Closing it needs a policy for when an old replica may be
+   dropped.
+
+   Publishing cost itself is no longer quadratic: an ordinary edit ships a delta, a full export goes
+   out every sixteenth publish and on demand, and a resync of a document nothing has touched
+   publishes nothing at all.
 2. **Eviction is eventual on every plane.** Removal now revokes reading (the CGKA), connecting
    (the roster) and watching (namespace rotation) — but all three converge asynchronously, so a
    peer that has not yet merged the removal still accepts the removed device's connections and

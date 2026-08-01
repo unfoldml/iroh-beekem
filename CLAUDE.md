@@ -12,9 +12,12 @@ follows is a current choice rather than a settled one.
 cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, capability closure,
                                  # forgery rejection, insider falsification tests
 cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer,
-                                 # outsiders, insiders, revenants
+                                 # outsiders, insiders, revenants, assets
                                  # ~5 min: runs under swarm faults (partitions, latency, reorder)
-cargo test -p iroh-beekem        # two real endpoints over real QUIC
+cargo test -p iroh-beekem        # two real endpoints over real QUIC, plus blob collection
+                                 # and the large-asset round trip. Do NOT run alongside the
+                                 # simulator: these wait on wall-clock outcomes and a
+                                 # saturated machine starves them into false failures.
 
 cargo run -p iroh-beekem --example two_node   # full two-peer session, prints progress
 cargo clippy --workspace --all-targets -- -D warnings
@@ -108,6 +111,23 @@ rather than raw `beekem`/`keyhive_crypto` types. The standing phrasing is **"a s
 visibility, not membership and not plaintext"** — if you find "invites are replayable" anywhere, it is
 stale, and if you find a claim that signing a ticket protects a *leaked* one, it is wrong: what bounds
 a thief is the roster and namespace rotation.
+
+Phase 9 has since landed: publishing costs the edit rather than the document, superseded blobs in the
+live namespace are collected, and a workspace entry may be a **binary asset** as well as a CRDT
+document ([asset.rs](crates/iroh-beekem-core/src/asset.rs),
+[workspace.rs](crates/iroh-beekem/src/workspace.rs)). Three standing phrasings:
+
+* **"a publish costs the change, not the workspace"** — if you find "every edit and every resync
+  exports all updates" anywhere, it is stale.
+* **"an asset is sealed under its own content key, and the group holds that key"** — if you find a
+  claim that content is always keyed directly by beekem application secrets, it is now true of
+  documents only.
+* **"a rotation re-encrypts documents and re-indexes assets"** — if you find "a rotation costs a full
+  re-publish" without that qualification, it is stale.
+
+`FileEntry.asset` is what distinguishes the two, and `None` means *document* rather than *unknown*:
+an entry written before assets existed is a document, and reading it as anything else would make an
+old manifest unreadable.
 
 ## Easy to break by accident
 
@@ -261,6 +281,74 @@ them *without* noticing will not fail loudly.
   approval is broadcast once with no write behind it, so `Event::ResyncCertificates` must be driven
   from both backends' resync paths. Without it a dropped approval leaves a quorum that formed on one
   node and nowhere else — an action performed there and refused everywhere.
+- **A published chunk must not be permanently tagged.** Awaiting `AddProgress` resolves through
+  `with_tag()`, which mints a *permanent* tag — so `store_chunk` uses `.temp_tag()` and holds the guard
+  across `set_hash` and no longer. Before it, blob collection reclaimed nothing however it was
+  configured, and the store grew without bound. The two halves of collection are created together in
+  `Node::gc_pair` ([node.rs](crates/iroh-beekem/src/node.rs)) because a store built with only one of
+  them either collects nothing or collects everything not currently being written.
+  `publishing_creates_no_permanent_tag` in [blob_gc.rs](crates/iroh-beekem/tests/blob_gc.rs) is what
+  keeps this true.
+
+- **A quiescent resync publishes nothing, and the simulator has to model reconciliation for that to be
+  sound.** `on_resync` returns no effects when `published_up_to[doc]` equals the document's current
+  version: the index entry is still there and `iroh-docs` reconciles key ranges between peers, so
+  re-encrypting produced a fresh blob per document per republish cycle that carried no new information.
+  What this *removed* is the accidental repair a republish used to provide for an entry lost in
+  transit — production never needed it, but the harness did, because it modelled the data plane as
+  pure broadcast. `WorkspaceNode::reconcile` ([sim/lib.rs](crates/iroh-beekem-sim/src/lib.rs)) is the
+  counterpart, on a sparser cadence (`RECONCILE_EVERY`) because re-offering everything to everyone
+  every round makes the harness *more* talkative than production and starves the control plane.
+
+- **`published_up_to` is a claim about a namespace, not about a document.** A rotation abandons the
+  index, so `forget_published` clears it on both adoption paths. Missed, every node's post-rotation
+  resync emits nothing at all and the group converges on a replica holding only what was edited
+  afterwards — silently.
+
+- **A delta needs an escalation path or it is a silent stall.** A document's index slot holds one chunk
+  per author, so a receiver that misses a delta cannot go back for it. `ChunkVerdict::AwaitingDeps`
+  therefore ages (`Parked::drains`) and past `MAX_DEP_WAIT_DRAINS` raises
+  `RepairTarget::DocumentHistory` — answered with `(Keying::Current, Extent::Full)`, because the
+  requester can decrypt perfectly well and re-keying would charge the group for something no key change
+  fixes. Without it the chunk sits until the pending budget evicts it and *`no chunk stays parked
+  forever` still passes*, because the queue does empty — by discarding.
+
+- **`group_size()` is beekem's tree count and can lag its own operations graph.** `Cgka::remove` checks
+  `contains_id` before replaying the graph and calls `remove_id` after, so a node holding a merged but
+  unreplayed concurrent removal reports the removed member *and* refuses to remove it with
+  `IdentifierNotFound`. Assert membership over `current_member_count`/`sees_member` instead. Two things
+  exist because of it: `run_quorum_actions` marks a proposal executed **only on success** — burning the
+  digest first turned that transient failure into a permanent divergence — and `on_certs_arrived` runs
+  the quorum pass whether or not anything was new. `beekem_group_size_disagrees_with_current_members`
+  in [beekem_loop.rs](crates/iroh-beekem-core/tests/beekem_loop.rs) pins it; the upstream reproduction
+  is in [docs/beekem-repro/](docs/beekem-repro/).
+
+- **An asset is keyed by an envelope, and that is what makes it repairable.** Segments are sealed under
+  a per-asset content key with XChaCha20-Poly1305; only that 32-byte key is encrypted to the group. So
+  a member admitted after the asset was written is stuck on one small chunk rather than on gigabytes,
+  and `RepairTarget::AssetKey` costs one re-encryption of 32 bytes. Keying segments with CGKA
+  application secrets directly would have made both repair and rotation O(bytes).
+
+- **Asset segments must stay out of the download policy, the parked queue, and `ingest_all`.** Without
+  `refresh_download_policy` every member fetches every asset the moment its entries reconcile — the
+  "slowing down document synchronization" the user story rules out. Segments are pulled at export time,
+  never pushed, so they never consume `MAX_PENDING_CHUNK_BYTES`; a design that routed them through
+  `Event::ChunkArrived` would quietly evict documents under load.
+
+- **A rotation re-indexes assets and re-encrypts documents.** `reindex_assets` writes the *same*
+  `(hash, size)` into the new replica for every asset key the manifest names and this node can serve.
+  Sound because the removed device could already read everything published before its removal and
+  cannot reach the new replica at all; what the rotation protects is everything published after. Both
+  backends do it — the simulator retains `asset_index_keys` across `AdoptNamespace` instead of clearing
+  wholesale — and `a_rotation_reindexes_an_asset_instead_of_re_encrypting_it` in
+  [assets.rs](crates/iroh-beekem/tests/assets.rs) fails without it.
+
+- **An interrupted attachment is only recoverable through the intent log.** `attach_file` indexes
+  segments before the manifest entry that declares them, and a segment key is a blinded MAC of a UUID
+  that exists only in memory until that entry lands — so a process killed halfway leaves blobs that are
+  protected from collection and nameable by nothing. `Store::store_pending_assets` records the UUID
+  first and `sweep_orphaned_assets` reads it back on the next start.
+
 - **Pinned dependencies are pinned for a reason** (see comments in the manifests): `rand` at 0.8.5 to
   unify with beekem's public API, `propsim` at a git rev because it has no semver.
 

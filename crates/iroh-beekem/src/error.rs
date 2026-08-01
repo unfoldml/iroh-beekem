@@ -65,6 +65,51 @@ pub enum WorkspaceError {
         tree_id: [u8; 32],
     },
 
+    /// Reading or writing a local file for an asset failed.
+    ///
+    /// Only the asset API produces this: it is the one part of the crate that
+    /// touches the filesystem on the caller's behalf, because a multi-gigabyte
+    /// asset cannot be handed over as a `Vec<u8>`.
+    #[error("asset file I/O failed: {0}")]
+    AssetIo(#[from] std::io::Error),
+
+    /// The named entry is a CRDT document, not a binary asset — or the other way
+    /// round.
+    ///
+    /// A distinct error rather than a silent fallback, because the two are read
+    /// through different APIs and returning an empty result would look like an
+    /// empty file.
+    #[error("entry is not a binary asset")]
+    NotAnAsset,
+
+    /// A segment of an asset could not be found or fetched.
+    ///
+    /// Expected during catch-up rather than exceptional: asset payloads are
+    /// fetched on demand, so a segment whose blob has not yet reached this node
+    /// is a reason to retry, not a corrupted workspace.
+    #[error("asset segment {index} is not available")]
+    MissingSegment {
+        /// Which segment is missing.
+        index: u64,
+    },
+
+    /// An asset was reassembled and did not match the digest the manifest names.
+    ///
+    /// The manifest is an unconditional CRDT merge, so any member can rewrite an
+    /// asset's recorded size or segment count. This is what turns that from a
+    /// silently wrong read into a refusal.
+    #[error("asset content does not match the digest recorded for it")]
+    CorruptAsset,
+
+    /// This node cannot yet decrypt the key protecting an asset.
+    ///
+    /// The ordinary experience of a member admitted after the asset was written:
+    /// the content key is wrapped under an epoch it cannot derive. A repair has
+    /// been requested, and the read succeeds once a member that can read it
+    /// answers.
+    #[error("asset key is not yet readable; a repair has been requested")]
+    AssetKeyUnavailable,
+
     /// The stored workspace belongs to a different device than the one opening
     /// it.
     ///
