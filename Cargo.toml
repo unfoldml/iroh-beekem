@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/iroh-beekem", "crates/iroh-beekem-core", "crates/iroh-beekem-sim"]
+
+[workspace.package]
+edition = "2024"
+# The workspace default is the published facade's floor, set by `iroh 1.0.3`.
+# Crates whose dependencies demand more override it; see each crate's manifest.
+# Verify with:
+#   cargo metadata --format-version 1 | \
+#     python3 -c 'import json,sys; print(max((p["rust_version"],p["name"]) \
+#       for p in json.load(sys.stdin)["packages"] if p.get("rust_version")))'
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ocramz/iroh-beekem"
+version = "0.1.0"
+
+[workspace.dependencies]
+beekem = "0.3.0"
+keyhive_crypto = "0.2.1"
+future_form = "0.3.1"
+# Pinned to match beekem's `rand ^0.8.5`: the `CryptoRng`/`RngCore` traits are
+# part of beekem's public API, so a 0.9 bump here would fail to unify.
+rand = "0.8.5"
+ed25519-dalek = "2.1"
+blake3 = "1.5"
+loro = "1.13"
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["use-std"] }
+thiserror = "2.0"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+pedantic = { level = "warn", priority = 3 }
+redundant_clone = { level = "deny", priority = 9 }

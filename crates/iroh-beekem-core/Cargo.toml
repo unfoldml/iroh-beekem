@@ -1,0 +1,55 @@
+[package]
+name = "iroh-beekem-core"
+description = "Pure, I/O-free core of iroh-beekem: CGKA group state, key blinding, and content encryption for confidential local-first workspaces."
+readme = "README.md"
+keywords = ["crdt", "cgka", "encryption", "local-first", "beekem"]
+categories = ["cryptography", "data-structures"]
+edition.workspace = true
+# Lower than the workspace default: this crate never depends on `iroh`, so its
+# floor is set by `beekem`/`keyhive_crypto` instead. Keeping it honest is the
+# point of a separate I/O-free crate.
+rust-version = "1.90"
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+# NOTE: this crate must never gain a networking or async-runtime dependency;
+# that is what keeps the state machine deterministically testable. Verify with:
+#   cargo tree -p iroh-beekem-core -e normal --prefix none \
+#     | sort -u | grep -Ev '^iroh-beekem' | grep -E '^(tokio|iroh|quinn)\b'
+[dependencies]
+beekem.workspace = true
+keyhive_crypto.workspace = true
+future_form.workspace = true
+rand.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+loro.workspace = true
+# Named directly because `CoreError` wraps `chacha20poly1305::Error`, which
+# beekem surfaces in its public encrypt/decrypt signatures.
+chacha20poly1305 = "0.10.1"
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[features]
+# Exposes `WorkspaceState::controller_mut`, which bypasses every local role
+# check. It exists so `iroh-beekem-sim` can model a member that acts beyond its
+# role; driving such an attack through the guarded path would test the guard
+# rather than the receiver's enforcement. Never enable it in an application.
+adversarial-testing = []
+
+[dev-dependencies]
+rand_chacha = "0.3"
+# Snapshot round-tripping is a data transformation, so it is specified as a
+# property over generated workspace histories rather than as example states.
+proptest = "1"
+# Tests only, and pinned to the major version `keyhive_crypto` uses, because
+# `the_signed_payload_types_cannot_share_an_encoding` is only meaningful if it
+# serializes the way `Signed` does. bincode 2 has a different default config; if
+# keyhive ever moves, this must move with it or the test silently checks nothing.
+bincode = "1"
+
+[lints]
+workspace = true
