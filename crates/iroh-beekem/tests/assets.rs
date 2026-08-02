@@ -11,10 +11,25 @@
 
 use std::time::Duration;
 
-use iroh_beekem::{Identity, Invite, Node, Workspace};
+use iroh_beekem::{Identity, Invite, Node, NodeOptions, Relay, Workspace};
 use iroh_beekem_core::{ASSET_SEGMENT_BYTES, DocumentUuid, Role, WorkspaceInfo};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+
+/// A node for a test: everything default except that it never uses a relay.
+///
+/// The counterpart of `test_node` in `two_node.rs`, and there for the same
+/// reason: both endpoints live on this machine, so a relay can never be the path
+/// that works, and leaving it on made connections to Number 0's public relay
+/// servers the dominant cost of the suite. See that function for the numbers.
+async fn test_node() -> Node {
+    Node::spawn_with_options(NodeOptions {
+        relay: Relay::Disabled,
+        ..NodeOptions::default()
+    })
+    .await
+    .expect("a test node should bind")
+}
 
 /// Two and a bit segments, so the tail is padded and the ordering of segments
 /// is observable. Deliberately not a multiple of the segment size.
@@ -87,7 +102,7 @@ struct Pair {
 
 /// Alice founds a workspace, attaches an asset, and invites Bob.
 async fn attached_pair(seed: u64) -> Pair {
-    let alice_node = Node::spawn().await.expect("alice binds");
+    let alice_node = test_node().await;
     let alice_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(seed));
     let alice = Workspace::create(
         alice_node,
@@ -126,7 +141,7 @@ async fn attached_pair(seed: u64) -> Pair {
         "the manifest must record the true length, not the padded one"
     );
 
-    let bob_node = Node::spawn().await.expect("bob binds");
+    let bob_node = test_node().await;
     let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(seed + 1));
     let invite: Invite = alice
         .add_user(
@@ -320,7 +335,7 @@ async fn a_rotation_reindexes_an_asset_instead_of_re_encrypting_it() {
 /// be left holding a phantom file it never asked for.
 #[tokio::test]
 async fn a_failed_attachment_leaves_no_entry_behind() {
-    let node = Node::spawn().await.expect("binding");
+    let node = test_node().await;
     let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(7));
     let ws = Workspace::create(
         node,

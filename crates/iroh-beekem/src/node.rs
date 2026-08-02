@@ -120,13 +120,62 @@ pub struct NodeOptions {
     /// sweep may delete is decided by the protection callback rather than by how
     /// often it runs.
     pub gc_interval: Duration,
+
+    /// How this node reaches peers it cannot address directly.
+    pub relay: Relay,
+}
+
+/// Whether a node may fall back to relay servers to reach a peer.
+///
+/// Relaying is what gets two peers connected when neither can open a direct path
+/// — the ordinary case across NATs, and why [`Relay::N0`] is the default. It is
+/// a *fallback*: a direct path is always preferred and is used the moment one is
+/// found, so disabling relays costs nothing between peers that can already reach
+/// each other and costs everything between peers that cannot.
+///
+/// Address lookup is deliberately **not** covered by this setting. Discovery is
+/// how an [`iroh::EndpointId`] becomes a dialable address, and this crate names
+/// peers by id everywhere — a restarted node re-dials the roster it read back
+/// from its own manifest, holding ids and no addresses. Turning that off does
+/// not slow a node down, it stops it reconnecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Relay {
+    /// Number 0's public relay servers. The right default for the internet.
+    #[default]
+    N0,
+    /// No relays: a peer is reachable directly or not at all.
+    ///
+    /// For deployments on one LAN, and for tests. Every test in this workspace
+    /// runs two or three endpoints on one machine, where a relay can never be
+    /// the path that works — but each endpoint still opened and maintained
+    /// connections to the public relay servers, and with several tests running
+    /// at once that dominated everything else the suite did. Measured over the
+    /// real-QUIC suite on an eight-core machine at cargo's default parallelism:
+    /// 21 of 38 tests timed out with relays enabled, 2 with them disabled.
+    Disabled,
 }
 
 impl Default for NodeOptions {
     fn default() -> Self {
         Self {
             gc_interval: DEFAULT_GC_INTERVAL,
+            relay: Relay::N0,
         }
+    }
+}
+
+/// Bind an endpoint configured as `relay` asks.
+///
+/// One helper rather than the same match in both constructors: the two differ in
+/// whether the secret key is generated or loaded, and nothing else, so a
+/// networking option added to one and not the other would give a persistent node
+/// different connectivity from an ephemeral one.
+fn endpoint_builder(relay: Relay) -> iroh::endpoint::Builder {
+    match relay {
+        Relay::N0 => Endpoint::builder(presets::N0),
+        // `N0DisableRelay` rather than a bare `Minimal`: it keeps the address
+        // lookup and drops only the relay, which is the split this option means.
+        Relay::Disabled => Endpoint::builder(presets::N0DisableRelay),
     }
 }
 
@@ -169,7 +218,7 @@ impl Node {
     ///
     /// The same as [`Self::spawn`].
     pub async fn spawn_with_options(options: NodeOptions) -> Result<Self, WorkspaceError> {
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = endpoint_builder(options.relay)
             .bind()
             .await
             .map_err(|e| WorkspaceError::Bind(e.to_string()))?;
@@ -246,7 +295,7 @@ impl Node {
 
         // Bound to the stored key rather than a fresh one. This is the single
         // line that makes a restart a restart rather than a new node.
-        let endpoint = Endpoint::builder(presets::N0)
+        let endpoint = endpoint_builder(options.relay)
             .secret_key(store.endpoint_key()?)
             .bind()
             .await

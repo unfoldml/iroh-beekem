@@ -100,6 +100,26 @@ Enrol one with `add_device`, revoke one with `remove_device`, and remove someone
 entirely with `remove_user`. See [`examples/two_node.rs`](crates/iroh-beekem/examples/two_node.rs)
 for a complete session over real QUIC.
 
+`Node::spawn` uses Number 0's relay servers, which is what gets two peers
+connected when neither can open a direct path — the ordinary case across NATs.
+On a single LAN, or in a test, that fallback can never be the path that works and
+is pure overhead:
+
+```rust,no_run
+use iroh_beekem::{Node, NodeOptions, Relay};
+
+let node = Node::spawn_with_options(NodeOptions {
+    relay: Relay::Disabled,
+    ..NodeOptions::default()
+}).await?;
+```
+
+Address lookup is deliberately not covered by that switch. It is what turns an
+endpoint id into a dialable address, and this crate names peers by id — a
+restarted node re-dials the roster it read back from its own manifest, which
+holds ids and no addresses. Pass a `Workspace::endpoint_addr()` to
+`Workspace::sync_with` when you already have one and want to skip the lookup.
+
 ## Design
 
 ```
@@ -426,6 +446,16 @@ cargo publish --dry-run --workspace
 # The core's purity is enforced mechanically; this must match nothing:
 cargo tree -p iroh-beekem-core -e normal --prefix none \
   | sort -u | grep -Ev '^iroh-beekem' | grep -E '^(tokio|iroh|quinn)\b'
+
+# The MSRV matrix, which CI runs and which a local `cargo test` does not check:
+# the two crates are pinned separately because `iroh-beekem` needs a newer
+# toolchain than the core does, and the core is the one published for reuse.
+cargo check -p iroh-beekem-core --all-targets   # MSRV 1.90
+cargo check -p iroh-beekem --all-targets        # MSRV 1.91
+
+# The example is a CI job of its own: it is the readable proof the CRUD API is
+# usable end to end, so it has to keep compiling and keep running.
+cargo run -p iroh-beekem --example two_node
 ```
 
 Note: `cargo clippy --all-features` pulls in a substantially larger dependency set (`arbitrary`,

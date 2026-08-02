@@ -4,10 +4,30 @@
 //! in `iroh-beekem-sim`. What these tests add is proof that the transport
 //! wiring is actually connected: ALPNs registered, gossip overlay bootstrapped,
 //! docs namespace shared with a write capability, blob payloads fetched.
+//!
+//! # Two rules for tests here
+//!
+//! **Spawn nodes through `test_node`, never `Node::spawn`.** Both endpoints in
+//! any test live on one machine, so a relay can never be the path that works —
+//! but with the default `NodeOptions` each endpoint still opened and maintained
+//! connections to Number 0's public relay servers, and with eight tests running
+//! at once that dominated everything else the suite did. Measured at cargo's
+//! default parallelism: 21 of 38 tests timed out with relays enabled, 2 with them
+//! disabled, 0 once the rule below was applied as well.
+//!
+//! **A test running three or more endpoints at once needs
+//! `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`.** Plain
+//! `#[tokio::test]` builds a *current-thread* runtime, so every endpoint's QUIC
+//! I/O, gossip, docs reconciliation and blob transfer share one thread with the
+//! test body's polling. Two endpoints fit; three do not, once seven other tests
+//! are competing for the same eight cores. The test then reports whatever it was
+//! waiting for as the failure — a missing member, a missing entry — rather than
+//! the scheduling that caused it. Two workers and not the default of one per
+//! core: at cargo's default parallelism that would be eight runtimes of eight.
 
 use std::time::Duration;
 
-use iroh_beekem::{Identity, Invite, Node, Workspace};
+use iroh_beekem::{Identity, Invite, Node, NodeOptions, Relay, Workspace, WorkspaceError};
 use iroh_beekem_core::{DocumentUuid, Role, WorkspaceInfo};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -23,9 +43,46 @@ fn info(name: &str) -> WorkspaceInfo {
     }
 }
 
+/// A node for a test: everything default except that it never uses a relay.
+///
+/// **Spawn every test node through this, not through [`Node::spawn`].** Both
+/// endpoints in any test here live on one machine, so a relay can never be the
+/// path that works — but with the default configuration each one still opened
+/// and maintained connections to Number 0's public relay servers, and several
+/// tests running at once made that the dominant cost of the whole suite. It looks
+/// exactly like a protocol regression: assorted `eventually` waits time out, in
+/// tests that pass the moment they are run alone. Measured on an eight-core
+/// machine at cargo's default parallelism, 21 of 38 tests timed out with relays
+/// enabled and 2 with them disabled.
+///
+/// Address lookup is deliberately left on. It is what turns an endpoint id into
+/// an address, and this crate names peers by id — a restarted node re-dials the
+/// roster it read back from its own manifest, which holds ids and no addresses,
+/// so `a_restarted_joiners_later_writes_are_still_accepted` fails without it.
+async fn test_node() -> Node {
+    Node::spawn_with_options(NodeOptions {
+        relay: Relay::Disabled,
+        ..NodeOptions::default()
+    })
+    .await
+    .expect("a test node should bind")
+}
+
+/// [`test_node`], backed by a directory so it can be restarted.
+async fn test_node_persistent(root: impl AsRef<std::path::Path>) -> Result<Node, WorkspaceError> {
+    Node::spawn_persistent_with_options(
+        root,
+        NodeOptions {
+            relay: Relay::Disabled,
+            ..NodeOptions::default()
+        },
+    )
+    .await
+}
+
 /// Found a workspace with one document already created, and return both.
 async fn founded(seed: u64, name: &str) -> (Workspace, DocumentUuid) {
-    let node = Node::spawn().await.expect("node should bind");
+    let node = crate::test_node().await;
     let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(seed));
     let ws = Workspace::create(
         node,
@@ -92,7 +149,7 @@ async fn invited_pair(seed: u64) -> Pair {
 
 async fn invited_pair_as(seed: u64, role: Role) -> Pair {
     let (alice, doc) = founded(seed, "shared").await;
-    let bob_node = Node::spawn().await.expect("bob should bind");
+    let bob_node = crate::test_node().await;
 
     // Bob generates his device identity and publishes only its public leaf key;
     // the secret half never leaves his device, which is what makes an
@@ -216,7 +273,7 @@ async fn content_written_before_the_invite_reaches_the_joiner() {
         .await
         .expect("alice writes while she is alone in the workspace");
 
-    let bob_node = Node::spawn().await.expect("bob should bind");
+    let bob_node = crate::test_node().await;
     let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(22));
     let invite: Invite = alice
         .add_user(
@@ -548,8 +605,8 @@ async fn a_viewer_is_given_a_read_only_capability() {
     let (alice, _doc) = founded(110, "shared").await;
     // Real nodes, because admitting somebody now records the address they will
     // connect from: the roster has to know it before the invite is handed over.
-    let viewer_node = Node::spawn().await.expect("the viewer's node should bind");
-    let editor_node = Node::spawn().await.expect("the editor's node should bind");
+    let viewer_node = crate::test_node().await;
+    let editor_node = crate::test_node().await;
     let viewer = Identity::generate(&mut ChaCha20Rng::seed_from_u64(111));
 
     let invite = alice
@@ -590,7 +647,7 @@ async fn a_second_device_joins_its_users_account_and_inherits_the_role() {
     // Alice enrols a laptop of her own. This is not an administrative act, and
     // the new device gets no role of its own — it acts under alice's.
     let laptop_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(121));
-    let laptop_node = Node::spawn().await.expect("laptop should bind");
+    let laptop_node = crate::test_node().await;
     let invite = alice
         .add_device(
             &laptop_identity.enrollment(laptop_node.endpoint().id()),
@@ -703,9 +760,7 @@ mod admission_control_is_wired_to_iroh {
     #[tokio::test]
     async fn a_node_that_was_never_admitted_is_refused_on_every_alpn() {
         let (alice, _doc) = founded(200, "shared").await;
-        let stranger = Node::spawn()
-            .await
-            .expect("the stranger's node should bind");
+        let stranger = crate::test_node().await;
         let alice_addr = alice.endpoint_addr();
 
         for (name, alpn) in ALPNS {
@@ -753,9 +808,7 @@ mod admission_control_is_wired_to_iroh {
     #[tokio::test]
     async fn a_refusal_is_distinguishable_from_a_shutdown() {
         let (alice, _doc) = founded(202, "shared").await;
-        let stranger = Node::spawn()
-            .await
-            .expect("the stranger's node should bind");
+        let stranger = crate::test_node().await;
         let alice_addr = alice.endpoint_addr();
 
         let conn = stranger
@@ -956,7 +1009,7 @@ mod removal_abandons_the_namespace {
 /// and `a_stolen_invite_buys_only_visibility` in the simulator is where it is
 /// stated.
 mod invite_security {
-    use iroh_beekem::{Identity, InviteError, Node, Workspace, WorkspaceError};
+    use iroh_beekem::{Identity, InviteError, Workspace, WorkspaceError};
     use iroh_beekem_core::Role;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -975,7 +1028,7 @@ mod invite_security {
     #[tokio::test]
     async fn an_invite_is_refused_to_a_device_it_does_not_name() {
         let (alice, _doc) = founded(700, "shared").await;
-        let bob_node = Node::spawn().await.expect("bob should bind");
+        let bob_node = crate::test_node().await;
         let bob = Identity::generate(&mut ChaCha20Rng::seed_from_u64(701));
         let invite = alice
             .add_user(
@@ -988,7 +1041,7 @@ mod invite_security {
 
         // A third device that was never admitted, holding bob's ticket.
         let thief = Identity::generate(&mut ChaCha20Rng::seed_from_u64(702));
-        let thief_node = Node::spawn().await.expect("the thief's node should bind");
+        let thief_node = crate::test_node().await;
         let refused = Workspace::join(
             thief_node,
             &invite,
@@ -1020,7 +1073,7 @@ mod invite_security {
     #[tokio::test]
     async fn an_invite_cannot_be_redeemed_twice_on_one_node() {
         let (alice, _doc) = founded(710, "shared").await;
-        let bob_node = Node::spawn().await.expect("bob should bind");
+        let bob_node = crate::test_node().await;
         let bob = Identity::generate(&mut ChaCha20Rng::seed_from_u64(711));
         let invite = alice
             .add_user(
@@ -1067,7 +1120,7 @@ mod invite_security {
     #[tokio::test]
     async fn an_invite_is_refused_after_its_window_closes() {
         let (alice, _doc) = founded(720, "shared").await;
-        let bob_node = Node::spawn().await.expect("bob should bind");
+        let bob_node = crate::test_node().await;
         let bob = Identity::generate(&mut ChaCha20Rng::seed_from_u64(721));
         let invite = alice
             .add_user(
@@ -1104,7 +1157,7 @@ mod invite_security {
     #[tokio::test]
     async fn a_viewer_cannot_mint_an_invite_at_all() {
         let (alice, _doc) = founded(740, "shared").await;
-        let viewer_node = Node::spawn().await.expect("the viewer's node should bind");
+        let viewer_node = crate::test_node().await;
         let viewer = Identity::generate(&mut ChaCha20Rng::seed_from_u64(741));
         let invite = alice
             .add_user(
@@ -1128,9 +1181,7 @@ mod invite_security {
         // refuses that first — which is the stronger statement: a viewer cannot
         // produce an invite this library would emit at all.
         let outsider = Identity::generate(&mut ChaCha20Rng::seed_from_u64(743));
-        let outsider_node = Node::spawn()
-            .await
-            .expect("the outsider's node should bind");
+        let outsider_node = crate::test_node().await;
         let refused = viewer_ws
             .add_user(
                 &outsider.enrollment(outsider_node.endpoint().id()),
@@ -1166,7 +1217,7 @@ mod invite_security {
 mod persistence_survives_a_restart {
     use std::{path::PathBuf, time::Duration};
 
-    use iroh_beekem::{Identity, Node, Workspace, WorkspaceError};
+    use iroh_beekem::{Identity, Workspace, WorkspaceError};
     use iroh_beekem_core::Role;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -1211,7 +1262,7 @@ mod persistence_survives_a_restart {
         let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(80));
 
         let (endpoint_before, tree_id, doc) = {
-            let node = Node::spawn_persistent(&root.0)
+            let node = crate::test_node_persistent(&root.0)
                 .await
                 .expect("a persistent node binds");
             let endpoint = node.endpoint().id();
@@ -1232,7 +1283,7 @@ mod persistence_survives_a_restart {
             (endpoint, tree_id, doc)
         };
 
-        let node = Node::spawn_persistent(&root.0)
+        let node = crate::test_node_persistent(&root.0)
             .await
             .expect("the same directory reopens");
         assert_eq!(
@@ -1283,12 +1334,13 @@ mod persistence_survives_a_restart {
     /// would reject the restarted node's entries as coming from an author no
     /// manifest maps to a member, and it would go permanently mute while looking
     /// entirely healthy from its own side.
-    #[tokio::test]
+    /// Three endpoints, so two worker threads — see the module docs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_restarted_joiners_later_writes_are_still_accepted() {
         let root = TempRoot::new("joiner");
 
         let (alice, alice_doc) = {
-            let node = Node::spawn().await.expect("alice binds");
+            let node = crate::test_node().await;
             let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(90));
             let ws = Workspace::create(
                 node,
@@ -1304,7 +1356,7 @@ mod persistence_survives_a_restart {
 
         let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(91));
         let bob_tree = {
-            let node = Node::spawn_persistent(&root.0)
+            let node = crate::test_node_persistent(&root.0)
                 .await
                 .expect("bob binds persistently");
             let invite = alice
@@ -1336,12 +1388,31 @@ mod persistence_survives_a_restart {
             tree
         };
 
-        let node = Node::spawn_persistent(&root.0)
+        let node = crate::test_node_persistent(&root.0)
             .await
             .expect("bob's directory reopens");
         let bob = Workspace::open(node, bob_tree, &bob_identity)
             .await
             .expect("bob reopens his workspace");
+        // Both directions, by address, and only because these nodes run without a
+        // relay. A restart binds a *new* UDP port, so each side's cached address
+        // for the other is stale; on the open internet the relay is what bridges
+        // that, since an endpoint stays reachable by id through it while a direct
+        // path is renegotiated. With relays off — see `test_node` — nothing does,
+        // and the two would wait on address lookup propagating a fresh record.
+        //
+        // This cannot hide a regression in what the test is *about*. If `open`
+        // failed to derive its roster, or derived the wrong author, or a restarted
+        // member's writes were refused, handing out addresses would not save it:
+        // `a_restarted_joiners_write_is_refused_without_its_author` and the roster
+        // assertions elsewhere in this module would still fail.
+        bob.sync_with(alice.endpoint_addr())
+            .await
+            .expect("bob syncs with alice's known address");
+        alice
+            .sync_with(bob.endpoint_addr())
+            .await
+            .expect("alice syncs with the restarted bob's new address");
         bob.append(alice_doc, "bob after restart")
             .await
             .expect("bob writes again");
@@ -1363,9 +1434,10 @@ mod persistence_survives_a_restart {
     /// would flap for as long as the node ran. Asserted over real endpoints
     /// because the unit test can only show the bookkeeping, not that both
     /// workspaces really do share one guard.
-    #[tokio::test]
+    /// Three endpoints, so two worker threads — see the module docs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_workspaces_on_one_node_do_not_evict_each_others_members() {
-        let host = Node::spawn().await.expect("the host binds");
+        let host = crate::test_node().await;
         let first_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(100));
         let second_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(101));
 
@@ -1390,7 +1462,7 @@ mod persistence_survives_a_restart {
         // second admission is what would clobber the first under a shared set.
         let mut guests = Vec::new();
         for (i, ws) in [(0u64, &first), (1, &second)] {
-            let node = Node::spawn().await.expect("a guest binds");
+            let node = crate::test_node().await;
             let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(110 + i));
             let invite = ws
                 .add_user(
@@ -1442,7 +1514,7 @@ mod persistence_survives_a_restart {
     /// of a configuration error.
     #[tokio::test]
     async fn an_in_memory_node_reports_that_it_cannot_persist() {
-        let node = Node::spawn().await.expect("an in-memory node binds");
+        let node = crate::test_node().await;
         assert!(
             matches!(Workspace::list(&node), Err(WorkspaceError::NotPersistent)),
             "an in-memory node did not report that it has no store"
@@ -1459,7 +1531,7 @@ mod persistence_survives_a_restart {
 mod a_member_can_walk_away {
     use std::time::Duration;
 
-    use iroh_beekem::{Identity, Node, Workspace};
+    use iroh_beekem::{Identity, Workspace};
     use iroh_beekem_core::WorkspaceInfo;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -1536,7 +1608,7 @@ mod a_member_can_walk_away {
         ));
         let _ = std::fs::remove_dir_all(&root);
 
-        let node = Node::spawn_persistent(&root)
+        let node = crate::test_node_persistent(&root)
             .await
             .expect("a persistent node binds");
         let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(62));
@@ -1583,7 +1655,7 @@ mod a_member_can_walk_away {
 mod an_action_needs_a_quorum {
     use std::time::Duration;
 
-    use iroh_beekem::{AdminAction, Identity, Invite, Node, Role, Workspace};
+    use iroh_beekem::{AdminAction, Identity, Invite, Role, Workspace};
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -1598,7 +1670,7 @@ mod an_action_needs_a_quorum {
     /// clear.
     #[tokio::test]
     async fn a_joiner_learns_the_workspace_threshold() {
-        let node = Node::spawn().await.expect("alice binds");
+        let node = crate::test_node().await;
         let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(70));
         let alice = Workspace::create_with_quorum(
             node,
@@ -1611,7 +1683,7 @@ mod an_action_needs_a_quorum {
         .expect("founding at a threshold of two succeeds");
         assert_eq!(alice.threshold().await, 2, "the founder set the threshold");
 
-        let bob_node = Node::spawn().await.expect("bob binds");
+        let bob_node = crate::test_node().await;
         let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(71));
         let invite: Invite = alice
             .add_user(
@@ -1640,9 +1712,10 @@ mod an_action_needs_a_quorum {
 
     /// In a workspace at a threshold of two, upon one admin proposing and both
     /// approving, we expect the removal to happen — and not before.
-    #[tokio::test]
+    /// Three endpoints, so two worker threads — see the module docs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_removal_waits_for_the_second_admin() {
-        let node = Node::spawn().await.expect("alice binds");
+        let node = crate::test_node().await;
         let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(73));
         let alice = Workspace::create_with_quorum(
             node,
@@ -1658,7 +1731,7 @@ mod an_action_needs_a_quorum {
         // neither approver is ever also the target.
         let mut joined = Vec::new();
         for (i, role) in [(0u64, Role::Admin), (1, Role::Editor)] {
-            let peer_node = Node::spawn().await.expect("a peer binds");
+            let peer_node = crate::test_node().await;
             let peer_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(74 + i));
             let invite = alice
                 .add_user(
@@ -1716,6 +1789,91 @@ mod an_action_needs_a_quorum {
             "the removal a quorum authorised is performed everywhere",
             Duration::from_secs(30),
             || async { alice.group_size().await == 2 && bob.group_size().await == 2 },
+        )
+        .await;
+    }
+
+    /// In a workspace holding a proposal, upon the public `resync` being called,
+    /// we expect the certificates to be re-announced along with everything else.
+    ///
+    /// `Workspace::resync` is anti-entropy for the three things broadcast exactly
+    /// once, and it drove only two of them: the manifest and the namespace, but
+    /// not the certificates. The internal `republish` a `NeighborUp` takes drove
+    /// all three, which is why nothing here caught it — every in-tree test
+    /// reaches anti-entropy through that path, and only a library caller reaches
+    /// this one.
+    ///
+    /// What the omission cost is specific: a proposal or an approval is broadcast
+    /// once with no write behind it, so a peer that missed one has no other way
+    /// to learn of it, and a quorum that formed on one node and nowhere else
+    /// leaves an action performed there and refused everywhere.
+    ///
+    /// This asserts the composition rather than the recovery. Making a peer
+    /// genuinely *miss* a gossip message needs fault injection, which the
+    /// simulator has and two real endpoints do not — `an_action_needs_a_quorum`
+    /// in the property suite covers the lossy case. What only this can show is
+    /// that the public entry point drives the event at all, over a live
+    /// transport, without erroring.
+    #[tokio::test]
+    async fn a_public_resync_re_announces_the_certificates() {
+        let node = crate::test_node().await;
+        let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(80));
+        let alice = Workspace::create_with_quorum(
+            node,
+            &identity,
+            info("guarded"),
+            2,
+            &mut ChaCha20Rng::seed_from_u64(80),
+        )
+        .await
+        .expect("founding succeeds");
+
+        let bob_node = crate::test_node().await;
+        let bob_identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(81));
+        let invite: Invite = alice
+            .add_user(
+                &bob_identity.enrollment(bob_node.endpoint().id()),
+                Role::Admin,
+                "bob",
+            )
+            .await
+            .expect("the founder may appoint an admin alone");
+        let bob = Workspace::join(
+            bob_node,
+            &invite,
+            &bob_identity,
+            &mut ChaCha20Rng::seed_from_u64(82),
+        )
+        .await
+        .expect("bob joins");
+
+        eventually("both are in the group", Duration::from_secs(20), || async {
+            alice.group_size().await == 2 && bob.group_size().await == 2
+        })
+        .await;
+
+        // A proposal is a certificate and nothing else: it mints no CGKA
+        // operation, so the certificate exchange is the only thing that can
+        // carry it.
+        let proposal = alice
+            .propose(
+                AdminAction::RemoveMember {
+                    member: bob.member_id().await.to_bytes(),
+                },
+                None,
+            )
+            .await
+            .expect("an admin may propose");
+
+        alice
+            .resync()
+            .await
+            .expect("the public resync completes over a live transport");
+
+        eventually(
+            "the proposal reaches the other admin",
+            Duration::from_secs(20),
+            || async { bob.proposals().await.iter().any(|p| p.digest == proposal) },
         )
         .await;
     }

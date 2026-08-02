@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use iroh_beekem::{Identity, Node, NodeOptions, Workspace};
+use iroh_beekem::{Identity, Node, NodeOptions, Relay, Workspace};
 use iroh_beekem_core::WorkspaceInfo;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -27,9 +27,14 @@ const PATH: &str = "/notes.md";
 
 /// A workspace on a node whose blob store sweeps often enough to watch.
 async fn founded(seed: u64) -> Workspace {
-    let node = Node::spawn_with_options(NodeOptions { gc_interval: SWEEP })
-        .await
-        .expect("node should bind");
+    let node = Node::spawn_with_options(NodeOptions {
+        gc_interval: SWEEP,
+        // No relay: both endpoints are on this machine. See `test_node` in
+        // `two_node.rs` for what leaving it on costs the suite.
+        relay: Relay::Disabled,
+    })
+    .await
+    .expect("node should bind");
     let identity = Identity::generate(&mut ChaCha20Rng::seed_from_u64(seed));
     Workspace::create(
         node,

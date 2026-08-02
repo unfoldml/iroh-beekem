@@ -284,6 +284,25 @@ mod concurrent_rotation_and_revocation {
     fn the_run_is_reproducible() {
         assert_deterministic(|| plan::<Churn>(Vec::new()), Seed(0x0BAD_F00D));
     }
+    /// In this plan, upon the run finishing, we expect the revocation actually to
+    /// have taken effect somewhere.
+    ///
+    /// The anti-vacuity guard. `remaining` filters on `is_revocation_target`,
+    /// which is a fact about the scenario constant rather than about anything
+    /// that happened — so both properties above hold perfectly well in a run
+    /// where nobody was ever removed, and would go on holding if the removal
+    /// stopped being issued.
+    #[test]
+    fn the_revocation_really_does_happen() {
+        plan::<Churn>(vec![property::sometimes(
+            "some node has seen the group shrink",
+            |w: &World<'_, WorkspaceNode<Churn>>| {
+                w.nodes()
+                    .any(|n| n.has_joined() && n.current_member_count() < NODES)
+            },
+        )])
+        .run(deterministic());
+    }
 }
 
 /// An attacker holding a keypair that no `Add` ever introduced, broadcasting
@@ -293,7 +312,7 @@ mod concurrent_rotation_and_revocation {
 mod a_forging_peer_is_rejected {
     use std::time::Duration;
 
-    use iroh_beekem_sim::{Forging, WorkspaceNode};
+    use iroh_beekem_sim::{FORGED_DOC, Forging, ROGUE_AUTHOR, WorkspaceNode, doc_key};
     use propsim::prelude::*;
 
     use super::{NODES, plan};
@@ -356,6 +375,80 @@ mod a_forging_peer_is_rejected {
         )])
         .run(deterministic());
     }
+
+    /// In a group under attack on the data plane, upon any honest node being
+    /// asked at any instant, we expect the forged document to be empty.
+    ///
+    /// The three properties above are all about the *control* plane — whether a
+    /// forged operation splices a leaf, whether the group still converges,
+    /// whether the queues hold. None of them constrains what a forger can write
+    /// into the index, and until the receiver's author check existed here,
+    /// nothing did: the attacker re-announces ciphertext every member can decrypt
+    /// under an author the capability closure gives no role, so decryption cannot
+    /// refuse it and only authority can.
+    ///
+    /// `FORGED_DOC` is written by nobody else in this scenario, so its content on
+    /// an honest node is a pure function of what that node accepted from the
+    /// forger — which is what lets the claim be stated as plainly as this.
+    #[test]
+    fn no_honest_node_ever_accepts_a_forged_entry() {
+        plan::<Forging>(vec![property::always(
+            "no honest node applies content from an author with no role",
+            |w: &World<'_, WorkspaceNode<Forging>>| {
+                w.nodes()
+                    .filter(|n| n.has_joined())
+                    .all(|n| n.document_text_of(FORGED_DOC).is_empty())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect a forged entry actually to
+    /// have arrived at an honest node and been refused there.
+    ///
+    /// The anti-vacuity guard for the property above, and the place to record why
+    /// it is *seen* rather than absent. The tempting claim — that a forged entry
+    /// never enters an honest node's index at all — is false here, and it is
+    /// false for the right reason. A forging node is a member: it holds the
+    /// namespace write capability, so in production its entry really does
+    /// reconcile into every peer's `iroh-docs` replica, whatever author id it
+    /// writes under. Nothing can stop it arriving. What stops it *counting* is
+    /// the receiver's author check, and that is the boundary the property above
+    /// states.
+    ///
+    /// So this asserting that the entry is present is not a weaker claim — it is
+    /// what makes the stronger one non-vacuous. Without it, an honest node that
+    /// never received the forgery at all would satisfy "the forged document is
+    /// empty" perfectly.
+    #[test]
+    fn a_forged_entry_does_reach_honest_nodes_and_is_refused_anyway() {
+        plan::<Forging>(vec![property::sometimes(
+            "an honest node has seen an entry from an uncertified author",
+            |w: &World<'_, WorkspaceNode<Forging>>| {
+                w.nodes().filter(|n| n.has_joined()).any(|n| {
+                    n.entry(&doc_key(FORGED_DOC))
+                        .is_some_and(|meta| meta.author == NodeId(ROGUE_AUTHOR))
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect a forgery really to have
+    /// been broadcast.
+    ///
+    /// The anti-vacuity guard for all five properties in this module. Every one
+    /// of them is satisfied by a run in which no forgery was ever sent, and under
+    /// a lossy transport with a bounded forgery budget that is a reachable run
+    /// rather than a hypothetical one.
+    #[test]
+    fn the_forger_really_does_attack() {
+        plan::<Forging>(vec![property::sometimes(
+            "some node has broadcast a forgery",
+            |w: &World<'_, WorkspaceNode<Forging>>| w.nodes().any(|n| n.forgeries_made() > 0),
+        )])
+        .run(deterministic());
+    }
 }
 
 #[test]
@@ -395,10 +488,17 @@ fn the_simulation_is_reproducible() {
 mod a_removed_member_stops_seeing {
     use std::time::Duration;
 
-    use iroh_beekem_sim::{Eviction, POST_REVOCATION_DOC, WorkspaceNode, doc_key};
+    use iroh_beekem_sim::{
+        Eviction, POST_REVOCATION_DOC, POST_REVOCATION_PATH, Role, WorkspaceNode, doc_key,
+        member_bytes_of,
+    };
     use propsim::prelude::*;
 
     use super::plan;
+
+    /// The node the founder promotes after the revocation, matching
+    /// `Scenario::PROMOTE_AFTER_REVOKE`.
+    const PROMOTED: u64 = 1;
 
     /// The removed device, once it has joined and been revoked.
     fn victim<'a>(
@@ -559,6 +659,100 @@ mod a_removed_member_stops_seeing {
         )])
         .run(deterministic());
     }
+
+    /// Given a revoked device, at every instant, we expect it never to learn the
+    /// name of a file created after its removal.
+    ///
+    /// The third clause of the user story — *"documents, document updates **or
+    /// workspace changes**"* — and until now nothing asserted it. Every other
+    /// property in this module looks at one document key, so a rotation that
+    /// moved the documents while going on republishing the manifest into the
+    /// abandoned replica would pass all of them and still tell the victim the
+    /// shape of the workspace indefinitely: what files exist, what they are
+    /// called, when they appear.
+    ///
+    /// A file name is worth withholding on its own. `/q4-layoffs.xlsx` discloses
+    /// its subject without a byte of its content being readable, which is the
+    /// whole reason storage keys are blinded in the first place.
+    #[test]
+    fn the_victim_never_sees_a_file_created_after_its_removal() {
+        plan::<Eviction>(vec![property::always(
+            "a removed device never learns the name of a later file",
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                victim(w).is_none_or(|n| {
+                    !n.manifest_paths()
+                        .iter()
+                        .any(|path| path == POST_REVOCATION_PATH)
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given a revoked device, we expect it to go on learning of membership
+    /// changes made after its removal — and this property exists to record that,
+    /// not to approve of it.
+    ///
+    /// Written inverted, exactly as the visibility properties in this module once
+    /// were, and for the same reason: the line is where it is, and it must not be
+    /// able to move without a test noticing.
+    ///
+    /// **Why the two halves of "workspace changes" differ.** A file name lives in
+    /// the manifest, which is republished into the rotated namespace — so
+    /// withholding it is confidentiality, enforced by a key the victim cannot
+    /// derive, and `the_victim_never_sees_a_file_created_after_its_removal` states
+    /// it as an absolute. A role lives in the capability closure and travels as a
+    /// *certificate* on the control plane, which has no namespace to rotate. What
+    /// is supposed to stop the victim receiving one is eviction from the roster —
+    /// and eviction is an availability boundary rather than a confidentiality one
+    /// (README, *Current trade-offs*). The victim keeps its inviter on the
+    /// bootstrap exception, keeps accepting that peer's broadcasts, and
+    /// certificate admission is monotone by design, so the grant is merged and
+    /// resolved like any other.
+    ///
+    /// Closing it is not a matter of adding a check. It needs the bootstrap
+    /// exception to expire, and that exception exists because a joiner must
+    /// accept its inviter *before* it has any state to derive a roster from.
+    #[test]
+    fn a_removed_device_still_learns_of_later_membership_changes() {
+        plan::<Eviction>(vec![property::sometimes(
+            "a removed device sees a promotion made after it was removed",
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                victim(w).is_some_and(|n| n.role_of(member_bytes_of(PROMOTED)) == Some(Role::Admin))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Given the group created a file and appointed an administrator after the
+    /// revocation, when the run settles, we expect the remaining members to know
+    /// about both.
+    ///
+    /// The counterweight and the anti-vacuity guard for the two properties above,
+    /// in the shape `every_remaining_member_sees_the_entry_the_victim_does_not`
+    /// already uses. `the_victim_never_sees_a_file_created_after_its_removal` is
+    /// satisfied by a run in which the founder never created the file — and a
+    /// change scheduled six seconds in, after a revocation and the rotation it
+    /// triggers, is one that can genuinely fail to happen. Without this, "the
+    /// victim never saw it" would be true because there was nothing to see.
+    #[test]
+    fn every_remaining_member_sees_the_workspace_changes_the_victim_does_not() {
+        plan::<Eviction>(vec![property::eventually_within(
+            "the members that stayed learn the later file and the later promotion",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<Eviction>>| {
+                let members = remaining(w);
+                members.len() >= 2
+                    && members.iter().all(|n| {
+                        n.manifest_paths()
+                            .iter()
+                            .any(|path| path == POST_REVOCATION_PATH)
+                            && n.role_of(member_bytes_of(PROMOTED)) == Some(Role::Admin)
+                    })
+            },
+        )])
+        .run(deterministic());
+    }
 }
 
 /// The CRUD surface an application actually calls, driven by generated
@@ -575,10 +769,17 @@ mod a_removed_member_stops_seeing {
 /// sequential model would report anomalies for correct behaviour. Convergence is
 /// the right specification, and it is what these assert.
 mod generated_crud_workloads {
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
 
-    use iroh_beekem_sim::{Crud, CrudChurn, Scenario, WorkspaceNode, WorkspaceSpec, crud_workload};
+    use iroh_beekem_sim::{
+        Crud, CrudChurn, Scenario, WorkspaceNode, WorkspaceSpec, append_only_workload,
+        crud_workload,
+    };
     use propsim::prelude::*;
+    // The recorded-history types. Re-exported by `propsim` from `propsim-core`
+    // but deliberately not in the prelude, since every other property in this
+    // suite reads node state rather than the history.
+    use propsim::{History, OpKind, ProcessId, Value};
 
     use super::{NODES, SEEDS, network_faults};
 
@@ -598,6 +799,28 @@ mod generated_crud_workloads {
             .faults(network_faults())
             .state_machine()
             .workload(crud_workload(NODES))
+            .client(WorkspaceSpec)
+            .check(properties)
+            .seeds(SEEDS)
+            .finish()
+    }
+
+    /// The same plan over a workload that only ever adds text.
+    ///
+    /// Exists for the history-based loss property alone. "No acknowledged write
+    /// is lost" needs a monotone history to be definable at all — see
+    /// `append_only_workload` — and it needs the same adversarial network as
+    /// everything else, which is why this differs from `workload_plan` in exactly
+    /// one line.
+    fn append_only_plan<S: Scenario>(
+        properties: Vec<Property<WorkspaceNode<S>>>,
+    ) -> TestPlan<WorkspaceNode<S>> {
+        Simulation::plan::<WorkspaceNode<S>>()
+            .nodes(NODES)
+            .transport(InMemory::unordered_lossy())
+            .faults(network_faults())
+            .state_machine()
+            .workload(append_only_workload(NODES))
             .client(WorkspaceSpec)
             .check(properties)
             .seeds(SEEDS)
@@ -796,6 +1019,213 @@ mod generated_crud_workloads {
         // order, or a failing run could never be replayed.
         assert_deterministic(|| workload_plan::<Crud>(Vec::new()), Seed(0x0C0D_E123));
     }
+
+    // ---------------------------------------------------------------------
+    // Loss and fabrication, stated over the recorded operation history.
+    //
+    // Every other property in this file reads node state. These read
+    // `World::history()` — the Jepsen-shaped log the harness records around each
+    // client op — and that difference is the point. "A node's own acknowledged
+    // writes are in its own view" is asserted elsewhere over `contributed()`,
+    // which is bookkeeping the node keeps *about itself*: an `apply_op` that
+    // forgot to record a fragment would weaken that property and nothing would
+    // report it. The history is written by the harness at invoke and completion
+    // time and is independent of anything the node believes.
+    //
+    // Two mechanical facts shape what can be asserted here:
+    //
+    // * The world hands every frame the **whole run's** history while node state
+    //   is the state at that instant. So a "present everywhere" claim has to be
+    //   `eventually_within` — at t=0 the history already mentions ops nobody has
+    //   issued yet — while a "⊆" claim is sound as `always`.
+    // * Client ops are gated one-in-flight per process, so for a given process
+    //   the entries strictly alternate invoke, terminal, invoke, terminal.
+    //   Pairing an acknowledgement with the op it acknowledges is therefore a
+    //   fold in recorded order rather than a matching problem.
+    // ---------------------------------------------------------------------
+
+    /// The characters carried by every mutating op that was *issued*, per
+    /// process, in recorded order.
+    ///
+    /// Read off the `Invoke` entries, whose `:value` is the op as the workload
+    /// generated it (`[:append 0 "abc"]`). The terminal entry carries only the
+    /// response, so the payload has to come from the invoke.
+    ///
+    /// `filter` decides which ops count and lets one traversal serve both
+    /// properties: everything mutating for the fabrication bound, appends only
+    /// for the loss bound.
+    fn issued_chars(history: &History, only_appends: bool) -> Vec<char> {
+        let mut out = Vec::new();
+        for entry in history.entries() {
+            if entry.kind != OpKind::Invoke {
+                continue;
+            }
+            if only_appends && entry.f.as_str() != "append" {
+                continue;
+            }
+            if let Value::List(items) = &entry.value {
+                // The text is the last element of every mutating form —
+                // `[:append d t]`, `[:write d t]`, `[:insert d p t]` — and a
+                // form without one (a read, a remove, a revert) contributes
+                // nothing, which is exactly right for both bounds.
+                if let Some(Value::Str(text)) = items.last() {
+                    out.extend(text.chars());
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// The characters carried by every append that was *acknowledged*.
+    ///
+    /// An op counts only if its terminal entry is `Ok`. `Fail` never took effect
+    /// and `Info` is indeterminate — an op still open when the run hit its
+    /// horizon is force-closed as `Info`, and it may well have applied — so
+    /// neither belongs in a lower bound on what must be present.
+    ///
+    /// Pairing exploits the one-in-flight-per-process gate: walking the entries
+    /// in order and remembering the last invoke seen for each process, a terminal
+    /// entry always resolves the invoke immediately before it for that process.
+    fn acknowledged_append_chars(history: &History) -> Vec<char> {
+        let mut open: BTreeMap<ProcessId, String> = BTreeMap::new();
+        let mut out = Vec::new();
+        for entry in history.entries() {
+            match entry.kind {
+                OpKind::Invoke => {
+                    let text = if entry.f.as_str() == "append" {
+                        match &entry.value {
+                            Value::List(items) => match items.last() {
+                                Some(Value::Str(text)) => text.clone(),
+                                _ => String::new(),
+                            },
+                            _ => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    open.insert(entry.process, text);
+                }
+                OpKind::Ok => {
+                    if let Some(text) = open.remove(&entry.process) {
+                        out.extend(text.chars());
+                    }
+                }
+                // Definitely did not happen, or may or may not have. Either way
+                // it cannot be required to be present.
+                OpKind::Fail | OpKind::Info => {
+                    open.remove(&entry.process);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether `subset` is contained in `superset` counting multiplicity, both
+    /// sorted.
+    ///
+    /// Multiset containment rather than substring containment, and the difference
+    /// matters: the workload draws text from `[a-z]{1,6}`, so one fragment
+    /// routinely appears inside another and `String::contains` would report a
+    /// fragment present that was never written.
+    fn is_sub_multiset(subset: &[char], superset: &[char]) -> bool {
+        let mut rest = superset.iter();
+        subset
+            .iter()
+            .all(|needed| rest.by_ref().any(|have| have == needed))
+    }
+
+    /// In a group under a generated workload, upon any node being asked at any
+    /// instant, we expect every character it holds to be one some client asked
+    /// for.
+    ///
+    /// The fabrication half, and total under the ordinary workload because
+    /// deleting text cannot manufacture any. Bounded by what was *issued* rather
+    /// than by what was acknowledged, because an op recorded `Info` may well have
+    /// taken effect — requiring content to trace back to an `Ok` would report a
+    /// failure for a timeout that landed.
+    ///
+    /// What it catches is a decrypt-and-apply path that duplicates a chunk, or
+    /// applies one under the wrong document, or resurrects a superseded delta —
+    /// none of which a convergence property sees, because every node can be wrong
+    /// in the same way and still agree.
+    #[test]
+    fn no_node_ever_holds_content_nobody_wrote() {
+        workload_plan::<Crud>(vec![property::always(
+            "every character on every node was asked for by some client",
+            |w: &World<'_, WorkspaceNode<Crud>>| {
+                let issued = issued_chars(w.history(), false);
+                joined(w).iter().all(|n| {
+                    let mut held: Vec<char> = n.all_text().concat().chars().collect();
+                    held.sort_unstable();
+                    is_sub_multiset(&held, &issued)
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group under a workload that only ever adds text, upon the run
+    /// settling, we expect every node's content to sit between what was
+    /// acknowledged and what was asked for.
+    ///
+    /// The loss half, and the reason the append-only workload exists: under the
+    /// ordinary workload a `write`, a `remove` or a `revert` may legitimately
+    /// delete an acknowledged append, so "every acknowledged write survives"
+    /// is false there and every weakening of it that becomes true is vacuous.
+    ///
+    /// Both bounds are asserted together because they fail in opposite
+    /// directions and a single-sided claim is satisfied by an absurd
+    /// implementation. Lower bound: a node holding *fewer* characters than were
+    /// acknowledged has lost an acknowledged write — the thing a local-first
+    /// system may never do. Upper bound: a node holding *more* than were ever
+    /// asked for has manufactured content. An implementation that dropped
+    /// everything satisfies the upper bound alone; one that duplicated every
+    /// chunk satisfies the lower.
+    #[test]
+    fn every_acknowledged_write_reaches_every_node() {
+        append_only_plan::<Crud>(vec![property::eventually_within(
+            "every node holds at least what was acknowledged and at most what was asked for",
+            Duration::from_secs(12),
+            |w: &World<'_, WorkspaceNode<Crud>>| {
+                let acknowledged = acknowledged_append_chars(w.history());
+                let issued = issued_chars(w.history(), true);
+                let nodes = joined(w);
+                nodes.len() == NODES
+                    && nodes.iter().all(|n| {
+                        let mut held: Vec<char> = n.all_text().concat().chars().collect();
+                        held.sort_unstable();
+                        is_sub_multiset(&acknowledged, &held) && is_sub_multiset(&held, &issued)
+                    })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect the recorded history to
+    /// contain acknowledged writes.
+    ///
+    /// The anti-vacuity guard for both properties above, and not a formality. A
+    /// history with no `Ok` append satisfies the loss bound trivially — the empty
+    /// multiset is contained in everything — and a plan built without `.client()`
+    /// or `.workload()` records no entries at all, which is the state every other
+    /// module in this file is in. A history property in one of those would pass
+    /// while reading nothing.
+    #[test]
+    fn the_history_really_does_record_acknowledged_writes() {
+        append_only_plan::<Crud>(vec![property::sometimes(
+            "the recorded history holds an acknowledged append",
+            |w: &World<'_, WorkspaceNode<Crud>>| !acknowledged_append_chars(w.history()).is_empty(),
+        )])
+        .run(deterministic());
+    }
+
+    /// Reproducibility for the append-only plan, as every other plan asserts it.
+    #[test]
+    fn an_append_only_run_is_reproducible() {
+        assert_deterministic(|| append_only_plan::<Crud>(Vec::new()), Seed(0x0A99_E4D0));
+    }
 }
 
 /// Admission control: what a node that was never admitted can observe.
@@ -963,6 +1393,28 @@ mod an_outsider_observes_nothing {
                         members.iter().map(|n| n.derived_roster()).collect();
                     rosters.dedup();
                     rosters.len() == 1 && rosters[0].len() == NODES
+                },
+            )],
+        )
+        .run(deterministic());
+    }
+    /// In this plan, upon the run finishing, we expect the outsider actually to
+    /// have been offered traffic and to have refused it.
+    ///
+    /// The anti-vacuity guard for the three "observes nothing" properties above,
+    /// and there is no substitute for it. Each of them is satisfied by a run in
+    /// which the network never delivered the outsider anything — and because
+    /// admission is checked *before* a message is recorded, every other counter
+    /// on this node reads zero in that case too, exactly as it does when the
+    /// roster is working. Only a count of what was turned away tells them apart.
+    #[test]
+    fn the_outsider_really_is_offered_traffic_and_refuses_it() {
+        plan_of_size::<Outsider>(
+            NODES_WITH_OUTSIDER,
+            vec![property::sometimes(
+                "the outsider has refused a message it was offered",
+                |w: &World<'_, WorkspaceNode<Outsider>>| {
+                    outsider(w).is_some_and(|n| n.refused_messages() > 0)
                 },
             )],
         )
@@ -1168,6 +1620,22 @@ mod an_insider_cannot_exceed_its_role {
                     .filter(|n| n.has_joined() && n.id() == 2)
                     .all(|n| !n.document_text().is_empty() && n.pending_chunks() == 0)
             },
+        )])
+        .run(deterministic());
+    }
+    /// In this plan, upon the run finishing, we expect the insider actually to
+    /// have tried to exceed its role.
+    ///
+    /// The anti-vacuity guard for every property in this module. All of them —
+    /// "no more administrators than were granted", "no role nobody granted", "no
+    /// device resolving to a user nobody admitted" — are satisfied by a run in
+    /// which node 2 behaved perfectly, and a scenario constant that stopped being
+    /// honoured would look exactly like a protocol that refuses the attack.
+    #[test]
+    fn the_insider_really_does_try_to_exceed_its_role() {
+        plan::<Insider>(vec![property::sometimes(
+            "the insider has acted beyond the role it was granted",
+            |w: &World<'_, WorkspaceNode<Insider>>| w.nodes().any(|n| n.overreaches_made() > 0),
         )])
         .run(deterministic());
     }
@@ -1797,15 +2265,24 @@ mod an_offline_node_catches_up {
 /// up able to read the thing, under partitions and reordering, and whether a
 /// removed one does not.
 ///
+/// The second half needs **two** scenarios, and for a while this comment claimed
+/// it while only one existed. `AssetChurn` attaches before it removes, so its
+/// victim read the asset while it was entitled to and is expected to still hold
+/// the plaintext — the right shape for "a removal must not cost the survivors
+/// their attachment" and the wrong one for confidentiality. `AssetAfterRemoval`
+/// attaches afterwards, which is the only ordering that can state forward
+/// secrecy at all, since forward secrecy is a claim about what comes next.
+///
 /// The asset is deliberately keyed differently from a document: its segments are
 /// sealed under a per-asset content key, and only that 32-byte key is encrypted
 /// to the group. So "can this member read the asset" is really "can this member
 /// unwrap one small chunk", which is what makes repairing an asset for a
 /// late-joining member cheap — and what these properties are ultimately about.
 mod an_asset_reaches_every_member {
-    use iroh_beekem_sim::{AssetChurn, Assets};
+    use iroh_beekem_sim::{AssetAfterRemoval, AssetChurn, Assets};
 
-    /// The node `AssetChurn` removes, matching `Scenario::REVOKE`.
+    /// The node `AssetChurn` and `AssetAfterRemoval` remove, matching
+    /// `Scenario::REVOKE`.
     const VICTIM: u64 = 2;
 
     use propsim::prelude::*;
@@ -1882,6 +2359,103 @@ mod an_asset_reaches_every_member {
             |w: &World<'_, WorkspaceNode<Assets>>| w.nodes().all(|n| n.evicted_chunks() == 0),
         )])
         .run(deterministic());
+    }
+
+    /// In a workspace that removed a member and *then* attached an asset, upon
+    /// the removed member being asked at any instant, we expect it never to hold
+    /// the content key.
+    ///
+    /// The confidentiality claim, and the reason it needs a scenario of its own.
+    /// `AssetChurn` attaches before it removes, so its victim read the asset while
+    /// it was entitled to and is expected to still hold the plaintext afterwards —
+    /// asserting confidentiality there would be asserting something false. Forward
+    /// secrecy is a claim about what comes *next*, so only an attachment that comes
+    /// next can state it.
+    ///
+    /// Stated over the key rather than over the plaintext because the key is where
+    /// the design puts the boundary: segments are sealed under a per-asset content
+    /// key and only that key is encrypted to the group, so "cannot read the asset"
+    /// is exactly "cannot unwrap one small chunk". A member that somehow obtained
+    /// the key would have the whole asset however the segments were distributed.
+    #[test]
+    fn a_member_removed_before_an_attachment_never_holds_its_content_key() {
+        plan::<AssetAfterRemoval>(vec![property::always(
+            "the removed member never unwraps the content key",
+            |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
+                w.nodes()
+                    .filter(|n| n.id() == VICTIM)
+                    .all(|n| !n.holds_asset_key())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace that removed a member and then attached an asset, upon the
+    /// removed member being asked at any instant, we expect it never to reassemble
+    /// the asset.
+    ///
+    /// The observable consequence of the property above, asserted separately
+    /// because the two fail apart. A member could be denied the key and still
+    /// reassemble the plaintext if segments were ever distributed unsealed, and it
+    /// could hold the key and reassemble nothing if the rotation withdrew its
+    /// access to the segments — only asserting both says the envelope works.
+    #[test]
+    fn a_member_removed_before_an_attachment_never_reads_it() {
+        plan::<AssetAfterRemoval>(vec![property::always(
+            "the removed member never reassembles the asset",
+            |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
+                w.nodes()
+                    .filter(|n| n.id() == VICTIM)
+                    .all(|n| n.read_asset_view().is_none())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a workspace that removed a member and then attached an asset, upon the
+    /// network settling, we expect every member that stayed to read it in full.
+    ///
+    /// The counterweight, and the anti-vacuity guard for both properties above.
+    /// Each of them is satisfied by a run in which the attachment never happened,
+    /// which — since it is scheduled late, after the removal and the rotation it
+    /// triggers — is exactly the failure mode to worry about. If the attachment
+    /// silently did not occur, this fails and the other two go on passing.
+    #[test]
+    fn the_survivors_do_read_an_asset_attached_after_the_removal() {
+        plan::<AssetAfterRemoval>(vec![property::eventually_within(
+            "every remaining member reassembles an asset attached after the removal",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
+                let expected = asset_plaintext();
+                let staying: Vec<_> = joined(w).into_iter().filter(|n| n.id() != VICTIM).collect();
+                staying.len() == NODES - 1
+                    && staying
+                        .iter()
+                        .all(|n| n.read_asset_view() == Some(expected.as_slice()))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect the attachment really to
+    /// have reached somebody.
+    ///
+    /// The module had no anti-vacuity guard at all before this: every property in
+    /// it is satisfied by a run in which the founder never attached anything.
+    #[test]
+    fn an_asset_really_is_attached_in_this_run() {
+        asset_plan(vec![property::sometimes(
+            "some node holds the asset's content key",
+            |w: &World<'_, WorkspaceNode<Assets>>| w.nodes().any(WorkspaceNode::holds_asset_key),
+        )])
+        .run(deterministic());
+    }
+
+    /// Reproducibility, as every other scenario asserts it and this module did
+    /// not.
+    #[test]
+    fn the_asset_run_is_reproducible() {
+        assert_deterministic(|| asset_plan(Vec::new()), Seed(0x0A55_E731));
     }
 }
 
@@ -2208,5 +2782,393 @@ mod an_action_needs_a_quorum {
     fn the_quorum_run_is_reproducible() {
         let _ = SEEDS;
         assert_deterministic(|| quorum_plan(Vec::new()), Seed(0x0000_9401));
+    }
+}
+
+/// Staggered admission, with one person holding two devices — user story 1.
+///
+/// Every other plan admits every node at t=0, which makes onboarding the easiest
+/// case rather than the interesting one: the group is complete before the first
+/// edit, so no joiner ever meets content encrypted under an epoch it cannot
+/// derive. `Onboarding` arrives late on purpose. Node 1 asks to join at 400ms and
+/// node 2 at 800ms, after the founder has written both of its edits, so the only
+/// things that can carry that content to them are the republish `on_hello`
+/// performs and the demand-driven repair behind it.
+///
+/// That is what makes the first property here the guard on the Phase 1 republish
+/// cooldown. Throttled too aggressively, a joiner never receives a re-encryption
+/// it can read, and it stays permanently short of content nobody notices is
+/// missing — no error, no queue growth, just a document that is shorter on one
+/// node than on another.
+///
+/// Node 2 is a second *device* of node 1's person rather than a third person, and
+/// the two halves fail differently: the stagger is what makes a joiner arrive
+/// late, and the shared user is what gives "all of one user's devices converge" a
+/// referent at all.
+mod devices_onboard_without_losing_content {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{DOCS, DocumentUuid, Onboarding, WorkspaceNode};
+    use propsim::prelude::*;
+
+    use super::{NODES, plan};
+
+    /// The node that joins as a second device of another node's person.
+    const SECOND_DEVICE: u64 = 2;
+
+    /// The node whose person that second device belongs to.
+    const PRIMARY: u64 = 1;
+
+    /// How many distinct people the scenario admits.
+    ///
+    /// Three nodes, two of which are one person, so two. Written as a name rather
+    /// than a literal because it is the whole claim of
+    /// `both_of_a_users_devices_resolve_to_one_user`: a device count and a person
+    /// count that move together is precisely the bug.
+    const USERS: usize = NODES - 1;
+
+    /// The two nodes that are one person, once both have joined.
+    fn one_persons_devices<'a>(
+        w: &'a World<'a, WorkspaceNode<Onboarding>>,
+    ) -> Vec<&'a WorkspaceNode<Onboarding>> {
+        w.nodes()
+            .filter(|n| n.has_joined() && (n.id() == SECOND_DEVICE || n.id() == PRIMARY))
+            .collect()
+    }
+
+    /// The sorted character multiset of one document on one node.
+    ///
+    /// Compared rather than the string, because Loro's ordering of concurrent
+    /// inserts is an implementation detail; convergence claims that no node holds
+    /// a character another does not.
+    fn shape_of(node: &WorkspaceNode<Onboarding>, doc: DocumentUuid) -> Vec<char> {
+        let mut chars: Vec<char> = node.document_text_of(doc).chars().collect();
+        chars.sort_unstable();
+        chars
+    }
+
+    /// In a group whose members are admitted one after another and after content
+    /// already exists, upon the run settling, we expect every admitted device to
+    /// read the same text as every other for **every** document — not merely for
+    /// the one the fixed script edits.
+    ///
+    /// Per document rather than over the concatenation, and that is the point of
+    /// the property rather than a detail of it. `all_text().concat()` is satisfied
+    /// by two nodes that disagree about two documents in compensating ways, which
+    /// is not a hypothetical: a republish that covered one document and skipped
+    /// another produces exactly that. This is also the property that protects the
+    /// Phase 1 republish cooldown — throttled too hard, a late joiner is served
+    /// nothing it can decrypt and onboarding fails silently.
+    #[test]
+    fn every_admitted_device_eventually_reads_every_file() {
+        plan::<Onboarding>(vec![property::eventually_within(
+            "every admitted device reads every document identically",
+            Duration::from_secs(15),
+            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+                let nodes: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
+                // Guarded on the count: at t=0 only the founder has joined, and a
+                // one-element set agrees with itself for every document trivially.
+                if nodes.len() != NODES {
+                    return false;
+                }
+                DOCS.into_iter().all(|doc| {
+                    nodes
+                        .windows(2)
+                        .all(|p| shape_of(p[0], doc) == shape_of(p[1], doc))
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group where two devices belong to one person, upon any node being
+    /// asked at any instant, we expect it never to attribute those devices to
+    /// different people and never to count more people than were admitted.
+    ///
+    /// The structural claim behind the whole scenario. An enrolment implemented
+    /// as an `AddUser` rather than an `AddDevice` converges perfectly well and
+    /// passes every content property in this file — it simply admits a person
+    /// nobody invited, who then holds a role in their own right and survives the
+    /// removal of the device that was supposed to *be* them. `certified_users`
+    /// cannot see that on its own; the count of distinct people is what moves.
+    #[test]
+    fn both_of_a_users_devices_resolve_to_one_user() {
+        plan::<Onboarding>(vec![property::always(
+            "a second device never mints a second person",
+            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+                w.nodes().filter(|n| n.has_joined()).all(|n| {
+                    // Never *more* than were admitted. Fewer is ordinary while
+                    // certificates are still in flight, and is what the liveness
+                    // property below covers instead.
+                    n.certified_users().len() <= USERS
+                }) && one_persons_devices(w).windows(2).all(|p| {
+                    match (p[0].user_of_this_device(), p[1].user_of_this_device()) {
+                        // Skipped rather than failed: a device has no user until
+                        // the binding admitting it has been merged, and the whole
+                        // window between `Hello` and `Welcome` sits in that state.
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group where one person holds two devices, upon the run settling, we
+    /// expect both of that person's devices to hold the same content and the same
+    /// derived roster.
+    ///
+    /// Distinct from the all-nodes convergence above, and not implied by it while
+    /// either device is still catching up: two devices of one person are admitted
+    /// by *different* issuers — the founder admitted the primary, the primary
+    /// enrolled the second — so they reach the group along different paths and a
+    /// defect in the second path shows here first.
+    #[test]
+    fn all_of_one_users_devices_converge_on_the_same_view() {
+        plan::<Onboarding>(vec![property::eventually_within(
+            "one person's two devices agree on content and on the roster",
+            Duration::from_secs(15),
+            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+                let devices = one_persons_devices(w);
+                if devices.len() != 2 {
+                    return false;
+                }
+                devices.windows(2).all(|p| {
+                    let mut a: Vec<char> = p[0].all_text().concat().chars().collect();
+                    let mut b: Vec<char> = p[1].all_text().concat().chars().collect();
+                    a.sort_unstable();
+                    b.sort_unstable();
+                    a == b && p[0].derived_roster() == p[1].derived_roster()
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect content to have existed
+    /// while a device had still not been admitted.
+    ///
+    /// The anti-vacuity guard for `every_admitted_device_eventually_reads_every_file`,
+    /// and the one that decides whether this scenario differs from `Honest` at
+    /// all. It states the scenario's *premise* rather than one of its symptoms,
+    /// which matters: the obvious guard — some node reached a non-zero
+    /// `unreadable_chunks` — passes with the stagger switched off, because a
+    /// lossy partitioned transport strands chunks on its own. It is a true
+    /// statement that proves nothing about this plan. "The founder had written
+    /// before everyone was in" is false without the stagger, since a `Hello` sent
+    /// at t=0 is answered well before `FIRST_EDIT`, and true by construction
+    /// with it.
+    #[test]
+    fn content_exists_before_the_last_device_is_admitted() {
+        plan::<Onboarding>(vec![property::sometimes(
+            "the founder has written while a device is still outside the group",
+            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+                let written = w
+                    .nodes()
+                    .any(|n| n.has_joined() && !n.document_text().is_empty());
+                written && w.nodes().any(|n| !n.has_joined())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect the second device to have
+    /// been admitted as a *device* rather than as a person.
+    ///
+    /// The anti-vacuity guard for `both_of_a_users_devices_resolve_to_one_user`,
+    /// which is satisfied by a run in which the second device never joined at all
+    /// — and under a lossy transport that is a reachable run, not a hypothetical
+    /// one. More certified devices than certified people is the single
+    /// observation that says the `AddDevice` path was taken.
+    #[test]
+    fn a_second_device_really_is_admitted_as_a_device() {
+        plan::<Onboarding>(vec![property::sometimes(
+            "some node sees more certified devices than people",
+            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+                w.nodes()
+                    .any(|n| n.certified_device_count() > n.certified_users().len())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Reproducibility, as every other scenario asserts it.
+    #[test]
+    fn the_onboarding_run_is_reproducible() {
+        assert_deterministic(|| plan::<Onboarding>(Vec::new()), Seed(0x0B0A_2D17));
+    }
+}
+
+/// Removing one device of a person, who keeps working — user story 3, at the
+/// granularity the simulator could not previously express.
+///
+/// The core states this as `removing_one_device_leaves_the_users_other_devices_alone`
+/// in `workspace_state.rs`, over a bus of two peers and no adversary. It had no
+/// simulator counterpart for a structural reason rather than an oversight: with
+/// one device per person, removing a device and removing a person were the same
+/// operation, so nothing here could tell a correct implementation from one that
+/// retracted the whole user along with the leaf.
+///
+/// Node 2 is the removed device and node 1 is the same person's other device. The
+/// claims split cleanly by what a mistake would cost: the *person* must keep its
+/// role and its place on every roster — a role is a grant to a user, and a
+/// removal is a retraction of a leaf, so conflating them silently demotes
+/// somebody — while the *device* must lose everything a removed member loses.
+mod removing_one_device_leaves_the_user_working {
+    use std::time::Duration;
+
+    use iroh_beekem_sim::{
+        DeviceChurn, POST_REVOCATION_DOC, Role, WorkspaceNode, doc_key, member_bytes_of,
+    };
+    use propsim::prelude::*;
+
+    use super::{NODES, plan};
+
+    /// The removed device.
+    const REMOVED_DEVICE: u64 = 2;
+
+    /// The other device of the same person, which must survive untouched.
+    const SURVIVING_DEVICE: u64 = 1;
+
+    /// The nodes still in the group after the removal.
+    fn remaining<'a>(
+        w: &'a World<'a, WorkspaceNode<DeviceChurn>>,
+    ) -> Vec<&'a WorkspaceNode<DeviceChurn>> {
+        w.nodes()
+            .filter(|n| n.has_joined() && n.id() != REMOVED_DEVICE)
+            .collect()
+    }
+
+    /// The removed device, once it has joined.
+    fn victim<'a>(
+        w: &'a World<'a, WorkspaceNode<DeviceChurn>>,
+    ) -> Option<&'a WorkspaceNode<DeviceChurn>> {
+        w.nodes()
+            .find(|n| n.id() == REMOVED_DEVICE && n.has_joined())
+    }
+
+    /// In a group where a person holds two devices and one of them is removed,
+    /// upon any remaining node being asked at any instant, we expect that person
+    /// still to hold the role it was granted.
+    ///
+    /// The claim the whole scenario exists for. A removal that retracted the
+    /// *user* rather than the device would leave this person with no role at all,
+    /// and every one of that person's remaining devices mute — every peer's
+    /// `author_may_write` would refuse their entries, with nothing reporting why.
+    /// Asserted as `always` rather than eventually because a role is never
+    /// supposed to move here: nobody issued a grant, so no interleaving may
+    /// produce one.
+    #[test]
+    fn the_users_other_device_keeps_its_role() {
+        plan::<DeviceChurn>(vec![property::always(
+            "removing one device never costs the person its role",
+            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+                let user = member_bytes_of(SURVIVING_DEVICE);
+                remaining(w).iter().all(|n| {
+                    // `None` while the grant is still in flight, which is
+                    // ordinary during onboarding; what must never happen is the
+                    // role resolving to something *other* than what was granted.
+                    n.role_of(user).is_none_or(|role| role == Role::Editor)
+                })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group where one of a person's two devices is removed, upon the run
+    /// settling, we expect the person's other device still to be admitted by
+    /// everybody.
+    ///
+    /// The availability half. A roster derives from certified devices intersected
+    /// with current members, so a removal that retracted one device's binding too
+    /// broadly would evict the person's other device from every peer's roster and
+    /// cut it off from the group without anyone having removed it.
+    #[test]
+    fn the_users_other_device_stays_on_every_roster() {
+        plan::<DeviceChurn>(vec![property::eventually_within(
+            "the person's remaining device is on every remaining roster",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+                let staying = remaining(w);
+                staying.len() == NODES - 1
+                    && staying
+                        .iter()
+                        .all(|n| n.is_on_roster(NodeId(SURVIVING_DEVICE)))
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group that removed one device and then wrote, upon that device being
+    /// asked at any instant, we expect it never to see the entry.
+    ///
+    /// The confidentiality half, and the same claim `a_removed_member_stops_seeing`
+    /// makes about a removed *person*. It has to be restated at this granularity
+    /// because the mechanism differs: what locks the device out is the namespace
+    /// rotation the removal triggers, and a removal that retracted the leaf
+    /// without rotating would leave the device reading the replica through the
+    /// capability it already holds.
+    #[test]
+    fn the_removed_device_stops_seeing_entries_written_after_it_went() {
+        plan::<DeviceChurn>(vec![property::always(
+            "a removed device never sees an entry written after its removal",
+            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+                victim(w).is_none_or(|n| n.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In a group that removed one device, upon the run settling, we expect the
+    /// remaining devices to hold identical content.
+    ///
+    /// The counterweight that stops the three properties above being satisfied by
+    /// refusing more aggressively. A removal that broke the group's convergence,
+    /// or that stranded the surviving device on the abandoned replica, would
+    /// satisfy every "the victim sees nothing" claim perfectly.
+    #[test]
+    fn the_remaining_devices_still_converge() {
+        plan::<DeviceChurn>(vec![property::eventually_within(
+            "the devices that stay converge through the removal",
+            Duration::from_secs(20),
+            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+                let staying = remaining(w);
+                staying.len() == NODES - 1
+                    && staying.windows(2).all(|p| {
+                        let mut a: Vec<char> = p[0].all_text().concat().chars().collect();
+                        let mut b: Vec<char> = p[1].all_text().concat().chars().collect();
+                        a.sort_unstable();
+                        b.sort_unstable();
+                        a == b
+                    })
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// In this plan, upon the run finishing, we expect a device really to have
+    /// been enrolled onto an existing person and really to have been removed.
+    ///
+    /// The anti-vacuity guard. Every property above is satisfied by a run in
+    /// which node 2 joined as a third *person* and was removed as one — which is
+    /// exactly the implementation they exist to rule out, and which would look
+    /// identical from every angle except this one.
+    #[test]
+    fn a_device_really_is_enrolled_and_really_is_removed() {
+        plan::<DeviceChurn>(vec![property::sometimes(
+            "some node saw the person hold two devices",
+            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+                let user = member_bytes_of(SURVIVING_DEVICE);
+                w.nodes().any(|n| n.devices_of_user(&user) == 2)
+            },
+        )])
+        .run(deterministic());
+    }
+
+    /// Reproducibility, as every other scenario asserts it.
+    #[test]
+    fn the_device_churn_run_is_reproducible() {
+        assert_deterministic(|| plan::<DeviceChurn>(Vec::new()), Seed(0x0DEC_1CE5));
     }
 }

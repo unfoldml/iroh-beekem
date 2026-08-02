@@ -28,8 +28,16 @@ help:
 
 check: test lint fmt-check purity
 
+# One suite at a time, deliberately. `cargo test --workspace` builds one job
+# graph and runs the simulator and the real-QUIC suite *concurrently* — the exact
+# combination CLAUDE.md says never to run, because the QUIC tests wait on
+# wall-clock outcomes and the simulator saturates every core it is given. The
+# failures land in the QUIC suite, name assorted `eventually` waits, and look
+# nothing like their cause.
 test:
-	cargo test --workspace
+	cargo test -p iroh-beekem-core
+	cargo test -p iroh-beekem-sim
+	cargo test -p iroh-beekem
 
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings

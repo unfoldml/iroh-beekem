@@ -4,13 +4,19 @@
 
 The near-term goal is **a publishable 0.1 crate**.
 
-Phases 0–9 are closed: the crate metadata and CI, per-user roles over a multi-document facade, roster
+Phases 0–11 are closed: the crate metadata and CI, per-user roles over a multi-document facade, roster
 admission on every ALPN, removal-then-rotation with demand-driven repair, receiver-checked capability
-certificates, signed single-use invites, persistence and restart, M-of-N admin actions, and — now —
-publishing cost, blob collection and large binary assets.
+certificates, signed single-use invites, persistence and restart, M-of-N admin actions, publishing
+cost with blob collection and large binary assets, versioning with checkpoints and revert, and — now —
+the named gaps in the property suite.
 
-What remains is four named gaps in the property suite, listed under
-[What remains](#what-remains).
+Phase 11 is worth a sentence of its own because it changed the *system* and not only the tests. Two of
+the four gaps could not be stated as written until the simulator gained something it was missing: a
+receiver-side author check on arriving entries, which existed only in the facade, and any notion of a
+person owning more than one device. A third turned out to be mis-stated in a way that would have made
+it pass while asserting nothing. Those findings are recorded under
+[the gaps](#the-gaps-that-were-in-the-property-suite-and-what-closing-them-found); what is left is
+under [What remains open](#what-remains-open).
 
 This document records **what exists and why it is that way**. Where it and the code disagree on
 detail, the code wins. [docs/USER_STORIES.md](USER_STORIES.md) states what the project is *for* and
@@ -32,8 +38,8 @@ outranks both.
 | 7 | `snapshot.rs` with `CgkaSnapshot`/`WorkspaceSnapshot`; `WorkspaceState::export`/`import`; `Node::spawn_persistent` with a persisted endpoint key and nonce ledger; `Workspace::open`/`list`/`delete`; derived `iroh-docs` author from `author_seed`; roster registry keyed by tree id; a simulated disk and an authored wipe in `WorkspaceNode` | [snapshot.rs](../crates/iroh-beekem-core/src/snapshot.rs), [store.rs](../crates/iroh-beekem/src/store.rs), [roster.rs](../crates/iroh-beekem/src/roster.rs) |
 | 8 | `Event::Leave` and `Workspace::leave`; `Policy`/`AdminProposal`/`Approval` as tagged certificates; a founder-fixed threshold; `require_quorum` on the issuer **and** a quorum check in `CgkaController::authorize` on every receiver; `Event::ResyncCertificates`; `propose`/`approve`/`proposals`/`threshold`; `Departure` and `Quorum` scenarios | [capability.rs](../crates/iroh-beekem-core/src/capability.rs), [state.rs](../crates/iroh-beekem-core/src/state.rs) |
 | 9 | blob collection (`temp_tag` + the `iroh-docs` protect callback, `NodeOptions`); delta publishing (`Extent`, `published_up_to`, quiescent resync, `RepairTarget::DocumentHistory`); large assets (`asset.rs`, envelope encryption, blinded segment key spaces, `attach_file`/`export_asset`, lazy download policy, the pending-asset intent log); rotation re-indexes assets; `Msg::Segment` and range reconciliation in the simulator; `Assets`/`AssetChurn` scenarios | [asset.rs](../crates/iroh-beekem-core/src/asset.rs), [blinding.rs](../crates/iroh-beekem-core/src/blinding.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs), [node.rs](../crates/iroh-beekem/src/node.rs) |
-
 | 10 | versioning: `version.rs` with `UnixSeconds`/`VersionId`/`VersionInfo`/`Checkpoint`/`AssetVersion`; a supplied clock on `WorkspaceState::handle`; per-document `authors` claims and `set_change_merge_interval(-1)`; `document_versions`/`document_text_at`/`Event::RevertDocument`; digest-keyed checkpoints with `RestoreOutcome`; per-version asset key spaces with `attach_version`/`export_asset_version`/`revert_asset`; `WsOp::Revert` in the generated workload; parked chunks no longer cached as delivered | [version.rs](../crates/iroh-beekem-core/src/version.rs), [state.rs](../crates/iroh-beekem-core/src/state.rs), [manifest.rs](../crates/iroh-beekem-core/src/manifest.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs) |
+| 11 | the named suite gaps: multi-device enrolment (`Scenario::SECOND_DEVICE`, `Msg::Hello::as_device_of`, `Onboarding`/`DeviceChurn`); the receiver-side author check in the simulator's `on_entry` and a data-plane forger (`FORGED_DOC`, `ROGUE_AUTHOR`); `AssetAfterRemoval`; loss and fabrication over `World::history()` with `append_only_workload`; post-revocation manifest and role changes (`FILE_AFTER_REVOKE`, `PROMOTE_AFTER_REVOKE`); `ANNOUNCED_ONCE` shared by `resync` and `republish` | [sim/lib.rs](../crates/iroh-beekem-sim/src/lib.rs), [properties.rs](../crates/iroh-beekem-sim/tests/properties.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs) |
 
 The threat model — what is confidential and from whom, and what a member, a removed member and the
 holder of a leaked invite can each actually do — lives in [README.md](../README.md) under *Threat
@@ -75,6 +81,14 @@ settled; if a user story needs a different answer, change it.
   member on an abandoned replica, a peer missing from somebody's roster until the next membership
   change, or — worst — a quorum that formed on one node and nowhere else, leaving an action performed
   there and refused everywhere.
+
+  In `iroh-beekem` there are two such paths — the public `Workspace::resync` and the internal
+  `republish` a `NeighborUp` takes — and they had drifted: `republish` drove all three while `resync`
+  drove only the manifest and the namespace. The hole was reachable by a library caller and by no
+  in-tree test, since every one of them reaches anti-entropy through the other path. They now share
+  `ANNOUNCED_ONCE` ([workspace.rs](../crates/iroh-beekem/src/workspace.rs)), which makes that
+  divergence unrepresentable rather than merely fixed. The simulator's `republish` drives all three
+  and its periodic `Tick::Resync` covers certificates through `Msg::Log` on a sparser cadence.
 
 - **Content flows through Loro as CRDT updates**, so a chunk applies only when the CGKA can reach the
   PCS key it names *and* Loro has the operations it depends on — that second condition is what
@@ -428,11 +442,11 @@ converged text. Asserting an exact string would assert an implementation detail 
 
 | Capability | API | Status |
 |---|---|---|
-| Typed client operations and generated workloads | `WsOp`, `crud_workload`, `ClientCodec`, `WorkspaceSpec` | in use |
+| Typed client operations and generated workloads | `WsOp`, `crud_workload`, `append_only_workload`, `ClientCodec`, `WorkspaceSpec` | in use |
 | Swarm faults | `Faults::swarm().partitions().latency_ms(..).reorder()` | in use, with `Mode::Liveness` set **explicitly** — see below |
 | Scripted faults at a chosen instant | `Faults::scripted().at(t).partition(..) / .heal_all() / .crash(n) / .restart(n)` | in use in `an_offline_node_catches_up`, for both the partition and the crash/restart variants |
-| Completed op spans | `Ctx::complete_op` | in use ([sim/lib.rs](../crates/iroh-beekem-sim/src/lib.rs), `flush_deferred_ops`) |
-| Recorded history | `World::history()` | **unused** — see the gap list |
+| Completed op spans | `Ctx::complete_op` | in use ([sim/lib.rs](../crates/iroh-beekem-sim/src/lib.rs), `flush_deferred_ops`) — but **only under a `WORKLOAD` scenario**. A plan built without `.workload()` and `.client()` issues no client op and so records no history at all, which is every plan but the two in `generated_crud_workloads` |
+| Recorded history | `World::history()` | in use in `generated_crud_workloads`: `no_node_ever_holds_content_nobody_wrote` and `every_acknowledged_write_reaches_every_node` |
 | Reference model | `SequentialModel` | **deliberately unused.** A CRDT workspace is not linearizable — concurrent writes commute rather than serialising — so a linearizability oracle reports anomalies for correct behaviour. The reasoning is in the code beside `WorkspaceSpec`. |
 
 **Fault plans must set `Mode::Liveness` explicitly.** `Faults::swarm()` defaults to `Mode::Safety`,
@@ -475,16 +489,23 @@ One or more scenarios per user story, all in
 
 | Story | Scenarios | Property module |
 |---|---|---|
-| 1 — invitation | `Honest` | top level (`every_node_eventually_joins_the_group`, …) |
+| 1 — invitation | `Honest`, `Onboarding` | top level (`every_node_eventually_joins_the_group`, …), `devices_onboard_without_losing_content` |
 | 2 — reconciliation | `Honest` + `Faults::scripted` | `an_offline_node_catches_up` — ten properties across the partition and the crash/restart variants |
-| 3 — removal | `Eviction`, `Churn`, `Insider`, `Revenant`, `Departure`, `Quorum` | `a_removed_member_stops_seeing`, `concurrent_rotation_and_revocation`, `an_insider_cannot_exceed_its_role`, `a_removed_member_is_evicted_again`, `a_member_leaves_of_its_own_accord`, `an_action_needs_a_quorum` |
+| 3 — removal | `Eviction`, `Churn`, `Insider`, `Revenant`, `Departure`, `Quorum`, `DeviceChurn` | `a_removed_member_stops_seeing`, `concurrent_rotation_and_revocation`, `an_insider_cannot_exceed_its_role`, `a_removed_member_is_evicted_again`, `a_member_leaves_of_its_own_accord`, `an_action_needs_a_quorum`, `removing_one_device_leaves_the_user_working` |
 | 4 — outsiders | `Forging`, `Outsider`, `StolenInvite` | `a_forging_peer_is_rejected`, `an_outsider_observes_nothing`, `a_stolen_invite_buys_only_visibility` |
-| 4 — large assets | `Assets`, `AssetChurn` | `an_asset_reaches_every_member` |
-| workloads | `Crud`, `CrudChurn` | `generated_crud_workloads` — the generated stream now includes `WsOp::Revert`, so every convergence property covers reverting too |
+| 4 — large assets | `Assets`, `AssetChurn`, `AssetAfterRemoval` | `an_asset_reaches_every_member` |
+| workloads | `Crud`, `CrudChurn` | `generated_crud_workloads` — the generated stream includes `WsOp::Revert`, so every convergence property covers reverting too; and the history-based loss and fabrication properties live here, because this is the only module with a workload |
 
 Story 2 has no scenario type of its own by design: "offline" is `Honest` under a scripted fault, in two
 variants — **disconnected** (`partition` then `heal_all`) and **shut down** (`crash` then `restart`) —
 and a distinct type would carry no state the fault plan does not already supply.
+
+**Story 1 gained a scenario, and the reason is the shape of `Honest`.** There every node asks to join
+at t=0, so the group is complete before the first edit and no joiner ever meets content it cannot
+decrypt — the easy half of onboarding. `Onboarding` staggers admission so a joiner arrives *after*
+content exists, which is what the republish on admission and the demand-driven repair are for, and
+gives one person two devices so "all of one user's devices converge" has a referent at all. Anything
+else in this file is one device per person.
 
 Asserted in *every* scenario:
 
@@ -495,8 +516,13 @@ Asserted in *every* scenario:
 | Runs are reproducible for a fixed seed | — |
 | A node's own acknowledged writes are always in its own view | `always` |
 | Every node's `users()`/`devices()` and `index` converge after quiescence | `eventually_within` |
-| No node accepts an entry from an author with no writing role | `always` |
 | `no_role_or_binding_ever_moves_without_a_valid_chain` | `always` |
+
+**An entry from an author with no writing role is refused, and that is asserted in
+`a_forging_peer_is_rejected` rather than everywhere.** This row previously claimed the check held in
+every scenario; it held in none, because `on_entry` performed no author check at all — the predicate
+existed only in the facade's `ingest_all`. It is now modelled where production has it, and stated
+where an author with no role actually occurs.
 
 The last is cross-cutting deliberately, `Honest` included: an insider property asserted only in an
 insider scenario tells you nothing about whether the honest path quietly accepts uncertified state.
@@ -511,9 +537,28 @@ it constrains a member. The insider is Story 3's problem. When adding an adversa
 first which family it belongs to — putting an insider property in Story 4 is how it ends up written
 against the wrong scenario and passing vacuously.
 
+**Every module needs a `sometimes` guard, and the guard has to discriminate.** A property about an
+adversary being refused, a victim seeing nothing or a write surviving is satisfied by a run in which
+the thing never happened — and under a lossy transport with bounded budgets, that is a reachable run
+rather than a hypothetical one. The test of a guard is mechanical and worth doing: **switch off the
+scenario constant it depends on and confirm the guard fails.** Two of the guards written for phase 11
+did not survive that check first time. One asserted a symptom (`unreadable_chunks` grew) that a lossy
+network produces on its own, and passed with the feature disabled; it was replaced by one stating the
+scenario's premise. Prefer the premise — it is what the plan is *for*, and a symptom the harness can
+manufacture by other means proves nothing.
+
+Three modules had no guard at all until phase 11, and the outsider's is the one worth understanding.
+"An unadmitted node observes nothing" is satisfied by a run in which the network never offered it
+anything — and because admission is checked *before* a message is recorded, every counter on that node
+reads zero in that case too, exactly as it does when the roster is working. No existing observable
+could tell the two apart, which is why `refused_messages` exists: a count of what was *turned away* is
+the only evidence that there was anything to turn away. `an_insider_cannot_exceed_its_role` and
+`concurrent_rotation_and_revocation` gained the same treatment through `overreaches_made` and a shrunk
+`current_member_count`.
+
 ---
 
-## What remains
+## Where the suite stands
 
 ### Versioning, and where it is tested
 
@@ -538,49 +583,95 @@ The rest sits where it can be stated exactly:
 | It all works over real QUIC, including exporting a superseded version | `versions_travel_over_the_wire` in [two_node.rs](../crates/iroh-beekem/tests/two_node.rs) |
 | A peer that missed the base of a delta still catches up | same — the regression for the `seen_entries` gap |
 
-### Gaps in the property suite
+### The gaps that were in the property suite, and what closing them found
 
-Four concrete additions, each named with the module it belongs in:
+All four are closed, along with the asset-confidentiality case and the device-removal counterpart.
+Three of them could not be written as originally stated, and *why* is worth more than the properties
+themselves — each was mis-stated in a way that would have produced a passing test asserting nothing.
 
-1. **No `Onboarding` scenario.** Nothing exercises staggered admission with several devices per user. Add
-   one beside `Honest` in [sim/lib.rs](../crates/iroh-beekem-sim/src/lib.rs), with properties asserting:
-   every admitted device eventually reads the same content as the founder for **every** file; a joiner
-   never reads content written before its own `Add` unless republished afterwards; all of one user's
-   devices converge on the same view. The first of those is what protects the Phase 1 republish
-   cooldown — throttled too hard, onboarding breaks silently and nothing currently states it as a
-   property.
-2. **No history-based loss property.** `Ctx::complete_op` is called but `World::history()` never is, so
-   "no acknowledged write is lost" is asserted over converged text rather than over recorded op spans.
-   Add one property over the recorded history in `an_offline_node_catches_up`.
-3. **A removed victim's manifest is unconstrained.** `a_removed_member_stops_seeing` asserts the victim
-   sees no *entry* written after its removal, but nothing asserts it sees no *manifest* update — no new
-   file names, no role changes. That is "or workspace changes" in Story 3. Add it to that module.
-4. **A forger's index entries are unconstrained at simulator level.** `a_forging_peer_is_rejected`
-   covers membership, convergence and queue bounds; nothing asserts a forging node's entries never enter
-   an honest node's index. (`an_unadmitted_node_never_observes_an_index_entry` is the converse property
-   and does not cover it.)
+1. **`Onboarding`.** Closed by `Onboarding` and `devices_onboard_without_losing_content`. Multi-device
+   needed real machinery: the simulator was one device per person by construction, so `Event::AddDevice`
+   appeared nowhere. `Msg::Hello` now carries `as_device_of`, and the **primary** device answers it
+   rather than the founder — `may_bind_device_to` admits both, and the non-admin disjunct ("enrolling
+   your own laptop is not an administrative act") is the one nothing else exercises.
 
-Also outstanding from phase 9 itself:
+   The anti-vacuity guard is worth copying. The obvious one — some node reached a non-zero
+   `unreadable_chunks` — passes with the stagger *switched off*, because a lossy partitioned transport
+   strands chunks by itself. It is a true statement that proves nothing about the plan. The guard that
+   works states the premise: the founder had written while a device was still outside the group, which
+   is false without the stagger and true by construction with it.
+2. **History-based loss.** Closed by `no_node_ever_holds_content_nobody_wrote` and
+   `every_acknowledged_write_reaches_every_node` — in `generated_crud_workloads`, **not** in
+   `an_offline_node_catches_up` as this document used to say. That module builds its plans with
+   `scripted_plan`, which supplies neither `.workload()` nor `.client()`, so no client op is ever
+   issued and `World::history()` is empty: the property would have passed while reading nothing.
+
+   Loss also needs a monotone workload to be *definable*. Under `crud_workload` a `write`, `remove` or
+   `revert` may legitimately delete an acknowledged append, so "every acknowledged write survives" is
+   false — and every weakening that becomes true is vacuous, since with three documents and a
+   destructive op drawn one time in three, every document sees one. Hence `append_only_workload`, and
+   hence the loss bound stated there while the fabrication bound stays on the full workload, where it
+   is total.
+3. **The removed victim's manifest.** Closed by `the_victim_never_sees_a_file_created_after_its_removal`
+   — but the "no role changes" half of the original wording was wrong twice over. Roles left the
+   manifest in phase 5, so it was never a manifest claim; and the victim **does** still learn of a
+   promotion made after its removal. A certificate travels on the control plane, which has no namespace
+   to rotate, and what should stop the victim receiving one is eviction — which is an availability
+   boundary, not a confidentiality one. The victim keeps its inviter on the bootstrap exception and
+   certificate admission is monotone by design.
+
+   `a_removed_device_still_learns_of_later_membership_changes` records that inverted, exactly as this
+   module's visibility properties once were, so the line cannot move without a test noticing. Closing it
+   means expiring the bootstrap exception — which exists because a joiner must accept its inviter
+   *before* it has state to derive a roster from.
+4. **The forger's index entries.** Closed by `no_honest_node_ever_accepts_a_forged_entry`, and this one
+   needed two fixes. The simulator applied **no author check at all** — `author_may_write` existed only
+   in the facade — so the harness was strictly weaker than production on the one plane an attacker
+   reaches without holding a key. And the forger had no data plane: `forge()` broadcast only a
+   control-plane `Msg::Op`, while `FORGE` applies to legitimate members whose entries *should* be
+   indexed.
+
+   "Never enters the index" is also the wrong claim, and this document said it. A forging node is a
+   member: it holds the namespace write capability, so its entry really does reconcile into every
+   peer's replica whatever author id it writes under, and nothing can stop it *arriving*. What stops it
+   counting is the receiver's author check. The forgery re-announces ciphertext the group can genuinely
+   decrypt, so that check is the only thing refusing it — sealing under a rogue key would have
+   decryption refuse it anyway and the property could not tell a working check from a missing one.
+
+Also closed: the asset-confidentiality case (`AssetAfterRemoval`, attaching after the revocation rather
+than before) and the device-removal counterpart (`DeviceChurn`, the simulator counterpart of the core's
+`removing_one_device_leaves_the_users_other_devices_alone`).
+
+Closing the asset case turned up a latent defect in `holds_asset_key`, which is the shape to watch for:
+it asked under `asset_key_key(ASSET)` while the key is sealed under `ASSET_V1`, so it returned `false`
+for every node at every instant. Harmless for as long as no property called it — and a confidentiality
+property built on it would have passed while asserting nothing. **An accessor no property calls is not
+covered by anything.**
+
+### What remains open
 
 * **Abandoned namespaces are never dropped**, so blob collection does not reach anything indexed only
   in one. Closing it needs a policy for when an old replica is safe to drop — peers may still be
   catching up on it — and until then a workspace's floor is set by how often it rotates.
-* **No property asserts that a member removed *before* an asset was attached cannot read it.**
-  `AssetChurn` removes after the attachment, which is the right shape for "a removal must not cost the
-  survivors their asset" and the wrong one for the confidentiality claim. The missing scenario attaches
-  *after* the revocation, and belongs beside the two that exist.
+* **A removed member still sees membership changes.** Recorded above and pinned by
+  `a_removed_device_still_learns_of_later_membership_changes`. It is the bootstrap exception, not a
+  missing check, and README *Current trade-offs* already carries eviction as an availability boundary.
 
-Also outstanding: removing one device of a user is asserted only in the core
-(`removing_one_device_leaves_the_users_other_devices_alone` in
-[workspace_state.rs](../crates/iroh-beekem-core/tests/workspace_state.rs)) and has no simulator
-counterpart showing the user's remaining devices stay fully functional under an adversarial network.
+* **The real-QUIC suite is wall-clock sensitive, and phase 11 removed three of the reasons it was.**
+  Every test node now spawns with `Relay::Disabled` (`test_node` in
+  [two_node.rs](../crates/iroh-beekem/tests/two_node.rs)), a restart is handed both addresses rather
+  than waiting on address lookup, and the three tests running three endpoints ask for two worker
+  threads instead of the current-thread runtime `#[tokio::test]` gives. Measured at cargo's default
+  parallelism on eight cores: **21 of 38 timed out before, 0 of 39 after.** What remains is that the
+  suite must not run *alongside* the simulator — `make test` runs the three in sequence, and
+  `cargo test --workspace` (which does not) should not be used.
 
 ### Smaller items
 
 - **Decide the seed budget now that faults are in play.** Consider propsim's `rigorous()` preset
-  nightly while keeping `deterministic()` for the fast path.
-- **The README's *Verification* block omits two things CI runs**: the MSRV matrix
-  (`iroh-beekem-core` @ 1.90, `iroh-beekem` @ 1.91) and `cargo run -p iroh-beekem --example two_node`.
+  nightly while keeping `deterministic()` for the fast path. More pressing now than it was: phase 11
+  added three scenarios and an extra plan, and the suite's runtime is the constraint on raising
+  `SEEDS`.
 
 ---
 
@@ -629,6 +720,11 @@ none can move into it:
    ([assets.rs](../crates/iroh-beekem/tests/assets.rs)) — the download policy and the on-demand fetch
    are `iroh-docs`/`iroh-blobs` mechanisms, and the blob count after a rotation is the only direct
    evidence that re-indexing happened rather than re-encryption.
+5. `a_public_resync_re_announces_the_certificates` — the simulator drives anti-entropy through its own
+   `republish`, so the *facade's* public entry point is a path only this can reach. It asserts the
+   composition, not the recovery: making a peer genuinely miss a gossip message needs fault injection,
+   which two real endpoints do not have, and the lossy case is `an_action_needs_a_quorum` in the
+   property suite.
 
 The example at [two_node.rs](../crates/iroh-beekem/examples/two_node.rs) is the readable proof the CRUD
 API is usable; keep it that way as the API grows.

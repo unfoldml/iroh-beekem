@@ -310,6 +310,39 @@ const REPUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// stall this mechanism exists to break.
 const REPAIR_COOLDOWN: Duration = Duration::from_secs(2);
 
+/// The three things broadcast exactly once, with no later write behind them.
+///
+/// A document has anti-entropy for free: the next edit carries whatever the last
+/// one lost. These do not. A rotation is announced once, the manifest is
+/// published only when it changes, and a certificate is broadcast when it is
+/// minted — so each needs a deliberate re-announcement, and dropping any one has
+/// its own distinct cost:
+///
+/// * the namespace — a member stranded on a replica the group abandoned, removed
+///   in effect without anyone having removed it;
+/// * the manifest — a peer missing from somebody's roster until the next
+///   membership change happens to republish it, since the roster derives from
+///   device records and those live in the manifest;
+/// * the certificates — worst of the three, because a lost approval leaves a
+///   quorum that formed on one node and nowhere else: an action performed there
+///   and refused everywhere. A role change is worse still, since it mints a
+///   grant and no operation at all, which makes this its *only* anti-entropy.
+///
+/// # Why this is one list and not two
+///
+/// There are two paths that must drive all of it — the public
+/// [`Workspace::resync`] and the internal `republish` a `NeighborUp` takes — and
+/// they had drifted: `republish` drove all three while `resync` drove only the
+/// first two, so the quorum hole above was reachable by any library caller and
+/// by none of the in-tree tests, which all go through the other path. Sharing the
+/// list makes that particular divergence unrepresentable rather than merely
+/// fixed.
+const ANNOUNCED_ONCE: [Event; 3] = [
+    Event::ResyncManifest,
+    Event::ResyncNamespace,
+    Event::ResyncCertificates,
+];
+
 /// Rate limiter keyed on whatever distinguishes one occasion from the next.
 ///
 /// Takes `now` as an argument rather than reading the clock, which is what
@@ -1007,10 +1040,22 @@ impl Workspace {
 
     /// Begin syncing the index with a peer.
     ///
+    /// Takes anything that names a peer, which in practice is one of two things
+    /// and the difference is what it costs. An [`EndpointId`] is a public key and
+    /// nothing else, so reaching it means resolving an address first — that is
+    /// what address lookup is for, and it is what the roster path uses, since a
+    /// manifest records ids and a restarted node has nothing else. An
+    /// [`EndpointAddr`] already carries the paths to the peer, so it dials
+    /// straight away.
+    ///
+    /// Prefer the address when one is at hand. Resolution is a network round trip
+    /// to a discovery service that a caller holding an address has no reason to
+    /// pay for, and it is a dependency on that service being reachable.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkspaceError::Storage`] if the sync cannot be started.
-    pub async fn sync_with(&self, peer: EndpointId) -> Result<(), WorkspaceError> {
+    pub async fn sync_with(&self, peer: impl Into<EndpointAddr>) -> Result<(), WorkspaceError> {
         doc(&self.inner)
             .await
             .start_sync(vec![peer.into()])
@@ -2038,16 +2083,10 @@ impl Workspace {
         for doc in self.files().await.into_iter().map(|f| f.uuid) {
             self.drive(Event::Resync { doc }).await?;
         }
-        // The manifest is published only when it changes, so unlike a document
-        // it has no later write to carry lost content. Device records live
-        // there and the roster derives from them, which makes a lost manifest
-        // chunk cost a peer its place on somebody's roster until the next
-        // membership change happens to republish it.
-        self.drive(Event::ResyncManifest).await?;
-        // And the rotation, for the same reason one step further out: a
-        // rotation is announced once, so a member that missed it goes on
-        // syncing a replica the group has abandoned.
-        self.drive(Event::ResyncNamespace).await
+        for event in ANNOUNCED_ONCE {
+            self.drive(event).await?;
+        }
+        Ok(())
     }
 
     /// Chunks parked awaiting key material or CRDT dependencies.
@@ -2477,14 +2516,9 @@ async fn republish(inner: &Arc<Inner>) {
         };
         apply_effects(inner, effects).await;
     }
-    // See `Workspace::resync`: the manifest needs re-announcing too, and this
-    // is the path a neighbour appearing takes, which is exactly when a peer is
-    // most likely to be missing it.
-    for event in [
-        Event::ResyncManifest,
-        Event::ResyncNamespace,
-        Event::ResyncCertificates,
-    ] {
+    // See `ANNOUNCED_ONCE`: this is the path a neighbour appearing takes, which
+    // is exactly when a peer is most likely to be missing one of them.
+    for event in ANNOUNCED_ONCE {
         let effects = {
             let mut state = inner.state.lock().await;
             state

@@ -37,19 +37,20 @@ use beekem::{
     id::{MemberId, TreeId},
     operation::CgkaOperation,
 };
-// Re-exported rather than merely used: a property asserting "this member holds
-// exactly the role it was granted" needs to name a role, and making the test
-// depend on `iroh-beekem-core` directly for one enum would obscure that the
-// simulator is the thing under test.
-pub use iroh_beekem_core::Role;
 use iroh_beekem_core::{
-    AdminAction, AssetMeta, AuthorizedOp, Certificate, CgkaController, Chunk, DocumentUuid, Effect,
-    EpochId, Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey,
-    UnixSeconds, WorkspaceSecret, WorkspaceState,
+    AdminAction, AssetMeta, AuthorizedOp, Certificate, CgkaController, Chunk, Effect, EpochId,
+    Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey, UnixSeconds,
+    WorkspaceSecret, WorkspaceState,
     asset::{ContentDigest, open_segment, seal_segment},
     state::AssetKeyVerdict,
     version::AssetVersion,
 };
+// Re-exported rather than merely used: a property asserting "this member holds
+// exactly the role it was granted" needs to name a role, and a property that
+// iterates [`DOCS`] to assert convergence *per document* needs to name a
+// document. Making the test depend on `iroh-beekem-core` directly for either
+// would obscure that the simulator is the thing under test.
+pub use iroh_beekem_core::{DocumentUuid, Role};
 use keyhive_crypto::{
     share_key::{ShareKey, ShareSecretKey},
     signed::Signed,
@@ -117,11 +118,40 @@ pub fn asset_plaintext() -> Vec<u8> {
 /// do with the removal.
 const ATTACH_AT: Duration = Duration::from_millis(900);
 
+/// When the founder attaches its asset under [`Scenario::ATTACH_AFTER_REVOKE`].
+///
+/// After [`REVOKE_AT`] and after [`WRITE_AFTER_REVOKE_AT`], so the attachment is
+/// unambiguously later than the removal *and* later than the rotation the
+/// removal triggers. The two orderings answer different questions and neither
+/// substitutes for the other: attaching first asks whether a removal costs the
+/// survivors an asset they already had, attaching afterwards asks whether the
+/// removed device can reach one it was never meant to see.
+const ATTACH_LATE_AT: Duration = Duration::from_millis(7500);
+
 /// The document the timer-driven scenarios edit.
 pub const DOC: DocumentUuid = DOCS[0];
 
 /// Which node founds the workspace.
 const FOUNDER: u64 = 0;
+
+/// The document a forger announces entries under, and which nobody else writes.
+///
+/// Chosen so the property has a clean referent: no honest node in the `Forging`
+/// scenario ever writes here — the timer-driven edits all go to [`DOC`] — so the
+/// document's content on an honest node is a pure function of what it accepted
+/// from the forger. "The forgery was refused" is then literally "that document
+/// is still empty", with no need to subtract legitimate writes from it.
+pub const FORGED_DOC: DocumentUuid = DOCS[1];
+
+/// The author id a forged index entry claims.
+///
+/// Outside the cluster deliberately. Key material is a pure function of the node
+/// id, so this names a well-formed member key — one that no `Add` ever
+/// introduced, that no binding attributes to a person, and that no grant gives a
+/// role. It is refused by the capability closure rather than by being malformed,
+/// which is the case worth testing: a receiver that checked well-formedness
+/// instead of authority would accept it.
+pub const ROGUE_AUTHOR: u64 = u64::MAX;
 
 /// How long after start a node makes its first edit, leaving time to onboard.
 const FIRST_EDIT: Duration = Duration::from_millis(300);
@@ -134,6 +164,18 @@ const EDITS_PER_NODE: u32 = 2;
 
 /// How often an unjoined node retries its `Hello`.
 const JOIN_RETRY: Duration = Duration::from_millis(100);
+
+/// How far apart staggered joiners announce themselves, per node id.
+///
+/// Chosen against [`FIRST_EDIT`] and [`EDIT_INTERVAL`] rather than freely: node
+/// *n* asks to join at `n * JOIN_STAGGER`, so at 400ms the last of three nodes
+/// arrives at 800ms, by which time the founder has already made both of its
+/// edits. That is the point of the scenario — a joiner that arrives after
+/// content exists can never derive the epoch that content was keyed under, and
+/// only the republish on admission and the demand-driven repair get it there.
+/// Much smaller and everyone is admitted before the first edit, which is the
+/// case every other scenario already covers.
+const JOIN_STAGGER: Duration = Duration::from_millis(400);
 
 /// How often a joined node re-announces its document state.
 ///
@@ -231,6 +273,15 @@ pub const POST_REVOCATION_DOC: DocumentUuid = DOCS[2];
 /// adopted; otherwise the property would be testing a race rather than the
 /// eviction.
 const WRITE_AFTER_REVOKE_AT: Duration = Duration::from_secs(6);
+
+/// The logical path the founder creates after the revocation.
+///
+/// A file the victim must never learn the existence of. Distinct from the entry
+/// under [`POST_REVOCATION_DOC`] in what withholds it: an entry is withheld by
+/// the victim holding no capability for the new replica, while a *name* is
+/// withheld one layer up, because the manifest that records it is republished
+/// into that same replica.
+pub const POST_REVOCATION_PATH: &str = "/created-after-the-removal.txt";
 
 /// When the departing member of a `Departure` run walks away.
 ///
@@ -385,12 +436,122 @@ pub trait Scenario: Clone + Default + 'static {
     /// no action could ever collect two approvals, and every property about a
     /// quorum being *reached* would be vacuous rather than false.
     const CO_ADMIN: Option<u64> = None;
+
+    /// A `(device, primary)` pair of nodes that are two devices of one *person*.
+    ///
+    /// Every other scenario is one device per person, which is why nothing until
+    /// now drove [`Event::AddDevice`] at all: a `Hello` admitted a new user, so
+    /// "a user's other devices" had no referent and the core's
+    /// `removing_one_device_leaves_the_users_other_devices_alone` had no
+    /// simulator counterpart.
+    ///
+    /// The **primary** enrols the device, not the founder, and the choice is not
+    /// arbitrary. `CapabilityStore::may_bind_device_to` admits two issuers — the
+    /// user itself, or an administrator — and only the first is otherwise
+    /// unexercised here. It is also the honest story: enrolling your own laptop
+    /// is not an administrative act, which is exactly why that disjunct exists.
+    /// The third-party case is already modelled, as an attack, by `overreach`.
+    const SECOND_DEVICE: Option<(u64, u64)> = None;
+
+    /// Whether the founder creates a *file* after the revocation, not just text.
+    ///
+    /// Separate from [`Self::WRITE_AFTER_REVOKE`] rather than folded into it, and
+    /// separate from [`Self::PROMOTE_AFTER_REVOKE`] for the same reason: three
+    /// scenarios set the write flag, and giving all of them a manifest change
+    /// would alter what those scenarios test rather than adding to it.
+    ///
+    /// A file name is a manifest change, and a manifest change is a different
+    /// thing to withhold from a removed member than an entry is. "So they can no
+    /// longer read documents, document updates **or workspace changes**" is the
+    /// user story; the third clause is this one, and until now nothing asserted
+    /// it — every property about the victim looked at one document key.
+    const FILE_AFTER_REVOKE: bool = false;
+
+    /// A node the founder promotes to admin *after* the revocation, if any.
+    ///
+    /// The other half of "workspace changes", and deliberately not a manifest
+    /// claim: roles left the manifest in phase 5 and live in the capability
+    /// closure, so what a removed member must not learn is a *certificate*, which
+    /// travels on the control plane rather than in the replica. The two halves
+    /// are withheld by different mechanisms and so must be asserted separately —
+    /// the file by the namespace rotation, the grant by the eviction that stops
+    /// the victim receiving broadcasts at all.
+    ///
+    /// Gated on its own constant because a promotion would break
+    /// `a_splice_never_confers_authority_the_splicer_lacked` and
+    /// `no_node_ever_sees_more_administrators_than_were_granted`, which assert
+    /// exactly one administrator in the scenarios that share the write flag.
+    const PROMOTE_AFTER_REVOKE: Option<u64> = None;
+
+    /// Whether the asset is attached *after* the revocation rather than before.
+    ///
+    /// The two orderings are not variations on one scenario, they are two
+    /// different claims. Attaching before a removal asks whether the removal
+    /// costs the survivors an attachment they already held — the availability
+    /// question, which `AssetChurn` covers. Attaching afterwards asks whether the
+    /// removed device can obtain one published after it was gone — the
+    /// confidentiality question, which nothing covered, because a victim that
+    /// legitimately read the asset before its removal is *expected* to still hold
+    /// the plaintext afterwards. Forward secrecy is a claim about what comes
+    /// next, so only this ordering can state it.
+    const ATTACH_AFTER_REVOKE: bool = false;
+
+    /// Whether joiners announce themselves spread out over time rather than at
+    /// once.
+    ///
+    /// Every other scenario has every node send its `Hello` at t=0, so the group
+    /// forms before the first edit and nothing is ever written that a peer cannot
+    /// decrypt. That is the *easy* half of onboarding. Staggering makes a joiner
+    /// arrive after content exists, which is the case the republish on
+    /// [`WorkspaceNode::on_hello`] and the demand-driven repair exist to serve —
+    /// and the case a republish cooldown tuned too aggressively would break
+    /// silently.
+    const STAGGER_JOIN: bool = false;
 }
 
 /// The base protocol: joins, edits and anti-entropy, nothing adversarial.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Honest;
 impl Scenario for Honest {}
+
+/// Staggered admission, with one person holding two devices.
+///
+/// User story 1, in the shape [`Honest`] deliberately avoids. There, every node
+/// asks to join at t=0, so the group is complete before the first edit and no
+/// joiner ever meets content it cannot decrypt. Here node 1 arrives at 400ms and
+/// node 2 at 800ms, after the founder has finished writing — so admission has to
+/// carry content to them, and the only things that can are the republish
+/// `on_hello` performs and the demand-driven repair behind it.
+///
+/// Node 2 is a second device of node 1's person rather than a third person. Both
+/// halves matter and they fail differently: the stagger is what makes a joiner
+/// arrive late, and the shared user is what makes "all of one user's devices
+/// converge" a claim with a referent.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Onboarding;
+impl Scenario for Onboarding {
+    const SECOND_DEVICE: Option<(u64, u64)> = Some((2, 1));
+    const STAGGER_JOIN: bool = true;
+}
+
+/// One device of a two-device person is removed, and the person stays.
+///
+/// The simulator counterpart of the core's
+/// `removing_one_device_leaves_the_users_other_devices_alone`, which until now
+/// had none: with one device per person, removing a device and removing a person
+/// were the same operation, so nothing could tell a correct implementation from
+/// one that retracted the whole user.
+///
+/// Node 2 is the removed device, so node 1 — the same person — must keep its
+/// role, its place on every roster and its content, under a network that is
+/// partitioning and reordering throughout.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DeviceChurn;
+impl Scenario for DeviceChurn {
+    const SECOND_DEVICE: Option<(u64, u64)> = Some((2, 1));
+    const REVOKE: Option<u64> = Some(2);
+    const WRITE_AFTER_REVOKE: bool = true;
+}
 
 /// The founder attaches a binary asset that every member must be able to read.
 ///
@@ -402,6 +563,26 @@ impl Scenario for Honest {}
 pub struct Assets;
 impl Scenario for Assets {
     const ATTACH_ASSET: bool = true;
+}
+
+/// An asset attached *after* a member is removed, which that member must never
+/// be able to read.
+///
+/// The confidentiality counterpart of [`AssetChurn`], and the ordering is the
+/// entire difference. A member removed *after* an attachment read the asset
+/// while it was entitled to, and is expected to still hold the plaintext — so
+/// that scenario can say nothing about confidentiality without asserting
+/// something false. Forward secrecy is a claim about what happens *next*, and
+/// only an attachment that comes next can state it.
+///
+/// What must hold: the victim never obtains the content key, so it never
+/// reassembles the asset, while the members that stayed do both.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AssetAfterRemoval;
+impl Scenario for AssetAfterRemoval {
+    const ATTACH_ASSET: bool = true;
+    const ATTACH_AFTER_REVOKE: bool = true;
+    const REVOKE: Option<u64> = Some(2);
 }
 
 /// An asset attached before a member is removed, so the removal must not cost
@@ -440,6 +621,12 @@ impl Scenario for Eviction {
     const ROTATE: bool = true;
     const REVOKE: Option<u64> = Some(2);
     const WRITE_AFTER_REVOKE: bool = true;
+    // The other two thirds of "documents, document updates or workspace
+    // changes". Only this scenario sets them: `Revenant` and `StolenInvite` share
+    // the write flag and assert exactly one administrator, which a promotion
+    // would falsify.
+    const FILE_AFTER_REVOKE: bool = true;
+    const PROMOTE_AFTER_REVOKE: Option<u64> = Some(1);
 }
 
 /// A node that never asks to join, sitting on the network and listening.
@@ -569,6 +756,19 @@ pub enum Msg {
         member: MemberId,
         /// The joiner's published leaf key.
         share_key: ShareKey,
+        /// The user this joiner is a further device of, if it is one.
+        ///
+        /// Declared by the *joiner* rather than decided by the admitter, and
+        /// that is what production does too: an invite is minted for a named
+        /// device of a named user, so by the time anybody answers, which of the
+        /// two this is has already been settled. `None` means "admit me as a new
+        /// person", which is every scenario but the two that set
+        /// [`Scenario::SECOND_DEVICE`].
+        ///
+        /// Naming the user rather than the enrolling node is deliberate: the
+        /// answer has to be checkable against the capability closure, and the
+        /// closure knows users and devices, not simulator ids.
+        as_device_of: Option<MemberId>,
     },
     /// The founder admits a joiner and ships the state needed to reconstruct
     /// the group.
@@ -896,8 +1096,26 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     resyncs_done: u32,
     rotations_done: u32,
     forgeries_made: u32,
+    /// The most recent document chunk this node published, kept for the forger.
+    ///
+    /// A data-plane forgery needs ciphertext the group can actually *read*, or
+    /// the property it feeds is vacuous: an unreadable chunk is refused by
+    /// decryption whether or not the author check exists, so it cannot tell the
+    /// two apart. A chunk this node published itself is readable by every member
+    /// by construction, which makes re-announcing it under an author nobody
+    /// certified the sharpest available test of that check — everything about the
+    /// entry is valid except who claims to have written it.
+    last_published: Option<Chunk>,
     /// How many times this node has acted beyond its role.
     overreaches_made: u32,
+    /// Messages this node refused because the sender was on no roster of its.
+    ///
+    /// The anti-vacuity observable for every "an unadmitted node observes
+    /// nothing" property. Those are all satisfied by a run in which the network
+    /// never offered the outsider anything at all — and since admission is
+    /// checked *before* the message is recorded, no other counter can tell that
+    /// case apart from a working roster.
+    refused_messages: u64,
     /// This node's own id, recorded at start so properties can identify it.
     me: u64,
     /// Text this node has contributed locally, for convergence assertions.
@@ -1510,6 +1728,89 @@ impl<S: Scenario> WorkspaceNode<S> {
         out
     }
 
+    /// Every logical path this node can read out of the manifest, sorted.
+    ///
+    /// The manifest half of "a removed member sees no workspace changes". A
+    /// document entry and a manifest entry fail differently: an entry the victim
+    /// cannot see is denied by the namespace rotation, while a *file name* is
+    /// denied by the same rotation one layer up — the manifest is republished
+    /// into the new replica and the victim never receives that chunk. Nothing
+    /// asserted the second until this existed, so `a_removed_member_stops_seeing`
+    /// constrained the content of the workspace and not its shape.
+    ///
+    /// Sorted so two nodes holding the same manifest produce identical vectors
+    /// and a convergence property can compare them directly.
+    #[must_use]
+    pub fn manifest_paths(&self) -> Vec<String> {
+        let Some(state) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = state
+            .manifest()
+            .files()
+            .into_iter()
+            .map(|file| file.logical_path)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// The user this device acts for, per this node's own capability closure.
+    ///
+    /// `None` until a binding for this device has been admitted, which includes
+    /// the whole window between sending a `Hello` and replaying the `Welcome`
+    /// that answers it. A property comparing two devices of one user must
+    /// therefore skip `None` rather than treat it as a disagreement, or it
+    /// reports a failure for every run where the deadline lands mid-enrolment.
+    #[must_use]
+    pub fn user_of_this_device(&self) -> Option<[u8; 32]> {
+        let state = self.state.as_ref()?;
+        state.capabilities().user_of(&state.member_id().to_bytes())
+    }
+
+    /// How many certified devices this node attributes to `user`.
+    ///
+    /// The observable that separates "a second device was enrolled" from "a
+    /// second user was admitted". [`Self::certified_users`] cannot tell them
+    /// apart on its own: an enrolment that wrongly minted a fresh user would
+    /// leave the device count right and this count wrong.
+    #[must_use]
+    pub fn devices_of_user(&self, user: &[u8; 32]) -> usize {
+        self.state
+            .as_ref()
+            .map_or(0, |state| state.devices_of(user).len())
+    }
+
+    /// How many messages this node refused for want of a roster entry.
+    ///
+    /// Counts arrivals the admission check turned away, so a non-zero value means
+    /// the network really did offer this node traffic it declined — which is what
+    /// separates "the roster works" from "nothing was ever sent".
+    #[must_use]
+    pub fn refused_messages(&self) -> u64 {
+        self.refused_messages
+    }
+
+    /// How many times this node has acted beyond the role it was granted.
+    ///
+    /// Exposed for anti-vacuity: every property about an insider being refused is
+    /// satisfied by a run in which it never tried.
+    #[must_use]
+    pub fn overreaches_made(&self) -> u32 {
+        self.overreaches_made
+    }
+
+    /// How many forgeries this node has broadcast.
+    ///
+    /// Exposed for anti-vacuity only. Every property about a forger being refused
+    /// is satisfied by a run in which no forgery was ever sent, and under a
+    /// lossy transport with a bounded forgery budget that is a reachable run
+    /// rather than a hypothetical one.
+    #[must_use]
+    pub fn forgeries_made(&self) -> u32 {
+        self.forgeries_made
+    }
+
     /// This node's own member id, as raw bytes.
     ///
     /// Zero before the node has joined, which no property should be reading.
@@ -1559,7 +1860,13 @@ impl<S: Scenario> WorkspaceNode<S> {
         out
     }
 
-    /// Announce this node's leaf key so the founder can admit it.
+    /// Announce this node's leaf key so it can be admitted.
+    ///
+    /// Broadcast rather than sent to the founder, because who answers depends on
+    /// what is being asked: a new person is admitted by the founder, a further
+    /// device by the person it belongs to. [`Self::enrolling_user`] decides which
+    /// question this is, and `on_hello` decides whether the receiver is the one
+    /// being asked.
     fn send_hello(&self, cx: &mut dyn Ctx<Self>) {
         let (Some(signer), Some(share_secret)) = (self.signer.as_ref(), self.share_secret) else {
             return;
@@ -1567,7 +1874,37 @@ impl<S: Scenario> WorkspaceNode<S> {
         cx.broadcast(Msg::Hello {
             member: MemberId::from(signer.verifying_key()),
             share_key: share_secret.share_key(),
+            as_device_of: self.enrolling_user(),
         });
+    }
+
+    /// The node that admits this one, and which it therefore accepts on faith.
+    ///
+    /// The person a further device belongs to, and the founder for everybody
+    /// else. Total rather than optional: every node that reaches this path has
+    /// an inviter, since an outsider and a thief are both diverted before it.
+    fn inviter(&self) -> u64 {
+        match S::SECOND_DEVICE {
+            Some((device, primary)) if device == self.me => primary,
+            _ => FOUNDER,
+        }
+    }
+
+    /// The user this node joins as a further device of, if it is one.
+    ///
+    /// Computed from the scenario constant rather than looked up, for the same
+    /// reason the founder can name a revocation victim without a lookup: every
+    /// node's key material is a pure function of its simulator id. A second
+    /// device therefore knows its primary's identity before either has joined,
+    /// which it must — it is naming the user it wants to be enrolled onto.
+    fn enrolling_user(&self) -> Option<MemberId> {
+        let (device, primary) = S::SECOND_DEVICE?;
+        if device != self.me {
+            return None;
+        }
+        Some(MemberId::from(
+            MemorySigner::generate(&mut node_rng(NodeId(primary), 0xA1)).verifying_key(),
+        ))
     }
 
     /// Broadcast this node's whole operation log, so peers can fill in gaps.
@@ -1674,6 +2011,36 @@ impl<S: Scenario> WorkspaceNode<S> {
         }
     }
 
+    /// Whether an entry authored by `author` should be applied.
+    ///
+    /// The simulator's counterpart of the check `ingest_all` performs in the
+    /// facade, and the same predicate one indirection shorter. Production maps an
+    /// `iroh-docs` author id to a member through the manifest's self-attested
+    /// author claims before consulting the closure; there are no author ids here,
+    /// because a node id already *is* the identity the transport authenticates —
+    /// so this resolves the node id to the member key it deterministically holds
+    /// and asks the closure directly.
+    ///
+    /// A node id no `Add` ever introduced still yields a well-formed member key,
+    /// since key material is a pure function of the id. It simply has no binding
+    /// and no grant, so the closure gives it no role — which is exactly how a
+    /// forger's entry is refused.
+    ///
+    /// Own entries pass unconditionally, for the reason the facade documents: a
+    /// node that refused its own writes until it had read back its own record
+    /// would deadlock at startup.
+    fn author_may_write(&self, author: NodeId) -> bool {
+        if author.0 == self.me {
+            return true;
+        }
+        self.state.as_ref().is_some_and(|state| {
+            state
+                .capabilities()
+                .role_of_member(&member_bytes_of(author.0))
+                .is_some_and(Role::can_write)
+        })
+    }
+
     /// Record an entry in the modelled replica.
     ///
     /// Recorded whether or not it can ever be decrypted: seeing an entry is a
@@ -1770,6 +2137,20 @@ impl<S: Scenario> WorkspaceNode<S> {
             return;
         }
         self.observe(key, author, &chunk);
+        // Observed and then refused, and the order is the whole distinction.
+        // `iroh-docs` reconciles a replica by key and records whatever arrives,
+        // so an entry written by somebody with no role *is* in the replica — what
+        // production refuses is applying it, in `ingest_all`, and that refusal is
+        // the only thing standing between a member's document and text an
+        // outsider wrote into it.
+        //
+        // Modelled here because it was missing, not because it is new: this is
+        // the receiver-side check `workspace.rs` performs on every entry, and
+        // without it the simulator was strictly weaker than production on the one
+        // plane an attacker can reach without holding any key at all.
+        if !self.author_may_write(author) {
+            return;
+        }
         let secret = WorkspaceSecret::new(workspace_secret_bytes());
         if key == secret.manifest_key() {
             self.drive(Event::ManifestArrived { chunk }, cx, salt);
@@ -1876,9 +2257,18 @@ impl<S: Scenario> WorkspaceNode<S> {
             cx.set_timer(Tick::Rotate, FIRST_ROTATE);
         }
         // The founder attaches, because it is the one node certain to hold a
-        // writing role from the first instant.
+        // writing role from the first instant. When the instant is chosen, so is
+        // the question: before a removal the claim is availability, after it the
+        // claim is confidentiality, and neither ordering can state the other.
         if S::ATTACH_ASSET && me.0 == FOUNDER {
-            cx.set_timer(Tick::Attach, ATTACH_AT);
+            cx.set_timer(
+                Tick::Attach,
+                if S::ATTACH_AFTER_REVOKE {
+                    ATTACH_LATE_AT
+                } else {
+                    ATTACH_AT
+                },
+            );
         }
         if me.0 == FOUNDER && S::REVOKE.is_some() {
             cx.set_timer(Tick::Revoke, REVOKE_AT);
@@ -2278,10 +2668,19 @@ impl<S: Scenario> WorkspaceNode<S> {
     /// The observable a removal property needs: a member locked out of an asset
     /// is one that cannot obtain the key, whatever it can still see of the
     /// segments.
+    ///
+    /// Keyed by the **version's** content id rather than by the asset's, because
+    /// that is the key space the key is sealed into: `seal_asset_key` is called
+    /// with `ASSET_V1`, and each version owns its own space so that publishing a
+    /// new version cannot replace the previous one's index entries. Asking under
+    /// [`ASSET`] named a space nothing ever writes to, so this returned `false`
+    /// for every node at every instant — invisible for as long as no property
+    /// called it, and a confidentiality property built on it would have passed
+    /// while asserting nothing at all.
     #[must_use]
     pub fn holds_asset_key(&self) -> bool {
         let secret = WorkspaceSecret::new(workspace_secret_bytes());
-        self.replica.contains_key(&secret.asset_key_key(ASSET))
+        self.replica.contains_key(&secret.asset_key_key(ASSET_V1))
     }
 
     /// Re-announce every document this node holds.
@@ -2361,6 +2760,15 @@ impl<S: Scenario> WorkspaceNode<S> {
                 // rather than the node.
                 Effect::EvictUncertified { member } => pending_eviction = Some(member),
                 Effect::StoreChunk { key, chunk, .. } | Effect::StoreManifest { key, chunk } => {
+                    // Kept only by a forger, and only for a document chunk: the
+                    // forgery re-announces readable ciphertext under an author
+                    // nobody certified, and a manifest chunk would be refused by
+                    // the key check rather than by the author check under test.
+                    if S::FORGE
+                        && key != WorkspaceSecret::new(workspace_secret_bytes()).manifest_key()
+                    {
+                        self.last_published = Some((*chunk).clone());
+                    }
                     // Recorded locally as well as broadcast: a node sees its own
                     // writes in its own index, exactly as it would after writing
                     // them into `iroh-docs`.
@@ -2540,6 +2948,45 @@ impl<S: Scenario> WorkspaceNode<S> {
                 proof: Vec::new(),
             });
         }
+        self.forge_entry(cx);
+    }
+
+    /// Announce an index entry under an author no binding certifies.
+    ///
+    /// The data-plane half of the forgery, and a different attack from the
+    /// operation above rather than a second delivery of it. That one asks the
+    /// group to accept a *member* and is refused by `known_members`; this one
+    /// asks it to accept *content*, and the only thing that refuses it is the
+    /// receiver's author check.
+    ///
+    /// Three choices make the test sharp:
+    ///
+    /// * The ciphertext is real — a chunk this node published and every member
+    ///   can decrypt. Sealing something under a rogue key would have decryption
+    ///   refuse it regardless, and the property could not distinguish a working
+    ///   author check from a missing one.
+    /// * The key is [`FORGED_DOC`], which no honest node ever writes to in this
+    ///   scenario. So its content is a pure function of what was accepted here,
+    ///   and "the forgery was refused" is exactly "that document is empty".
+    /// * The claimed author is [`ROGUE_AUTHOR`], a node id outside the cluster.
+    ///   Key material is a pure function of the id, so it names a perfectly
+    ///   well-formed member — one that no `Add` introduced, no binding attributes
+    ///   to a person, and no grant gives a role. That is what the closure refuses.
+    ///
+    /// A relaying peer must not launder this into its own name; `reconcile`
+    /// preserves the recorded author for the same reason.
+    fn forge_entry(&mut self, cx: &mut dyn Ctx<Self>) {
+        let Some(chunk) = self.last_published.clone() else {
+            // Nothing published yet, so there is no readable ciphertext to
+            // misattribute. The next forgery tick finds one.
+            return;
+        };
+        cx.broadcast(Msg::Entry {
+            namespace: self.namespace,
+            key: doc_key(FORGED_DOC),
+            author: NodeId(ROGUE_AUTHOR),
+            chunk: Box::new(chunk),
+        });
     }
 
     /// Act beyond the role this node was granted.
@@ -2606,26 +3053,58 @@ impl<S: Scenario> WorkspaceNode<S> {
         from: NodeId,
         member: MemberId,
         share_key: ShareKey,
+        as_device_of: Option<MemberId>,
         cx: &mut dyn Ctx<Self>,
     ) {
-        if cx.me().0 != FOUNDER {
+        // Who answers depends on what was asked. A new person is admitted by the
+        // founder; a further device is enrolled by the person it belongs to, and
+        // by nobody else — `require_may_add_device_to` would refuse a third party
+        // anyway, so a founder that answered here would broadcast an operation
+        // every receiver drops and hand the joiner a `Welcome` for an admission
+        // that never happened.
+        let answering = match as_device_of {
+            Some(user) => self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.member_id().to_bytes() == user.to_bytes()),
+            None => cx.me().0 == FOUNDER,
+        };
+        if !answering {
             return;
         }
-        // Each simulated node is one device belonging to one person, so a join
-        // admits a new user rather than enrolling a device onto an existing one.
-        self.drive(
-            Event::AddUser {
-                member,
-                share_key,
-                role: Role::Editor,
-                display_name: format!("node-{}", from.0),
-                // Recorded by the admitter, which is the only way the joiner
-                // reaches anyone's roster before it has synced a manifest.
-                endpoint: Some(endpoint_of(from)),
-            },
-            cx,
-            1,
-        );
+
+        match as_device_of {
+            // A further device of a person already in the group. Not an
+            // administrative act: this node is enrolling its own laptop, which
+            // is the non-admin disjunct of `may_bind_device_to` and the one no
+            // other scenario reaches.
+            Some(user) => self.drive(
+                Event::AddDevice {
+                    member,
+                    share_key,
+                    user: user.to_bytes(),
+                    label: format!("device-{}", from.0),
+                    endpoint: Some(endpoint_of(from)),
+                },
+                cx,
+                1,
+            ),
+            // A new person, which is what every scenario but `Onboarding` and
+            // `DeviceChurn` asks for.
+            None => self.drive(
+                Event::AddUser {
+                    member,
+                    share_key,
+                    role: Role::Editor,
+                    display_name: format!("node-{}", from.0),
+                    // Recorded by the admitter, which is the only way the joiner
+                    // reaches anyone's roster before it has synced a manifest.
+                    endpoint: Some(endpoint_of(from)),
+                },
+                cx,
+                1,
+            ),
+        }
 
         let Some(state) = self.state.as_ref() else {
             return;
@@ -2843,9 +3322,22 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
             // landed would discard exactly the messages the inbox exists to
             // keep. That is the difference between a joiner and an outsider:
             // holding an invite, not having already joined.
-            self.bootstrap.insert(NodeId(FOUNDER));
-            self.send_hello(cx);
-            cx.set_timer(Tick::Join, JOIN_RETRY);
+            //
+            // A second device's inviter is the person it belongs to, not the
+            // founder: that is who mints its ticket and who answers its `Hello`,
+            // so that is who it must accept on faith before it holds any state.
+            self.bootstrap.insert(NodeId(self.inviter()));
+            if S::STAGGER_JOIN {
+                // Announced later rather than at t=0, so this node arrives after
+                // content exists. Deliberately not a retry of a `Hello` already
+                // sent: sending one now and staggering the *retries* would still
+                // have every node admitted before the first edit, which is the
+                // case that is already covered.
+                cx.set_timer(Tick::Join, JOIN_STAGGER * u32::try_from(me.0).unwrap_or(1));
+            } else {
+                self.send_hello(cx);
+                cx.set_timer(Tick::Join, JOIN_RETRY);
+            }
         }
 
         self.arm_timers(cx);
@@ -2858,6 +3350,7 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         // exists, how big it is and who wrote it — which is the metadata leak
         // admission control exists to close.
         if !self.admits(from, &msg) {
+            self.refused_messages += 1;
             return;
         }
         self.apply_msg(from, msg, cx);
@@ -2887,7 +3380,11 @@ impl<S: Scenario> WorkspaceNode<S> {
     /// happens exactly once however many effect batches a message produced.
     fn apply_msg(&mut self, from: NodeId, msg: Msg, cx: &mut dyn Ctx<Self>) {
         match msg {
-            Msg::Hello { member, share_key } => self.on_hello(from, member, share_key, cx),
+            Msg::Hello {
+                member,
+                share_key,
+                as_device_of,
+            } => self.on_hello(from, member, share_key, as_device_of, cx),
             // The thief first, because the two paths differ in exactly the way
             // the scenario is about: `on_welcome` honours the invitee binding and
             // an attacker does not.
@@ -2987,6 +3484,56 @@ impl<S: Scenario> WorkspaceNode<S> {
         // ships.
         self.save();
         OpOutcome::Done(resp)
+    }
+
+    /// Change the workspace after the victim is gone, in every way a member can.
+    ///
+    /// Three changes rather than one, because the user story lists three things a
+    /// removed member must stop seeing — *"documents, document updates or
+    /// workspace changes"* — and they are withheld by different mechanisms. The
+    /// entry and the file name are withheld by the namespace rotation, one at the
+    /// document layer and one at the manifest layer above it. The role is not
+    /// withheld by the rotation at all: a grant is a certificate on the control
+    /// plane, where what should stop the victim is eviction. A scenario producing
+    /// only one of them could not tell which mechanism was working.
+    fn write_after_revocation(&mut self, cx: &mut dyn Ctx<Self>) {
+        // A document nothing has written to before, so every entry under its key
+        // belongs to the post-rotation namespace.
+        self.drive(
+            Event::LocalEdit {
+                doc: POST_REVOCATION_DOC,
+                text: "written after the removal".into(),
+            },
+            cx,
+            0x1A7E,
+        );
+        if S::FILE_AFTER_REVOKE {
+            self.drive(
+                Event::UpsertFile {
+                    entry: FileEntry {
+                        uuid: POST_REVOCATION_DOC,
+                        logical_path: POST_REVOCATION_PATH.into(),
+                        mime_type: "text/plain".into(),
+                        // A document, not an asset. `None` means document rather
+                        // than unknown, which is what keeps a manifest written
+                        // before assets existed readable.
+                        asset: None,
+                    },
+                },
+                cx,
+                0x1A7F,
+            );
+        }
+        if let Some(subject) = S::PROMOTE_AFTER_REVOKE {
+            self.drive(
+                Event::SetRole {
+                    user: member_bytes_of(subject),
+                    role: Role::Admin,
+                },
+                cx,
+                0x1A80,
+            );
+        }
     }
 
     /// The protocol half of [`Node::on_timer`].
@@ -3117,18 +3664,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                 self.drive(Event::Leave, cx, 0x1EA7);
                 self.left = true;
             }
-            Tick::LateEdit => {
-                // A document nothing has written to before, so every entry
-                // under its key belongs to the post-rotation namespace.
-                self.drive(
-                    Event::LocalEdit {
-                        doc: POST_REVOCATION_DOC,
-                        text: "written after the removal".into(),
-                    },
-                    cx,
-                    0x1A7E,
-                );
-            }
+            Tick::LateEdit => self.write_after_revocation(cx),
             Tick::Forge => {
                 self.forge(cx);
                 self.forgeries_made += 1;
@@ -3260,6 +3796,48 @@ pub fn crud_workload(nodes: usize) -> BoxedStrategy<FrozenOp> {
         1 => (doc(), small())
             .prop_map(|(d, b)| Value::List(vec![Value::keyword("revert"), d, b])),
         2 => doc().prop_map(|d| Value::List(vec![Value::keyword("read"), d])),
+    ];
+
+    (0..nodes, op)
+        .prop_map(|(process, value)| FrozenOp::new(NodeId(process as u64), value))
+        .boxed()
+}
+
+/// A generated stream of appends and reads, and nothing that destroys text.
+///
+/// # Why a second workload exists
+///
+/// So that "no acknowledged write is lost" has a meaning. Under
+/// [`crud_workload`] it does not: a `write`, a `remove` or a `revert` may
+/// legitimately delete an append that was acknowledged a moment earlier, so a
+/// property asserting that every acknowledged fragment survives to the end of the
+/// run is simply false — and any weakening of it that becomes true (only the
+/// appends after the last destructive op, say) is satisfied vacuously, because
+/// with three documents and a destructive op drawn one time in three, every
+/// document sees one.
+///
+/// Loss is only definable over a monotone history. This is that history: text
+/// only ever accumulates, so the multiset of characters in a converged document
+/// is bounded below by what was acknowledged and above by what was ever asked
+/// for, and both bounds are total. Reads are kept because they cost nothing and
+/// exercise the same completion path a `WsResp::Text` takes.
+///
+/// This is deliberately *not* a replacement for [`crud_workload`] — deletion is
+/// where CRDT convergence is hardest, and that is where the convergence
+/// properties belong. The two workloads answer different questions.
+///
+/// # Panics
+///
+/// Panics if the built-in text pattern is not a valid regex, which would be a bug
+/// in this function rather than anything a caller can cause.
+pub fn append_only_workload(nodes: usize) -> BoxedStrategy<FrozenOp> {
+    let text = || proptest::string::string_regex("[a-z]{1,6}").expect("valid regex");
+    let doc = || (0..DOCS.len()).prop_map(|d| Value::Int(i64::try_from(d).unwrap_or(0)));
+
+    let op = prop_oneof![
+        4 => (doc(), text())
+            .prop_map(|(d, t)| Value::List(vec![Value::keyword("append"), d, Value::Str(t)])),
+        1 => doc().prop_map(|d| Value::List(vec![Value::keyword("read"), d])),
     ];
 
     (0..nodes, op)

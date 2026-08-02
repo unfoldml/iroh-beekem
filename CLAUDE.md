@@ -22,6 +22,9 @@ cargo test -p iroh-beekem        # two real endpoints over real QUIC, plus blob 
                                  # and the large-asset round trip. Do NOT run alongside the
                                  # simulator: these wait on wall-clock outcomes and a
                                  # saturated machine starves them into false failures.
+                                 # `make test` runs the three suites in sequence for that
+                                 # reason; `cargo test --workspace` does not and should not
+                                 # be used.
 
 cargo run -p iroh-beekem --example two_node   # full two-peer session, prints progress
 cargo clippy --workspace --all-targets -- -D warnings
@@ -284,7 +287,11 @@ them *without* noticing will not fail loudly.
 - **Certificates need anti-entropy like the manifest and the namespace do.** A grant, proposal or
   approval is broadcast once with no write behind it, so `Event::ResyncCertificates` must be driven
   from both backends' resync paths. Without it a dropped approval leaves a quorum that formed on one
-  node and nowhere else — an action performed there and refused everywhere.
+  node and nowhere else — an action performed there and refused everywhere. In `iroh-beekem` the
+  three live in `ANNOUNCED_ONCE` ([workspace.rs](crates/iroh-beekem/src/workspace.rs)) and both the
+  public `resync` and the internal `republish` iterate it. They are one list because they had already
+  drifted once: `resync` drove two of the three, reachable by a library caller and by no in-tree test.
+  Adding a fourth thing announced once means adding it there, not at a call site.
 - **A published chunk must not be permanently tagged.** Awaiting `AddProgress` resolves through
   `with_tag()`, which mints a *permanent* tag — so `store_chunk` uses `.temp_tag()` and holds the guard
   across `set_hash` and no longer. Before it, blob collection reclaimed nothing however it was
@@ -332,6 +339,47 @@ them *without* noticing will not fail loudly.
   a member admitted after the asset was written is stuck on one small chunk rather than on gigabytes,
   and `RepairTarget::AssetKey` costs one re-encryption of 32 bytes. Keying segments with CGKA
   application secrets directly would have made both repair and rotation O(bytes).
+
+- **A receiver refuses an entry whose author holds no writing role, and both backends do it.**
+  `ingest_all` in [workspace.rs](crates/iroh-beekem/src/workspace.rs) consults
+  `WorkspaceState::author_may_write`; the simulator's `on_entry` consults the closure directly, since
+  it has no `iroh-docs` author ids to map. The entry is **observed and then refused**, in that order,
+  and the order is the design: a forging node is a *member*, so it holds the namespace write
+  capability and its entry genuinely reconciles into every peer's replica whatever author it claims.
+  Nothing stops it arriving; the author check is what stops it counting. A property asserting such an
+  entry "never enters the index" is therefore asserting something false —
+  `no_honest_node_ever_accepts_a_forged_entry` in
+  [properties.rs](crates/iroh-beekem-sim/tests/properties.rs) states it over the *document* instead,
+  and its counterpart asserts the entry does arrive, which is what keeps the first non-vacuous.
+
+- **A test node must be spawned with `Relay::Disabled`, through `test_node`.** Both endpoints in any
+  test live on one machine, so a relay can never be the path that works — but with the default
+  `NodeOptions` each endpoint still opened and maintained connections to Number 0's public relay
+  servers, and with eight tests running at once that dominated everything else the suite did.
+  Measured over the real-QUIC suite at cargo's default parallelism: **21 of 38 timed out with relays
+  enabled, 2 with them disabled, 0 after the two remaining fixes below.** The failures name assorted
+  `eventually` waits and look exactly like a protocol regression, which is what makes this worth
+  knowing rather than merely worth doing.
+
+  The other two, both in [two_node.rs](crates/iroh-beekem/tests/two_node.rs): a restart binds a *new*
+  UDP port, so with no relay each side's cached address for the other is stale and
+  `a_restarted_joiners_later_writes_are_still_accepted` must be handed both addresses; and
+  `a_removal_waits_for_the_second_admin` runs three endpoints, which do not fit on the
+  **current-thread** runtime `#[tokio::test]` builds, so it asks for two workers. Address lookup stays
+  **on** in tests — it is what turns an endpoint id into an address, and the roster path has nothing
+  else, so disabling it does not slow a node down, it stops it reconnecting.
+
+- **`make test` runs the three suites in sequence, and `cargo test --workspace` must not be used.**
+  The workspace form builds one job graph and runs the simulator and the real-QUIC suite
+  concurrently — the combination the Commands section says never to run. `make test` existed and did
+  exactly that until phase 11.
+
+- **A history property is only non-vacuous in a plan with a workload.** `World::history()` is empty
+  unless the plan supplies `.workload()` and `.client()`, which only `generated_crud_workloads` does —
+  every other module builds plans without them, so a loss property added there passes while reading
+  nothing. Loss also needs `append_only_workload`: under `crud_workload` a `write`, `remove` or
+  `revert` may legitimately delete an acknowledged append, so "every acknowledged write survives" is
+  false there and every weakening of it that becomes true is vacuous.
 
 - **Asset segments must stay out of the download policy, the parked queue, and `ingest_all`.** Without
   `refresh_download_policy` every member fetches every asset the moment its entries reconcile — the
