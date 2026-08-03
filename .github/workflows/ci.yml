@@ -5,15 +5,14 @@ on:
     branches: [main]
   pull_request:
 
-# A superseded run tells us nothing; cancel it rather than pay for it.
+# superseded runs are canceled
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # Backtraces cost nothing until something fails, and a property-test failure
-  # without one is far more expensive to chase down.
+  # enable backtraces for all jobs, not just the test job, so that a panic in any job prints a stack trace.
   RUST_BACKTRACE: 1
 
 jobs:
