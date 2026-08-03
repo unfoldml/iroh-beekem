@@ -158,7 +158,7 @@ settled; if a user story needs a different answer, change it.
   tested: a revert converges with a concurrent edit like any other write, and the version reverted away
   from stays listed, so a revert can be reverted.
 
-- **Attribution is recorded, not derived, and that is a correctness decision rather than a taste one.**
+- **Attribution is recorded, not derived**
   The obvious design — derive each device's Loro peer id from the workspace secret and the member id, so
   every peer can invert it — corrupts documents. Assigning a peer id also fixes the operation counter a
   replica writes next, so any device that loses a document's local history while another replica keeps

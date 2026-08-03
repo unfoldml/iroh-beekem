@@ -19,6 +19,12 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # The three suites together run in minutes now that the root manifest
+    # optimises dependencies; without that they ran for over 45 minutes and,
+    # with no timeout here, inherited GitHub's six-hour default — which is how
+    # the regression stayed invisible. A breach of this budget means something
+    # regressed, not that the runner was busy.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

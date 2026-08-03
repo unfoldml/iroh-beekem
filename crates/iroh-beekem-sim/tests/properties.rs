@@ -12,6 +12,26 @@ use propsim::prelude::*;
 const NODES: usize = 3;
 const SEEDS: usize = 6;
 
+/// The longest deadline a property in this file can meaningfully ask for.
+///
+/// propsim floors a run's horizon at ten seconds past the last *scripted* fault
+/// event, and widens it for nothing else. Swarm faults are lowered through
+/// `schedule_fault` rather than through `script()`, so they never widen it at
+/// all, and the scripted plans' last event — `REPAIR_AT` — falls at four
+/// seconds, inside the five-second floor. **Every plan in this file therefore
+/// stops at fifteen virtual seconds.**
+///
+/// Deadlines longer than this are not stricter or more generous, they are
+/// simply unreachable: a property asking for twenty seconds evaluates the
+/// window `0..20s` against a trace that ended at fifteen, which is the same
+/// window as this constant while reading like a patience the harness does not
+/// have. Naming it is what stops the next deadline being written past the end
+/// of the run.
+///
+/// A property that genuinely needs longer needs the *horizon* moved first;
+/// raising the number here alone would change nothing.
+const HORIZON: Duration = Duration::from_secs(15);
+
 /// Nodes that have finished joining the group.
 fn joined<'a, S: Scenario>(w: &'a World<'a, WorkspaceNode<S>>) -> Vec<&'a WorkspaceNode<S>> {
     w.nodes().filter(|n| n.has_joined()).collect()
@@ -224,12 +244,10 @@ fn a_healthy_run_never_evicts_anything() {
 /// membership and key-rotation operations with no central sequencer. Nothing
 /// exercised that: the simulator only ever added members and edited text.
 mod concurrent_rotation_and_revocation {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{Churn, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{NODES, plan};
+    use super::{HORIZON, NODES, plan};
 
     /// The nodes still in the group after the scenario's revocation.
     fn remaining<'a>(w: &'a World<'a, WorkspaceNode<Churn>>) -> Vec<&'a WorkspaceNode<Churn>> {
@@ -242,7 +260,7 @@ mod concurrent_rotation_and_revocation {
     fn the_remaining_members_still_converge() {
         plan::<Churn>(vec![property::eventually_within(
             "members converge across concurrent rotations and a revocation",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Churn>>| {
                 let members = remaining(w);
                 if members.len() != NODES - 1 {
@@ -310,12 +328,10 @@ mod concurrent_rotation_and_revocation {
 /// operations without checking signatures or issuers, so these properties hold
 /// only because the core checks both before merging.
 mod a_forging_peer_is_rejected {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{FORGED_DOC, Forging, ROGUE_AUTHOR, WorkspaceNode, doc_key};
     use propsim::prelude::*;
 
-    use super::{NODES, plan};
+    use super::{HORIZON, NODES, plan};
 
     #[test]
     fn no_forged_member_ever_enters_the_group() {
@@ -339,7 +355,7 @@ mod a_forging_peer_is_rejected {
         // legitimate traffic — a plausible way to "fix" the first property.
         plan::<Forging>(vec![property::eventually_within(
             "honest nodes converge despite the forgery traffic",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Forging>>| {
                 let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
                 if members.len() != NODES {
@@ -486,15 +502,13 @@ fn the_simulation_is_reproducible() {
 /// were inverted — they asserted that the victim went on watching, so that the
 /// line could not move without a test noticing. It has now moved.
 mod a_removed_member_stops_seeing {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{
         Eviction, POST_REVOCATION_DOC, POST_REVOCATION_PATH, Role, WorkspaceNode, doc_key,
         member_bytes_of,
     };
     use propsim::prelude::*;
 
-    use super::plan;
+    use super::{HORIZON, plan};
 
     /// The node the founder promotes after the revocation, matching
     /// `Scenario::PROMOTE_AFTER_REVOKE`.
@@ -549,7 +563,7 @@ mod a_removed_member_stops_seeing {
     fn every_remaining_member_sees_the_entry_the_victim_does_not() {
         plan::<Eviction>(vec![property::eventually_within(
             "remaining members observe the post-revocation entry",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 let members = remaining(w);
                 members.len() >= 2
@@ -591,7 +605,7 @@ mod a_removed_member_stops_seeing {
     fn the_remaining_members_converge_on_one_namespace() {
         plan::<Eviction>(vec![property::eventually_within(
             "remaining members agree on the current namespace",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 let members = remaining(w);
                 let Some(first) = members.first() else {
@@ -639,7 +653,7 @@ mod a_removed_member_stops_seeing {
     fn rotation_does_not_cost_the_remaining_members_their_content() {
         plan::<Eviction>(vec![property::eventually_within(
             "remaining members converge across the rotation",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 let members = remaining(w);
                 if members.len() < 2 {
@@ -739,7 +753,7 @@ mod a_removed_member_stops_seeing {
     fn every_remaining_member_sees_the_workspace_changes_the_victim_does_not() {
         plan::<Eviction>(vec![property::eventually_within(
             "the members that stayed learn the later file and the later promotion",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 let members = remaining(w);
                 members.len() >= 2
@@ -1240,12 +1254,10 @@ mod generated_crud_workloads {
 /// guard is genuinely wired to `iroh` is proven separately, by
 /// `admission_control_is_wired_to_iroh` in the `iroh-beekem` QUIC suite.
 mod an_outsider_observes_nothing {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{Outsider, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{NODES, plan_of_size};
+    use super::{HORIZON, NODES, plan_of_size};
 
     /// One more node than the honest group, so the outsider's presence does not
     /// shrink the set of members the other properties are about.
@@ -1353,7 +1365,7 @@ mod an_outsider_observes_nothing {
             NODES_WITH_OUTSIDER,
             vec![property::eventually_within(
                 "members converge on a roster containing each other",
-                Duration::from_secs(15),
+                HORIZON,
                 |w: &World<'_, WorkspaceNode<Outsider>>| {
                     let members = members(w);
                     if members.len() != NODES {
@@ -1383,7 +1395,7 @@ mod an_outsider_observes_nothing {
             NODES_WITH_OUTSIDER,
             vec![property::eventually_within(
                 "derived rosters agree",
-                Duration::from_secs(15),
+                HORIZON,
                 |w: &World<'_, WorkspaceNode<Outsider>>| {
                     let members = members(w);
                     if members.len() != NODES {
@@ -1436,12 +1448,10 @@ mod an_outsider_observes_nothing {
 /// makes the scenario worth having: a check that only rejected malformed input
 /// would pass it while changing nothing.
 mod an_insider_cannot_exceed_its_role {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{Insider, Role, WorkspaceNode, member_bytes_of};
     use propsim::prelude::*;
 
-    use super::{NODES, plan};
+    use super::{HORIZON, NODES, plan};
 
     /// In a workspace where only the founder was granted an administrative role,
     /// upon a member issuing grants promoting itself, we expect no node ever to
@@ -1559,7 +1569,7 @@ mod an_insider_cannot_exceed_its_role {
     fn honest_nodes_still_converge_while_under_attack() {
         plan::<Insider>(vec![property::eventually_within(
             "every node converges on the same document despite the insider",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Insider>>| {
                 let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
                 if members.len() != NODES {
@@ -1592,7 +1602,7 @@ mod an_insider_cannot_exceed_its_role {
     fn rejection_never_strands_the_queues() {
         plan::<Insider>(vec![property::eventually_within(
             "nothing stays parked once the network settles",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Insider>>| {
                 w.nodes()
                     .filter(|n| n.has_joined())
@@ -1614,7 +1624,7 @@ mod an_insider_cannot_exceed_its_role {
     fn the_insiders_own_view_stays_self_consistent() {
         plan::<Insider>(vec![property::eventually_within(
             "the insider still reads what the group wrote",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Insider>>| {
                 w.nodes()
                     .filter(|n| n.has_joined() && n.id() == 2)
@@ -1657,12 +1667,10 @@ mod an_insider_cannot_exceed_its_role {
 /// `eventually_within` where the insider's are `always`, and that difference is
 /// the honest statement of what removal buys: a bounded window, not zero.
 mod a_removed_member_is_evicted_again {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{Revenant, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{NODES, plan};
+    use super::{HORIZON, NODES, plan};
 
     /// The nodes still in the group after the scenario's revocation.
     fn remaining<'a>(
@@ -1684,7 +1692,7 @@ mod a_removed_member_is_evicted_again {
     fn every_spliced_leaf_is_eventually_removed_again() {
         plan::<Revenant>(vec![property::eventually_within(
             "the group returns to its legitimate size after the splices",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Revenant>>| {
                 let members = remaining(w);
                 !members.is_empty()
@@ -1725,7 +1733,7 @@ mod a_removed_member_is_evicted_again {
     fn the_remaining_members_still_converge_through_the_evictions() {
         plan::<Revenant>(vec![property::eventually_within(
             "the remaining members agree on one namespace and one document",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Revenant>>| {
                 let members = remaining(w);
                 if members.len() < 2 {
@@ -1772,7 +1780,7 @@ mod a_stolen_invite_buys_only_visibility {
     };
     use propsim::prelude::*;
 
-    use super::{NODES, plan_of_size};
+    use super::{HORIZON, NODES, plan_of_size};
 
     /// One more node than the honest group, so the thief's presence does not
     /// shrink the set of members the other properties are about.
@@ -1909,7 +1917,7 @@ mod a_stolen_invite_buys_only_visibility {
             NODES_WITH_THIEF,
             vec![property::eventually_within(
                 "the remaining members agree on one namespace and one document",
-                Duration::from_secs(20),
+                HORIZON,
                 |w: &World<'_, WorkspaceNode<StolenInvite>>| {
                     let members = remaining(w);
                     if members.len() < 2 {
@@ -2287,7 +2295,7 @@ mod an_asset_reaches_every_member {
 
     use propsim::prelude::*;
 
-    use super::{Duration, NODES, WorkspaceNode, asset_plaintext, joined, plan};
+    use super::{Duration, HORIZON, NODES, WorkspaceNode, asset_plaintext, joined, plan};
 
     fn asset_plan(
         properties: Vec<Property<WorkspaceNode<Assets>>>,
@@ -2424,7 +2432,7 @@ mod an_asset_reaches_every_member {
     fn the_survivors_do_read_an_asset_attached_after_the_removal() {
         plan::<AssetAfterRemoval>(vec![property::eventually_within(
             "every remaining member reassembles an asset attached after the removal",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
                 let expected = asset_plaintext();
                 let staying: Vec<_> = joined(w).into_iter().filter(|n| n.id() != VICTIM).collect();
@@ -2806,12 +2814,10 @@ mod an_action_needs_a_quorum {
 /// late, and the shared user is what gives "all of one user's devices converge" a
 /// referent at all.
 mod devices_onboard_without_losing_content {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{DOCS, DocumentUuid, Onboarding, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{NODES, plan};
+    use super::{HORIZON, NODES, plan};
 
     /// The node that joins as a second device of another node's person.
     const SECOND_DEVICE: u64 = 2;
@@ -2863,7 +2869,7 @@ mod devices_onboard_without_losing_content {
     fn every_admitted_device_eventually_reads_every_file() {
         plan::<Onboarding>(vec![property::eventually_within(
             "every admitted device reads every document identically",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Onboarding>>| {
                 let nodes: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
                 // Guarded on the count: at t=0 only the founder has joined, and a
@@ -2928,7 +2934,7 @@ mod devices_onboard_without_losing_content {
     fn all_of_one_users_devices_converge_on_the_same_view() {
         plan::<Onboarding>(vec![property::eventually_within(
             "one person's two devices agree on content and on the roster",
-            Duration::from_secs(15),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<Onboarding>>| {
                 let devices = one_persons_devices(w);
                 if devices.len() != 2 {
@@ -3016,14 +3022,12 @@ mod devices_onboard_without_losing_content {
 /// removal is a retraction of a leaf, so conflating them silently demotes
 /// somebody — while the *device* must lose everything a removed member loses.
 mod removing_one_device_leaves_the_user_working {
-    use std::time::Duration;
-
     use iroh_beekem_sim::{
         DeviceChurn, POST_REVOCATION_DOC, Role, WorkspaceNode, doc_key, member_bytes_of,
     };
     use propsim::prelude::*;
 
-    use super::{NODES, plan};
+    use super::{HORIZON, NODES, plan};
 
     /// The removed device.
     const REMOVED_DEVICE: u64 = 2;
@@ -3088,7 +3092,7 @@ mod removing_one_device_leaves_the_user_working {
     fn the_users_other_device_stays_on_every_roster() {
         plan::<DeviceChurn>(vec![property::eventually_within(
             "the person's remaining device is on every remaining roster",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 let staying = remaining(w);
                 staying.len() == NODES - 1
@@ -3131,7 +3135,7 @@ mod removing_one_device_leaves_the_user_working {
     fn the_remaining_devices_still_converge() {
         plan::<DeviceChurn>(vec![property::eventually_within(
             "the devices that stay converge through the removal",
-            Duration::from_secs(20),
+            HORIZON,
             |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 let staying = remaining(w);
                 staying.len() == NODES - 1

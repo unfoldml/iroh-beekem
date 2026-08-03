@@ -198,6 +198,9 @@ const JOIN_STAGGER: Duration = Duration::from_millis(400);
 /// snapshot, and a deep clone here means serializing every CRDT document. The
 /// interval and [`MAX_RESYNCS`] are therefore tuned to keep runs to seconds
 /// while still giving lost chunks several chances to be re-announced.
+///
+/// Their *product* is the constrained quantity, because the run ends at a fixed
+/// horizon this crate cannot set — see [`MAX_RESYNCS`] before changing either.
 const RESYNC_INTERVAL: Duration = Duration::from_millis(600);
 
 /// How many times a node re-announces before going quiet, so runs terminate.
@@ -211,9 +214,27 @@ const RESYNC_INTERVAL: Duration = Duration::from_millis(600);
 ///
 /// Sized against the fault schedule rather than the write schedule: at
 /// [`RESYNC_INTERVAL`] this covers the horizon of every property in the suite.
-/// Raising the *interval* rather than the count is deliberate — every event
-/// makes the simulator deep-clone all node state, so coverage is bought far
-/// more cheaply in duration than in frequency.
+///
+/// # Neither lever is free, and this comment used to say one of them was
+///
+/// It read: raise the *interval* rather than the count, because every event
+/// makes the simulator deep-clone all node state, so coverage is bought more
+/// cheaply in duration than in frequency. The first half is true and the
+/// conclusion does not follow, because **the run has a fixed end**. propsim
+/// floors a run's horizon at ten seconds past the last *scripted* fault event
+/// and widens it for nothing else; swarm faults are lowered through
+/// `schedule_fault` rather than `script()`, so every plan in the suite stops at
+/// fifteen virtual seconds.
+///
+/// `24 × 600 ms` is `14.4 s`, which fills that horizon with 600 ms to spare.
+/// Lengthening the interval therefore does not buy a longer run, it pushes the
+/// last rounds past the end of one — anti-entropy is cut and nothing fails,
+/// which is the silent-stall shape this file warns about everywhere else. The
+/// horizon has to move first, and the suite cannot move it without a scripted
+/// fault event to anchor it to.
+///
+/// So the honest statement is that the product of the two is pinned at the
+/// horizon, and a change to either has to be paid for in the other.
 const MAX_RESYNCS: u32 = 24;
 
 /// The re-announcement budget when generated operations drive the run.

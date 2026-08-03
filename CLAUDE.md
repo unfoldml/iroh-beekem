@@ -17,11 +17,16 @@ cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, capabi
                                  # forgery rejection, insider falsification tests
 cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer,
                                  # outsiders, insiders, revenants, assets
-                                 # ~18 min: runs under swarm faults (partitions, latency, reorder).
+                                 # ~3 min: runs under swarm faults (partitions, latency, reorder).
                                  # Cost is proportional to the *number of events*, because the
-                                 # simulator deep-clones every node's state per event — so a
-                                 # longer `RESYNC_INTERVAL` buys coverage without buying time,
-                                 # and only `MAX_RESYNCS` or fewer items per round make it faster.
+                                 # simulator deep-clones every node's state per event, and that
+                                 # clone is four Loro snapshot round trips plus the CGKA tree.
+                                 # This is why the root manifest optimises dependencies: at
+                                 # `opt-level = 0` the same suite took over 45 min and one
+                                 # property test alone took 40 s. Do not remove those profiles.
+                                 # Neither `RESYNC_INTERVAL` nor `MAX_RESYNCS` is a free lever —
+                                 # propsim ends every run here at 15 virtual seconds and their
+                                 # product already fills it; see `MAX_RESYNCS` in sim/src/lib.rs.
 cargo test -p iroh-beekem        # two real endpoints over real QUIC, plus blob collection
                                  # and the large-asset round trip. Do NOT run alongside the
                                  # simulator: these wait on wall-clock outcomes and a
@@ -89,8 +94,7 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
   `now`. A limiter that called `Instant::now` would break the rule; one that takes the instant as an
   argument is what lets the same policy be checked against wall time and against virtual time.
 - **Adding an `Event`, `Effect` or `ControlMsg` variant means updating both backends**, or the
-  simulator and the real transport silently diverge in behaviour. A variant the simulator can only
-  map to nothing is a variant in the wrong place.
+  simulator and the real transport silently diverge in behaviour. 
 
 
 ## Engineering and Coding practices

@@ -17,7 +17,7 @@ COVERAGE_FLOOR ?= 70
 
 help:
 	@echo "check         test + lint + fmt-check + purity (what CI gates on)"
-	@echo "test          the three suites; the sim one takes ~5 min"
+	@echo "test          the three suites, ~4 min; the sim one is ~3 of it"
 	@echo "lint          clippy over the workspace, warnings denied"
 	@echo "fmt / fmt-check   rustfmt with the pinned nightly"
 	@echo "purity        prove iroh-beekem-core has no tokio/iroh/quinn"
