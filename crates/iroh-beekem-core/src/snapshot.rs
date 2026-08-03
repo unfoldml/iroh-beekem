@@ -46,13 +46,12 @@
 //!   this node never reappears on any peer's roster and admission control locks
 //!   it out of the workspace it already belongs to.
 
-use beekem::{cgka::Cgka, id::MemberId};
+use beekem::cgka::Cgka;
 use keyhive_crypto::share_key::ShareSecretKey;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    blinding::DocumentUuid, capability::Certificate, content::ChunkRef, error::CoreError,
-    state::NamespaceEpoch,
+    blinding::DocumentUuid, capability::Certificate, content::ChunkRef, state::NamespaceEpoch,
 };
 
 /// The snapshot layout this build writes and reads.
@@ -161,18 +160,6 @@ pub struct WorkspaceSnapshot {
     pub(crate) published_up_to: Vec<(DocumentUuid, Vec<u8>)>,
 }
 
-/// Restore a member identity from its compressed 32-byte form.
-///
-/// # Errors
-///
-/// Returns [`CoreError::MalformedKey`] if the bytes are not a point on the
-/// curve, which a truncated or corrupted snapshot can produce.
-pub(crate) fn member_from_bytes(bytes: [u8; 32]) -> Result<MemberId, CoreError> {
-    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-        .map(MemberId::from)
-        .map_err(|_| CoreError::MalformedKey { key: bytes })
-}
-
 #[cfg(test)]
 mod tests {
     use beekem::id::TreeId;
@@ -180,10 +167,13 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    use super::{SNAPSHOT_VERSION, member_from_bytes};
+    use super::SNAPSHOT_VERSION;
     use crate::{
-        blinding::WorkspaceSecret, capability::DEFAULT_THRESHOLD, error::CoreError,
-        keys::CgkaController, state::WorkspaceState,
+        blinding::WorkspaceSecret,
+        capability::{DEFAULT_THRESHOLD, member_from_bytes},
+        error::CoreError,
+        keys::CgkaController,
+        state::WorkspaceState,
     };
 
     /// A one-member workspace, which is all these checks need.

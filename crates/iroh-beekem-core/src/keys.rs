@@ -58,11 +58,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     capability::{
         AdminAction, AdminProposal, Approval, CapabilityStore, Certificate, DEFAULT_THRESHOLD,
-        DeviceBinding, Grant, Policy, Role,
+        DeviceBinding, Grant, Policy, Role, member_from_bytes,
     },
     content::{Chunk, ChunkRef},
     error::CoreError,
-    snapshot::{CgkaSnapshot, member_from_bytes},
+    snapshot::CgkaSnapshot,
     sync_poll::now_or_never,
 };
 

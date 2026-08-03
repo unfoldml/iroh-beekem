@@ -70,6 +70,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use beekem::id::MemberId;
 use keyhive_crypto::{signed::Signed, signer::memory::MemorySigner};
 use serde::{Deserialize, Serialize};
 
@@ -205,6 +206,28 @@ pub const POLICY_DOMAIN: [u8; 16] = *b"iroh-beekem/plcy";
 /// exactly as it did: a single admin acting alone *is* a quorum of one, and
 /// `require_quorum` degenerates to the `require_admin` it replaced.
 pub const DEFAULT_THRESHOLD: u32 = 1;
+
+/// Restore a member identity from its compressed 32-byte form.
+///
+/// Everything that crosses a boundary carries a member as raw bytes rather than
+/// as a [`MemberId`], because a `MemberId` wraps an *expanded* Ed25519 point and
+/// would make every certificate, error and control message pay for it. This is
+/// the one decompression, so that a snapshot, a device record and a repair
+/// request all agree on what "not a valid member key" means.
+///
+/// A failure is never a protocol event to act on. Bytes that are not a point on
+/// the curve could not have been introduced by any `Add`, so the sender is not a
+/// member and the right answer is to discard rather than to investigate.
+///
+/// # Errors
+///
+/// Returns [`CoreError::MalformedKey`] if the bytes are not a point on the
+/// curve, which a truncated snapshot or a fabricated message can produce.
+pub fn member_from_bytes(bytes: [u8; 32]) -> Result<MemberId, CoreError> {
+    ed25519_dalek::VerifyingKey::from_bytes(&bytes)
+        .map(MemberId::from)
+        .map_err(|_| CoreError::MalformedKey { key: bytes })
+}
 
 /// The workspace's administrative threshold, fixed by its founder.
 ///

@@ -17,11 +17,12 @@ use beekem::id::{MemberId, TreeId};
 use bytes::Bytes;
 use iroh::{EndpointAddr, EndpointId};
 use iroh_beekem_core::{
-    ASSET_SEGMENT_BYTES, AdminAction, AssetKey, AssetMeta, AuthorizedOp, CgkaController,
-    DEFAULT_THRESHOLD, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
+    ANNOUNCED_ONCE, ASSET_SEGMENT_BYTES, AdminAction, AssetKey, AssetMeta, CgkaController,
+    Cooldown, DEFAULT_THRESHOLD, DeviceRecord, DocumentUuid, Effect, EpochId, Event, FileEntry,
     NamespaceEpoch, ProposalStatus, RepairTarget, RestoreOutcome, Role, UnixSeconds, VersionId,
     VersionInfo, WorkspaceInfo, WorkspaceSecret, WorkspaceState,
     asset::{ContentDigest, open_segment, seal_segment},
+    capability::member_from_bytes,
     state::AssetKeyVerdict,
     version::{AssetVersion, Checkpoint},
 };
@@ -94,11 +95,6 @@ fn now() -> UnixSeconds {
 /// Every member writes to the same blinded key for a given document, so the
 /// author is what distinguishes their entries from each other.
 type EntrySlot = ([u8; 32], [u8; 32]);
-
-/// Rebuild a `MemberId` from raw verifying-key bytes.
-fn member_id_from_bytes(bytes: &[u8; 32]) -> Option<MemberId> {
-    ed25519_verifying_key(bytes).map(MemberId::from)
-}
 
 /// Shared state behind the pump loops.
 struct Inner {
@@ -251,24 +247,6 @@ impl Drop for Workspace {
     }
 }
 
-/// How many operations a peer's log-repair broadcast may contain.
-///
-/// `ControlMsg::Log` is the repair mechanism: any peer may send its whole
-/// history when a neighbour appears, and the receiver merges all of it. That
-/// makes it the cheapest amplification point on the control plane, since one
-/// message can cost the receiver an unbounded number of signature checks. The
-/// limit is well above any realistic workspace history and exists purely to
-/// bound that cost.
-const MAX_LOG_OPS: usize = 100_000;
-
-/// How many certificates a peer's log-repair or certificate broadcast may carry.
-///
-/// The same amplification argument as [`MAX_LOG_OPS`], and a tighter bound
-/// because the realistic count is far smaller: one binding per device plus a few
-/// grants per user. Each certificate costs the receiver a signature check, and a
-/// batch that is all new costs a closure recompute as well.
-const MAX_LOG_CERTS: usize = 10_000;
-
 /// How long the eviction of one spliced leaf is suppressed after the last.
 ///
 /// `Effect::EvictUncertified` answers a removed member re-entering the tree, and
@@ -309,94 +287,6 @@ const REPUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(5);
 /// produces the unreadable chunk would suppress every retry, which is the
 /// stall this mechanism exists to break.
 const REPAIR_COOLDOWN: Duration = Duration::from_secs(2);
-
-/// The three things broadcast exactly once, with no later write behind them.
-///
-/// A document has anti-entropy for free: the next edit carries whatever the last
-/// one lost. These do not. A rotation is announced once, the manifest is
-/// published only when it changes, and a certificate is broadcast when it is
-/// minted — so each needs a deliberate re-announcement, and dropping any one has
-/// its own distinct cost:
-///
-/// * the namespace — a member stranded on a replica the group abandoned, removed
-///   in effect without anyone having removed it;
-/// * the manifest — a peer missing from somebody's roster until the next
-///   membership change happens to republish it, since the roster derives from
-///   device records and those live in the manifest;
-/// * the certificates — worst of the three, because a lost approval leaves a
-///   quorum that formed on one node and nowhere else: an action performed there
-///   and refused everywhere. A role change is worse still, since it mints a
-///   grant and no operation at all, which makes this its *only* anti-entropy.
-///
-/// # Why this is one list and not two
-///
-/// There are two paths that must drive all of it — the public
-/// [`Workspace::resync`] and the internal `republish` a `NeighborUp` takes — and
-/// they had drifted: `republish` drove all three while `resync` drove only the
-/// first two, so the quorum hole above was reachable by any library caller and
-/// by none of the in-tree tests, which all go through the other path. Sharing the
-/// list makes that particular divergence unrepresentable rather than merely
-/// fixed.
-const ANNOUNCED_ONCE: [Event; 3] = [
-    Event::ResyncManifest,
-    Event::ResyncNamespace,
-    Event::ResyncCertificates,
-];
-
-/// Rate limiter keyed on whatever distinguishes one occasion from the next.
-///
-/// Takes `now` as an argument rather than reading the clock, which is what
-/// makes the policy testable without waiting on wall time — the same reasoning
-/// that keeps `iroh-beekem-core` clock-free.
-///
-/// Generic in the key because its three users disagree about what "the same
-/// event" means, and each disagreement is deliberate: neighbour-up repair is
-/// per peer; an *outgoing* repair request is per `(target, epoch)`, so a peer
-/// that becomes stuck on a new epoch is not silenced by the window it opened
-/// for the old one; and *answering* a repair request is per requesting member,
-/// because there the point is to limit the requester rather than the request.
-#[derive(Debug)]
-struct Cooldown<K> {
-    seen: HashMap<K, Instant>,
-    window: Duration,
-}
-
-impl<K: std::hash::Hash + Eq> Cooldown<K> {
-    /// A limiter that suppresses a repeated key for `window`.
-    fn new(window: Duration) -> Self {
-        Self {
-            seen: HashMap::new(),
-            window,
-        }
-    }
-
-    /// Whether `key` may trigger its action now, recording it if so.
-    ///
-    /// Expired entries are pruned on the way through, so the map stays
-    /// proportional to the keys seen in one window rather than to every key
-    /// ever seen. Without that, a map keyed by peer id would simply move the
-    /// exhaustion vector this exists to close from CPU to memory.
-    fn claim(&mut self, key: K, now: Instant) -> bool {
-        // An entry older than the cooldown says nothing its absence does not.
-        let window = self.window;
-        self.seen.retain(|_, at| now.duration_since(*at) < window);
-        match self.seen.get(&key) {
-            Some(at) if now.duration_since(*at) < window => false,
-            _ => {
-                self.seen.insert(key, now);
-                true
-            }
-        }
-    }
-
-    /// How many keys are currently being tracked.
-    ///
-    /// Only the pruning test needs this; the policy itself never asks.
-    #[cfg(test)]
-    fn tracked(&self) -> usize {
-        self.seen.len()
-    }
-}
 
 /// Derive the gossip topic for a workspace.
 ///
@@ -1305,7 +1195,7 @@ impl Workspace {
             state
                 .devices_of(&user)
                 .iter()
-                .filter_map(|d| member_id_from_bytes(&d.member))
+                .filter_map(|d| member_from_bytes(d.member).ok())
                 .collect()
         };
         let mut first_error = None;
@@ -2199,190 +2089,86 @@ async fn control_loop<E>(
 /// Handle one decoded control-plane message.
 ///
 /// Split out of [`control_loop`] so the loop stays about *stream lifecycle* —
-/// neighbour arrivals, decode failures — and this stays about protocol. They grew
-/// together and the seam is the natural one: everything here takes the state lock,
-/// nothing here touches the gossip stream.
-async fn handle_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
-    apply_control_msg(inner, decoded).await;
-    // One write per message rather than one per effect batch: a `Log` exchange
-    // replays the whole operation history under a single lock, and this is the
-    // boundary at which that history has finished being applied.
-    persist(inner).await;
-}
-
-/// The protocol half of [`handle_control_msg`], separated so persistence happens
-/// exactly once however many effect batches the message produced.
-async fn apply_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
-    match decoded {
-        ControlMsg::Op { op, proof } => {
-            let effects = {
-                let mut state = inner.state.lock().await;
-                report_rejection(state.handle(
-                    Event::ControlOp(AuthorizedOp::new(*op, proof)),
-                    &mut rand::rngs::OsRng,
-                    now(),
-                ))
-            };
-            apply_effects(inner, effects).await;
-            ingest_all(inner).await;
-        }
-        ControlMsg::Certs(certs) => {
-            if certs.len() > MAX_LOG_CERTS {
-                tracing::warn!(
-                    len = certs.len(),
-                    "discarding an oversized certificate batch"
-                );
-                return;
-            }
-            let effects = {
-                let mut state = inner.state.lock().await;
-                report_rejection(state.handle(
-                    Event::CertsArrived(certs),
-                    &mut rand::rngs::OsRng,
-                    now(),
-                ))
-            };
-            apply_effects(inner, effects).await;
-            ingest_all(inner).await;
-        }
-        ControlMsg::Log { ops, certs } => {
-            if ops.len() > MAX_LOG_OPS || certs.len() > MAX_LOG_CERTS {
-                tracing::warn!(
-                    ops = ops.len(),
-                    certs = certs.len(),
-                    "discarding an oversized operation log"
-                );
-                return;
-            }
-            let mut effects = Vec::new();
-            {
-                let mut state = inner.state.lock().await;
-                // Certificates strictly first: they authorise the `Add`s in
-                // the log, so replaying the operations against an empty
-                // closure would refuse the history this exchange exists to
-                // hand over.
-                effects.append(&mut report_rejection(state.handle(
-                    Event::CertsArrived(certs),
-                    &mut rand::rngs::OsRng,
-                    now(),
-                )));
-                for op in ops {
-                    let outcome = state.handle(
-                        Event::ControlOp(AuthorizedOp::bare(Arc::new(op))),
-                        &mut rand::rngs::OsRng,
-                        now(),
-                    );
-                    effects.append(&mut report_rejection(outcome));
-                }
-            }
-            apply_effects(inner, effects).await;
-            // Newly recovered key material may unlock chunks that have been
-            // parked since before this peer caught up.
-            ingest_all(inner).await;
-        }
-        // The index sync will surface the entry; the announce only prompts
-        // us to look sooner.
-        ControlMsg::Announce { .. } => {
-            ingest_all(inner).await;
-        }
-        // The group has abandoned the namespace this node is syncing. The
-        // capability is encrypted under the group key, so a device removed
-        // before the rotation simply cannot read it and stays behind —
-        // which is the whole purpose of rotating rather than asking nicely.
-        ControlMsg::Namespace { epoch, chunk } => {
-            let effects = {
-                let mut state = inner.state.lock().await;
-                report_rejection(state.handle(
-                    Event::NamespaceArrived { epoch, chunk },
-                    &mut rand::rngs::OsRng,
-                    now(),
-                ))
-            };
-            apply_effects(inner, effects).await;
-        }
-        // Somebody cannot read what we publish. Answering re-keys the
-        // group, so the core checks the requester is a member *now* before
-        // any of that happens; a refusal is logged rather than fatal, since
-        // a revoked device asking is an expected thing to see on a topic
-        // every past invitee can reach.
-        ControlMsg::Repair {
-            member,
-            target,
-            epoch,
-        } => answer_repair(inner, member, target, epoch).await,
-    }
-}
-
-/// Answer one peer's repair request, if it is allowed to make it.
+/// neighbour arrivals, decode failures — and this stays about what a message
+/// costs this node. The protocol itself is `WorkspaceState::on_control`, in the
+/// core, because it was written here and in the simulator and the two copies
+/// drifted.
 ///
-/// Split out of [`apply_control_msg`] because it is the only arm with a policy
-/// decision of its own: answering costs the group a tree operation, so the rate
-/// limit is a denial-of-service control rather than a tuning knob.
-async fn answer_repair(inner: &Arc<Inner>, member: [u8; 32], target: RepairTarget, epoch: EpochId) {
-    let Some(requester) = member_id_from_bytes(&member) else {
-        tracing::warn!("discarding a repair request naming an unparseable member");
-        return;
-    };
-    // Checked before the core is asked to do anything, because what is being
-    // limited is the *work*: a member ignoring its own sending cooldown must not
-    // be able to buy more re-keys by shouting.
-    let allowed = {
-        let mut cooldown = inner.repair_answer_cooldown.lock().await;
-        cooldown.claim(member, Instant::now())
-    };
-    if !allowed {
-        tracing::debug!("suppressing a repeat repair answer for one peer");
-        return;
+/// # Three things happen here and none of them can move into the core
+///
+/// The **rate limit** runs first, before the core is asked to do anything,
+/// because what is being limited is the *work*: answering a repair costs the
+/// whole group a re-key, so a member ignoring its own sending cooldown must not
+/// be able to buy more of them by shouting. Which messages are chargeable is the
+/// core's call — see [`ControlMsg::answer_cooldown_key`] — and how often is
+/// ours, because it needs a clock.
+///
+/// The **re-ingest** runs last, once, for every message rather than for the four
+/// that obviously need it. What it recovers is not the core's parked queue,
+/// which `on_control` already drains: it is entries this node fetched and then
+/// *refused*, because their author held no writing role at the time. Those are
+/// re-offered on every pass, and a certificate arriving in this message is
+/// exactly what lets one through. Doing it uniformly costs a cheap idempotent
+/// pass after a `Namespace` or a `Repair` — and after a `Namespace` it is not
+/// even redundant, since adopting a replica clears `seen_entries`.
+///
+/// The **snapshot** is written once, at the end. `ingest_all` persists too, so
+/// this is the seam rather than a second write: a `Log` exchange replays a whole
+/// operation history, and one write per message is the boundary at which that
+/// history has finished being applied.
+async fn handle_control_msg(inner: &Arc<Inner>, decoded: ControlMsg) {
+    if let Some(key) = decoded.answer_cooldown_key() {
+        let allowed = {
+            let mut cooldown = inner.repair_answer_cooldown.lock().await;
+            cooldown.claim(key, Instant::now())
+        };
+        if allowed {
+            // Inside the budget; fall through and answer.
+        } else {
+            tracing::debug!("suppressing a repeat repair answer for one peer");
+            return;
+        }
+    } else {
+        // Not a message that costs this node unsolicited work.
     }
 
-    // An asset key is the one repair target whose ciphertext is not in the
-    // core's state — it lives in a blob any member can fetch, and caching it
-    // there would mean persisting a secret to avoid a decryption. So it is
-    // fetched here and handed in, rather than routed through
-    // `Event::RepairRequested` like the other three.
-    let effects = if let RepairTarget::AssetKey(asset) = target {
-        answer_asset_key_repair(inner, requester, asset).await
-    } else {
+    let effects = {
         let mut state = inner.state.lock().await;
-        report_rejection(state.handle(
-            Event::RepairRequested {
-                requester,
-                target,
-                epoch,
-            },
-            &mut rand::rngs::OsRng,
-            now(),
-        ))
+        report_rejection(state.on_control(decoded, &mut rand::rngs::OsRng, now()))
     };
     apply_effects(inner, effects).await;
+    ingest_all(inner).await;
 }
 
-/// Re-encrypt one asset's content key for a peer that cannot derive its epoch.
+/// Answer [`Effect::ResealAssetKey`]: fetch the key chunk and re-encrypt it.
 ///
 /// The cheapest repair in the system, and deliberately so: an asset's segments
 /// are keyed by a per-asset content key rather than by the CGKA, so restoring a
 /// ten-gigabyte asset to a newly admitted member costs one 32-byte chunk under a
 /// fresh epoch. Encrypting the segments to the group directly would have cost
 /// ten gigabytes.
-async fn answer_asset_key_repair(
-    inner: &Inner,
-    requester: MemberId,
-    asset: DocumentUuid,
-) -> Vec<Effect> {
+///
+/// The fetch is why this is an effect rather than something the core does: the
+/// key is in a blob any member can pull, and caching it in the core would mean
+/// persisting a secret to save one decryption.
+async fn answer_asset_key_repair(inner: &Arc<Inner>, requester: MemberId, asset: DocumentUuid) {
     let Some(bytes) =
         fetch_indexed_bytes(inner, inner.secret.asset_key_key(asset).as_bytes()).await
     else {
         // This node does not hold the key chunk either. Not an error: some other
         // member will answer, exactly as with a document repair a viewer cannot
         // serve.
-        return Vec::new();
+        return;
     };
     let Ok(chunk) = decode_chunk(&bytes) else {
         tracing::warn!("an asset key entry did not decode; ignoring the repair request");
-        return Vec::new();
+        return;
     };
-    let mut state = inner.state.lock().await;
-    report_rejection(state.reseal_asset_key(requester, asset, &chunk, &mut rand::rngs::OsRng))
+    let effects = {
+        let mut state = inner.state.lock().await;
+        report_rejection(state.reseal_asset_key(requester, asset, &chunk, &mut rand::rngs::OsRng))
+    };
+    apply_effects(inner, effects).await;
 }
 
 /// Pump the data plane: entries and payloads arriving over docs and blobs.
@@ -2622,6 +2408,13 @@ async fn apply_effects(inner: &Arc<Inner>, effects: Vec<Effect>) {
             }
             Effect::RequestRepair { target, epoch } => {
                 request_repair(inner, target, epoch).await;
+            }
+            // The one repair the core cannot answer from state: an asset's
+            // content key lives in a blob, so the ciphertext has to be fetched
+            // and handed back. Boxed because re-sealing publishes, which comes
+            // straight back through this pump.
+            Effect::ResealAssetKey { requester, asset } => {
+                Box::pin(answer_asset_key_repair(inner, requester, asset)).await;
             }
             // Removal abandons the namespace for a fresh one. Minting is I/O,
             // so the core asks rather than doing it, and the capability comes
@@ -3445,90 +3238,4 @@ async fn fetch_chunks(
 /// Rebuild a verifying key from raw bytes.
 fn ed25519_verifying_key(bytes: &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey> {
     ed25519_dalek::VerifyingKey::from_bytes(bytes).ok()
-}
-
-/// The neighbour-up repair path is reachable by anyone who has ever held an
-/// invite, because the gossip topic is derived from the tree id. Each arrival
-/// costs a full operation-log broadcast and a signature check per operation on
-/// every receiver, so the rate limit is a denial-of-service control, not a
-/// tuning knob. It takes `now` as an argument so the policy can be checked
-/// without waiting on wall time.
-#[cfg(test)]
-mod cooldown {
-    use std::time::Instant;
-
-    use iroh::{EndpointId, SecretKey};
-
-    use super::{Cooldown, NEIGHBOR_COOLDOWN};
-
-    fn peer(seed: u8) -> EndpointId {
-        SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    #[test]
-    fn a_first_arrival_is_always_allowed() {
-        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
-        assert!(
-            cooldown.claim(peer(1), Instant::now()),
-            "a peer that has never been seen must be able to repair"
-        );
-    }
-
-    #[test]
-    fn a_repeat_arrival_within_the_window_is_refused() {
-        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
-        let start = Instant::now();
-
-        assert!(cooldown.claim(peer(1), start));
-        assert!(
-            !cooldown.claim(peer(1), start + NEIGHBOR_COOLDOWN / 2),
-            "a peer reconnecting inside the window must not trigger a second repair"
-        );
-    }
-
-    #[test]
-    fn the_same_peer_is_allowed_again_once_the_window_passes() {
-        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
-        let start = Instant::now();
-
-        assert!(cooldown.claim(peer(1), start));
-        assert!(
-            cooldown.claim(peer(1), start + NEIGHBOR_COOLDOWN),
-            "the limit is a rate, not a ban: a genuine later reconnect must repair"
-        );
-    }
-
-    #[test]
-    fn one_peers_cooldown_does_not_suppress_another() {
-        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
-        let start = Instant::now();
-
-        assert!(cooldown.claim(peer(1), start));
-        assert!(
-            cooldown.claim(peer(2), start),
-            "the budget is per peer; one noisy peer must not starve a quiet one"
-        );
-    }
-
-    #[test]
-    fn expired_entries_are_pruned_so_the_map_cannot_grow_without_bound() {
-        let mut cooldown = Cooldown::new(NEIGHBOR_COOLDOWN);
-        let start = Instant::now();
-
-        // A flood of distinct peers, which is what an attacker controls: peer
-        // ids are free to mint.
-        for seed in 0..64u8 {
-            cooldown.claim(peer(seed), start);
-        }
-        assert_eq!(cooldown.tracked(), 64, "all should be tracked while fresh");
-
-        // One arrival after the window must collect every stale entry, or the
-        // rate limit would trade a CPU vector for a memory one.
-        cooldown.claim(peer(200), start + NEIGHBOR_COOLDOWN);
-        assert_eq!(
-            cooldown.tracked(),
-            1,
-            "expired entries must be pruned, leaving only the live one"
-        );
-    }
 }

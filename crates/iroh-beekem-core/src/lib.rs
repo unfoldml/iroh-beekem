@@ -13,6 +13,13 @@
 //! virtual time and a seeded RNG, so that partitions, reordering and concurrent
 //! membership changes can be property-tested rather than hoped about.
 //!
+//! Two modules look like exceptions and are not. [`wire`] frames bytes, which
+//! opens no socket and reads no clock; [`cooldown`] is *given* an instant, never
+//! reads one, exactly as [`state::WorkspaceState::handle`] is given `now`. Both
+//! are here because both backends need them and both had written their own —
+//! and a rule that is checked twice is a rule that eventually disagrees with
+//! itself.
+//!
 //! This is enforced mechanically; see `xtask-style` check in the README:
 //!
 //! ```text
@@ -29,6 +36,7 @@ pub mod asset;
 pub mod blinding;
 pub mod capability;
 pub mod content;
+pub mod cooldown;
 pub mod error;
 pub mod keys;
 pub mod manifest;
@@ -36,6 +44,7 @@ pub mod snapshot;
 pub mod state;
 pub mod sync_poll;
 pub mod version;
+pub mod wire;
 
 pub use asset::{ASSET_SEGMENT_BYTES, AssetKey, AssetMeta, SegmentVerdict};
 pub use blinding::{DocumentUuid, StorageKey, WorkspaceSecret};
@@ -44,9 +53,11 @@ pub use capability::{
     DeviceBinding, Grant, Policy, ProposalStatus, Role,
 };
 pub use content::{Chunk, ChunkRef};
+pub use cooldown::{Cooldown, Deadline};
 pub use error::CoreError;
 pub use keys::{AuthorizedOp, CgkaController, ControlOp, DecryptOutcome, EpochId, MergeOutcome};
 pub use manifest::{DeviceDisplay, DeviceRecord, FileEntry, Manifest, UserRecord, WorkspaceInfo};
 pub use snapshot::{CgkaSnapshot, SNAPSHOT_VERSION, WorkspaceSnapshot};
-pub use state::{Effect, Event, NamespaceEpoch, RepairTarget, WorkspaceState};
+pub use state::{ANNOUNCED_ONCE, Effect, Event, NamespaceEpoch, RepairTarget, WorkspaceState};
 pub use version::{Checkpoint, RestoreOutcome, UnixSeconds, VersionId, VersionInfo};
+pub use wire::{ControlMsg, MAX_LOG_CERTS, MAX_LOG_OPS, decode_chunk, encode_chunk};

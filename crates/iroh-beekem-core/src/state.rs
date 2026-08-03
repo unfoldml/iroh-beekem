@@ -36,7 +36,10 @@
 //! nothing outside it, so the repair reaches new members without reaching
 //! removed ones.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use beekem::{
     id::{MemberId, TreeId},
@@ -51,13 +54,16 @@ use zeroize::Zeroizing;
 use crate::{
     asset::{AssetKey, AssetMeta},
     blinding::{DocumentUuid, StorageKey, WorkspaceSecret},
-    capability::{AdminAction, CapabilityStore, Certificate, DEFAULT_THRESHOLD, Role},
+    capability::{
+        AdminAction, CapabilityStore, Certificate, DEFAULT_THRESHOLD, Role, member_from_bytes,
+    },
     content::{Chunk, ChunkRef},
     error::CoreError,
     keys::{AuthorizedOp, CgkaController, DecryptOutcome, EpochId, MergeOutcome},
     manifest::{DeviceRecord, FileEntry, Manifest, WorkspaceInfo, hex},
-    snapshot::{SNAPSHOT_VERSION, WorkspaceSnapshot, member_from_bytes},
+    snapshot::{SNAPSHOT_VERSION, WorkspaceSnapshot},
     version::{AssetVersion, Checkpoint, RestoreOutcome, UnixSeconds, VersionId, VersionInfo},
+    wire::{ControlMsg, MAX_LOG_CERTS, MAX_LOG_OPS},
 };
 
 /// How much ciphertext may sit parked awaiting keys or CRDT dependencies.
@@ -530,6 +536,43 @@ pub enum Event {
     },
 }
 
+/// The three things broadcast exactly once, with no later write behind them.
+///
+/// A document has anti-entropy for free: the next edit carries whatever the last
+/// one lost. These do not. A rotation is announced once, the manifest is
+/// published only when it changes, and a certificate is broadcast when it is
+/// minted — so each needs a deliberate re-announcement, and dropping any one has
+/// its own distinct cost:
+///
+/// * the namespace — a member stranded on a replica the group abandoned, removed
+///   in effect without anyone having removed it;
+/// * the manifest — a peer missing from somebody's roster until the next
+///   membership change happens to republish it, since the roster derives from
+///   device records and those live in the manifest;
+/// * the certificates — worst of the three, because a lost approval leaves a
+///   quorum that formed on one node and nowhere else: an action performed there
+///   and refused everywhere. A role change is worse still, since it mints a
+///   grant and no operation at all, which makes this its *only* anti-entropy.
+///
+/// # Why this is one list and not three
+///
+/// Three paths across two backends must drive all of it: the `iroh-beekem`
+/// facade's public `resync` and its internal `republish`, and the simulator's
+/// periodic resync tick. They had drifted twice. First inside the facade, where
+/// `republish` drove all three while `resync` drove only the first two, so the
+/// quorum hole above was reachable by any library caller and by no in-tree test.
+/// Then across the crate boundary, where the simulator's tick drove two of the
+/// three and its `republish` drove all of them. Sharing one list makes both
+/// divergences unrepresentable rather than merely fixed.
+///
+/// **Adding a fourth thing announced once means adding it here**, not at a call
+/// site.
+pub const ANNOUNCED_ONCE: [Event; 3] = [
+    Event::ResyncManifest,
+    Event::ResyncNamespace,
+    Event::ResyncCertificates,
+];
+
 /// Something the caller must do on this node's behalf.
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -568,8 +611,11 @@ pub enum Effect {
     /// **The caller must rate-limit this**, and feed it back as
     /// [`Event::RemoveMember`]. Answering costs a removal and a namespace
     /// rotation, so an attacker re-adding in a loop would otherwise churn the
-    /// whole group. The core has no clock to limit with; both backends already
-    /// keep a `Cooldown` for the repair path and this reuses the pattern.
+    /// whole group. The core is never *given* a clock to limit with, so the
+    /// window is the caller's; the limiter itself is [`Cooldown`], which both
+    /// backends already use for the repair path.
+    ///
+    /// [`Cooldown`]: crate::cooldown::Cooldown
     EvictUncertified {
         /// The leaf to remove.
         member: MemberId,
@@ -692,6 +738,30 @@ pub enum Effect {
         target: RepairTarget,
         /// The epoch it cannot derive.
         epoch: EpochId,
+    },
+    /// Fetch one asset's key chunk and hand it back to
+    /// [`WorkspaceState::reseal_asset_key`].
+    ///
+    /// The answer to a [`RepairTarget::AssetKey`] request, and the only repair
+    /// that cannot be produced from state alone: an asset's content key lives in
+    /// a blob any member can fetch, and caching it here would mean persisting a
+    /// secret to save a decryption. So the core asks for the ciphertext rather
+    /// than holding it.
+    ///
+    /// This is what makes an asset repair cheap. Segments are sealed under the
+    /// asset's own content key, so restoring a ten-gigabyte asset to a newly
+    /// admitted member costs one 32-byte chunk under a fresh epoch. Keying the
+    /// segments with CGKA application secrets directly would have made it
+    /// proportional to the bytes.
+    ///
+    /// A backend that cannot find the chunk does nothing, and that is correct
+    /// rather than a failure: some other member will answer, exactly as with a
+    /// document repair a viewer cannot serve.
+    ResealAssetKey {
+        /// The member that cannot derive the asset's key.
+        requester: MemberId,
+        /// Which asset they are stuck on.
+        asset: DocumentUuid,
     },
 }
 
@@ -1668,6 +1738,134 @@ impl WorkspaceState {
     /// Propagates [`CoreError::Cgka`] if the operation graph cannot be sorted.
     pub fn op_log(&self) -> Result<Vec<Signed<CgkaOperation>>, CoreError> {
         self.cgka.op_log()
+    }
+
+    /// Handle one control-plane message, returning the effects to perform.
+    ///
+    /// [`Self::handle`] with the wire's framing in front of it, and the second
+    /// of this type's two entry points.
+    ///
+    /// # Why this is here and not in the transport
+    ///
+    /// Turning a [`ControlMsg`] into the events it stands for is protocol, and
+    /// it was written twice — once in the `iroh-beekem` facade and once in the
+    /// simulator. The copies drifted, which is not a hypothetical: the receiver-
+    /// side author check lived in the facade alone for a whole phase, so a
+    /// property that claimed to reject a forged entry was asserting something
+    /// weaker than it read as. One dispatch here makes that class of divergence
+    /// unrepresentable rather than merely repaired.
+    ///
+    /// # What this does not do
+    ///
+    /// It does not re-read the index. Four of the six messages leave a backend
+    /// with new key material that may unlock chunks it already fetched and
+    /// refused, but *acting* on that means re-reading a replicated index, and
+    /// only a backend that has one can do it. The follow-up is the same for
+    /// every message, so it belongs at the call site rather than in a per-arm
+    /// effect the simulator could only map to nothing.
+    ///
+    /// It also does not rate-limit. See [`ControlMsg::answer_cooldown_key`]:
+    /// answering a repair costs the whole group a re-key, so the limit has to
+    /// run *before* any work here, and it needs a clock this crate is never
+    /// given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::MalformedKey`] if a [`ControlMsg::Repair`] names
+    /// bytes that are not a verifying key — such a value could never have
+    /// entered the tree, so the sender is not a member. Returns
+    /// [`CoreError::IncompleteLog`] if a [`ControlMsg::Log`] or
+    /// [`ControlMsg::Certs`] exceeds [`MAX_LOG_OPS`] or [`MAX_LOG_CERTS`];
+    /// nothing is merged in that case, which is the whole point of the bound.
+    /// Otherwise propagates whatever [`Self::handle`] would.
+    pub fn on_control<R: CryptoRng + RngCore>(
+        &mut self,
+        msg: ControlMsg,
+        csprng: &mut R,
+        now: UnixSeconds,
+    ) -> Result<Vec<Effect>, CoreError> {
+        match msg {
+            ControlMsg::Op { op, proof } => {
+                self.handle(Event::ControlOp(AuthorizedOp::new(*op, proof)), csprng, now)
+            }
+            ControlMsg::Certs(certs) => {
+                Self::refuse_oversized(0, certs.len())?;
+                self.handle(Event::CertsArrived(certs), csprng, now)
+            }
+            ControlMsg::Log { ops, certs } => {
+                Self::refuse_oversized(ops.len(), certs.len())?;
+                // Certificates strictly first: they authorise the `Add`s in the
+                // log, so replaying the operations against an empty closure
+                // would refuse the very history this message exists to hand
+                // over. An operation refused for want of a certificate is not
+                // parked — no later certificate brings it back — so the order is
+                // the difference between a repair and a silent loss.
+                let mut effects = self.handle(Event::CertsArrived(certs), csprng, now)?;
+                for op in ops {
+                    // Each operation individually, and a rejection does not
+                    // abandon the rest: a log is a repair broadcast, so one
+                    // operation this node will not accept says nothing about the
+                    // next, and stopping here would discard the remainder of a
+                    // history that is otherwise sound.
+                    if let Ok(mut more) = self.handle(
+                        Event::ControlOp(AuthorizedOp::bare(Arc::new(op))),
+                        csprng,
+                        now,
+                    ) {
+                        effects.append(&mut more);
+                    } else {
+                        // Refused: not a member, not permitted, or not
+                        // verifiable. The next operation is judged on its own.
+                    }
+                }
+                Ok(effects)
+            }
+            // The nudge is the whole message. See the variant's documentation:
+            // acting on it means re-reading an index, which is the transport's
+            // job and not this crate's.
+            ControlMsg::Announce { .. } => Ok(Vec::new()),
+            ControlMsg::Namespace { epoch, chunk } => {
+                self.handle(Event::NamespaceArrived { epoch, chunk }, csprng, now)
+            }
+            ControlMsg::Repair {
+                member,
+                target,
+                epoch,
+            } => {
+                let requester = member_from_bytes(member)?;
+                self.handle(
+                    Event::RepairRequested {
+                        requester,
+                        target,
+                        epoch,
+                    },
+                    csprng,
+                    now,
+                )
+            }
+        }
+    }
+
+    /// Refuse a control message that would cost more to merge than it can be
+    /// worth.
+    ///
+    /// A repair broadcast is unsolicited and its cost falls on every receiver:
+    /// one message can otherwise buy an attacker an unbounded number of
+    /// signature checks and closure recomputes on every node that hears it. The
+    /// bounds are far above any real workspace, so an honest peer never meets
+    /// them — which matters, because a bound tight enough to bite would break
+    /// the repair the message exists to perform.
+    ///
+    /// Reported as an error rather than as an empty effect list, so a caller can
+    /// tell "this changed nothing" from "this was refused before it could".
+    fn refuse_oversized(ops: usize, certs: usize) -> Result<(), CoreError> {
+        if ops > MAX_LOG_OPS || certs > MAX_LOG_CERTS {
+            Err(CoreError::IncompleteLog {
+                unresolved: ops.saturating_add(certs),
+            })
+        } else {
+            Ok(())
+        }
     }
 
     /// Handle one event, returning the effects the caller must perform.
@@ -3096,14 +3294,24 @@ impl WorkspaceState {
                     Vec::new()
                 }
             }
-            // Answered by [`Self::reseal_asset_key`] and not from here, because
-            // it is the one repair target whose ciphertext is not in state: an
-            // asset's content key lives in a blob, recoverable by any member, and
-            // is deliberately not cached. The caller fetches that blob and calls
-            // the method; reaching this arm means a request arrived through a
-            // path that has not been taught to, which is worth no effects rather
-            // than a silent partial answer.
-            RepairTarget::AssetKey(_) => Vec::new(),
+            // The one repair target whose ciphertext is not in state: an asset's
+            // content key lives in a blob any member can fetch, and caching it
+            // here would mean persisting a secret to save a decryption. So the
+            // answer is asked for rather than produced — the backend fetches the
+            // blob and calls [`Self::reseal_asset_key`] with it.
+            //
+            // Asked for rather than left to the backend to notice, because a
+            // backend that did not notice answered nothing and said nothing: the
+            // simulator reached this arm on every asset repair for as long as it
+            // returned an empty vector, so the whole mechanism was invisible to
+            // the property suite.
+            //
+            // Not counted in `repairs_answered` here. Nothing has been answered
+            // yet; whether it can be depends on a blob this node may not hold,
+            // and `reseal_asset_key` counts it when it succeeds.
+            RepairTarget::AssetKey(asset) => {
+                return Ok(vec![Effect::ResealAssetKey { requester, asset }]);
+            }
         };
         if effects.is_empty() {
             // Nothing to offer: no epoch was minted, so nothing is counted.

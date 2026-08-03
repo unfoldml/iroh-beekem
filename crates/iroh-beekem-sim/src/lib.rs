@@ -9,15 +9,31 @@
 //! is a synchronous callback, so a state machine that needed an async runtime
 //! could not be plugged in at all.
 //!
+//! # What is modelled and what is shared
+//!
+//! The control plane is **not** modelled. [`Msg::Control`] carries the core's own
+//! [`ControlMsg`], and every one is dispatched by
+//! `WorkspaceState::on_control` — the same method the real `Workspace` calls. So
+//! the receive caps, the certificates-before-operations ordering inside a log,
+//! and the refusal of a repair naming bytes that are not a member key are things
+//! this harness *exercises* rather than things it resembles. The mapping used to
+//! be written here as well as in the facade, and the copies drifted.
+//!
+//! What is modelled is everything the transport supplies: the join handshake
+//! ([`Msg::Hello`], [`Msg::Welcome`]), which stands in for an `Invite`; the
+//! replicated index and its payloads ([`Msg::Entry`], [`Msg::Segment`]), which
+//! production gets from `iroh-docs` and `iroh-blobs`; admission, persistence and
+//! range reconciliation; and the adversaries.
+//!
 //! # The simulated protocol
 //!
 //! Node 0 founds the workspace. Every other node publishes its leaf key with
 //! [`Msg::Hello`], the founder admits it and replies with [`Msg::Welcome`]
 //! carrying the full CGKA operation log, and the joiner replays that log to
-//! reconstruct the group. Thereafter all nodes gossip [`Msg::Op`] (control
-//! plane) and [`Msg::Entry`] (data plane), with [`Msg::Log`] and
-//! [`Msg::Repair`] as the two repair paths — one for a lost operation, one for
-//! an epoch a node was admitted too late to derive.
+//! reconstruct the group. Thereafter all nodes gossip [`ControlMsg::Op`]
+//! (control plane) and [`Msg::Entry`] (data plane), with [`ControlMsg::Log`] and
+//! [`ControlMsg::Repair`] as the two repair paths — one for a lost operation,
+//! one for an epoch a node was admitted too late to derive.
 //!
 //! Messages that arrive before a node has joined are buffered rather than
 //! dropped, because under an unordered transport a `Welcome` routinely loses
@@ -29,7 +45,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
-    sync::Arc,
     time::Duration,
 };
 
@@ -38,9 +53,9 @@ use beekem::{
     operation::CgkaOperation,
 };
 use iroh_beekem_core::{
-    AdminAction, AssetMeta, AuthorizedOp, Certificate, CgkaController, Chunk, Effect, EpochId,
-    Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget, StorageKey, UnixSeconds,
-    WorkspaceSecret, WorkspaceState,
+    ANNOUNCED_ONCE, AdminAction, AssetMeta, Certificate, CgkaController, Chunk, ControlMsg,
+    Cooldown, Effect, EpochId, Event, FileEntry, NamespaceEpoch, ProposalStatus, RepairTarget,
+    StorageKey, UnixSeconds, WorkspaceSecret, WorkspaceState,
     asset::{ContentDigest, open_segment, seal_segment},
     state::AssetKeyVerdict,
     version::AssetVersion,
@@ -243,6 +258,20 @@ const RECONCILE_EVERY: u32 = 4;
 /// this whole mechanism exists to prevent. The real `Workspace` uses the same
 /// relationship at a larger scale.
 const REPAIR_COOLDOWN: Duration = Duration::from_millis(500);
+
+/// How long *answering* one member's repair request is suppressed.
+///
+/// Zero, which switches the limit off and reproduces the behaviour this harness
+/// has always had. The real `Workspace` suppresses a repeat answer for two
+/// seconds, because there the requester is untrusted and answering costs the
+/// whole group a re-key; here the requesters are the scenario's own nodes,
+/// asking a bounded number of times, and a live limit would only risk starving
+/// the `eventually_within` budgets the repair properties depend on.
+///
+/// Kept as a named constant rather than omitted, so that the simulator's
+/// position on this is a line somebody can read and change, instead of an
+/// absence nobody can see. Raising it is a deliberate experiment, not a fix.
+const REPAIR_ANSWER_COOLDOWN: Duration = Duration::ZERO;
 
 /// How often a rotating node re-keys its leaf.
 const ROTATE_INTERVAL: Duration = Duration::from_millis(350);
@@ -818,70 +847,27 @@ pub enum Msg {
         /// The blinding secret for storage keys.
         secret: [u8; 32],
     },
-    /// Control plane: a signed CGKA operation, with the certificates that
-    /// authorise it.
+    /// Everything on the control plane, as the wire carries it.
     ///
-    /// The proof travels *with* the operation because the receiver checks the
-    /// issuer's capability before merging: one shipped without it is refused
-    /// rather than parked, and no later certificate brings it back. Modelling
-    /// them as separate messages would make the simulator strictly more fragile
-    /// than production, which is the mistake `Msg::Log` exists to avoid.
-    Op {
-        /// The operation.
-        op: Box<Signed<CgkaOperation>>,
-        /// Certificates authorising it.
-        proof: Vec<Certificate>,
-    },
-    /// Control plane: capability certificates with no operation behind them.
+    /// The core's [`ControlMsg`], shared with the real `Workspace` rather than
+    /// modelled beside it. Five variants used to live here — `Op`, `Certs`,
+    /// `Log`, `Repair` and `Namespace` — each restating a `ControlMsg` variant,
+    /// and each dispatched by a copy of the facade's `apply_control_msg`. The
+    /// copies drifted, which is not hypothetical: the receiver-side author check
+    /// existed in the facade alone for a whole phase, so a property here claimed
+    /// more than it asserted.
     ///
-    /// A role change mints a grant and no CGKA operation, so it needs its own
-    /// carrier. The counterpart of `ControlMsg::Certs`.
-    Certs(Vec<Certificate>),
-    /// Control plane repair: the sender's whole operation log.
+    /// Sharing the type shares the dispatch with it. Both backends now call
+    /// `WorkspaceState::on_control`, so the operation-log caps, the
+    /// certificates-before-operations ordering and the refusal of a repair
+    /// naming bytes that are not a member key are all things this harness
+    /// exercises rather than things it merely resembles.
     ///
-    /// The counterpart of `ControlMsg::Log`, which the real `Workspace` ships
-    /// whenever a neighbour appears. Without it a single lost [`Msg::Op`] is
-    /// lost *forever*, and the consequences are unrecoverable rather than
-    /// merely slow: a peer that misses the operation establishing a PCS key can
-    /// never derive it, so every later chunk and every later manifest encrypted
-    /// under that key is permanently undecryptable to it. Anti-entropy on the
-    /// data plane cannot repair that, because re-announcing re-encrypts under
-    /// the same key the peer already could not derive.
-    ///
-    /// Modelling the data plane's repair but not the control plane's would have
-    /// made the simulator strictly more fragile than production, and every
-    /// resulting failure an artefact of the harness.
-    Log {
-        /// The operation log, in causal order.
-        ops: Vec<Signed<CgkaOperation>>,
-        /// The sender's whole certificate store.
-        ///
-        /// Not optional, for the same reason the log itself is not: the
-        /// certificates authorise every `Add` it contains, and they are the only
-        /// anti-entropy a role change gets. Shipping the log without them would
-        /// make log repair reinstate the very hole phase 5 closed.
-        certs: Vec<Certificate>,
-    },
-    /// Control plane repair: "I can never decrypt what you are publishing."
-    ///
-    /// The counterpart of `ControlMsg::Repair`. A peer admitted after content
-    /// already existed cannot derive the epoch that content was keyed under,
-    /// and no amount of re-announcement helps — anti-entropy re-encrypts under
-    /// that same epoch. This is how it says so, and a member that can read the
-    /// content answers by minting a new epoch and publishing under it.
-    ///
-    /// Carried on the control plane rather than the data plane because that is
-    /// where the answer's key material has to travel anyway, and because it is
-    /// gated by the same roster: a node nobody admits cannot make the group
-    /// re-key.
-    Repair {
-        /// Who is stuck. Checked against current membership by the receiver.
-        member: MemberId,
-        /// What they cannot read.
-        target: RepairTarget,
-        /// The epoch they cannot derive, which keys the sender's cooldown.
-        epoch: EpochId,
-    },
+    /// Note what this made *representable*: `Msg::Repair` carried a typed
+    /// `MemberId`, so a request naming an invalid point could not be sent at
+    /// all, and the reasoning `ControlMsg::Repair` records had never been under
+    /// test. `ControlMsg` carries raw bytes, so it can be.
+    Control(ControlMsg),
     /// Data plane: one entry in the replicated index.
     ///
     /// Carries the *blinded key* rather than a document id, because that is all
@@ -932,18 +918,6 @@ pub enum Msg {
         author: NodeId,
         /// The sealed segment.
         bytes: Vec<u8>,
-    },
-    /// A rotation to a fresh replicated index.
-    ///
-    /// The capability travels encrypted under the group key, so a device
-    /// removed before the rotation cannot read it and stays on the abandoned
-    /// namespace. Carried on the control plane because the data plane is the
-    /// thing being replaced.
-    Namespace {
-        /// The generation being announced.
-        epoch: u32,
-        /// The encrypted capability.
-        chunk: Box<Chunk>,
     },
 }
 
@@ -1190,13 +1164,38 @@ pub struct WorkspaceNode<S: Scenario = Honest> {
     namespace: NamespaceEpoch,
     /// Control-plane operations seen, whether or not they applied.
     observed_ops: u64,
-    /// When each distinct repair request was last put on the wire.
+    /// How often this node may put the same repair request on the wire.
     ///
-    /// The rate limiter the core cannot own, because the core has no clock.
-    /// A `BTreeMap` rather than a `HashMap` so that nothing about this node's
-    /// behaviour can depend on hash iteration order, which is the kind of
-    /// nondeterminism `the_simulation_is_reproducible` exists to catch.
-    repair_sent: BTreeMap<(RepairTarget, EpochId), Duration>,
+    /// The core's [`Cooldown`], measured against virtual time rather than a wall
+    /// clock — it is *given* an instant and never reads one, which is why it can
+    /// live in a crate with no clock. Keyed per `(target, epoch)` so a node that
+    /// becomes stuck on a new epoch is not silenced by the window it opened for
+    /// the old one.
+    ///
+    /// Its internal map is a `HashMap`, and that is safe here although the field
+    /// it replaced was a `BTreeMap` for determinism: nothing reads the map in
+    /// order. A claim is a lookup and an insert, and the prune only removes, so
+    /// no outcome can depend on iteration order and
+    /// `the_simulation_is_reproducible` still holds.
+    repair_sent: Cooldown<(RepairTarget, EpochId), Duration>,
+    /// Entries observed but refused, because their author held no writing role
+    /// when they arrived.
+    ///
+    /// Retried on every `Effect::ManifestUpdated`, which is when the claim or
+    /// the grant that would admit them can have landed. Production needs no such
+    /// list: `ingest_all` re-reads the whole index each pass and records an entry
+    /// in `seen_entries` only once it has been *applied*, so a refusal is
+    /// re-offered for free. Without this the harness would drop on refusal and
+    /// turn every ordinary catch-up race into permanent lost content.
+    refused: Vec<(StorageKey, NodeId, Box<Chunk>)>,
+    /// How often this node may *answer* one member's repair request.
+    ///
+    /// Set to a zero window, so today it suppresses nothing and the harness
+    /// behaves exactly as it did — see [`REPAIR_ANSWER_COOLDOWN`]. It exists
+    /// anyway because the facade has had this limit since phase 4 and the
+    /// simulator simply did not, which is the kind of gap that is invisible
+    /// until somebody reads both files side by side.
+    repair_answers: Cooldown<[u8; 32], Duration>,
     /// Client operations that arrived before this node finished joining.
     ///
     /// Held rather than failed. The harness allows one operation in flight per
@@ -1329,6 +1328,31 @@ const SIM_EPOCH: i64 = 1_767_225_600;
 /// still governs message timing and delivery.
 fn node_rng(me: NodeId, salt: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(me.0.wrapping_mul(0x9E37_79B9).wrapping_add(salt))
+}
+
+/// The RNG salt one control-plane message is handled under.
+///
+/// [`node_rng`] seeds a fresh stream per salt, so two calls sharing one salt
+/// draw identical randomness. That is harmless for a message that only merges,
+/// and it is a defect for one that re-keys: answering two repairs with the same
+/// salt would mint the *same* epoch twice and leave the second requester exactly
+/// as stuck as it was. So a repair takes its salt from the epoch it names, and
+/// every other message takes a constant of its own — distinct per variant, which
+/// is what stops two arriving in one round from encrypting under the same
+/// stream.
+fn control_salt(msg: &ControlMsg) -> u64 {
+    match msg {
+        ControlMsg::Op { .. } => 2,
+        ControlMsg::Certs(_) => 5,
+        ControlMsg::Log { .. } => 4,
+        ControlMsg::Namespace { .. } => 6,
+        ControlMsg::Announce { .. } => 7,
+        // The one salt that must vary. Eight bytes of a digest, which is as
+        // distinct between two epochs as anything this node can compute.
+        ControlMsg::Repair { epoch, .. } => {
+            u64::from_le_bytes(epoch.as_bytes()[..8].try_into().unwrap_or([0u8; 8]))
+        }
+    }
 }
 
 /// The blinded key a document is stored under, as every node computes it.
@@ -1909,10 +1933,15 @@ impl<S: Scenario> WorkspaceNode<S> {
 
     /// Broadcast this node's whole operation log, so peers can fill in gaps.
     ///
-    /// Bounded by nothing here because the simulated log is tiny; the real
-    /// `Workspace` caps the receive side with `MAX_LOG_OPS` and rate-limits the
-    /// send side with a per-peer cooldown, both of which are transport concerns
-    /// rather than protocol ones.
+    /// The receive side is bounded by [`MAX_LOG_OPS`] and [`MAX_LOG_CERTS`],
+    /// which live in the core and so apply here exactly as they do in
+    /// production — a bound this harness used to lack entirely. Only the *send*
+    /// rate is a transport concern: the real `Workspace` ships its log when a
+    /// neighbour appears behind a per-peer cooldown, and here a periodic tick
+    /// stands in for that.
+    ///
+    /// [`MAX_LOG_OPS`]: iroh_beekem_core::MAX_LOG_OPS
+    /// [`MAX_LOG_CERTS`]: iroh_beekem_core::MAX_LOG_CERTS
     fn send_log(&mut self, cx: &mut dyn Ctx<Self>) {
         let Some(state) = self.state.as_ref() else {
             return;
@@ -1921,57 +1950,73 @@ impl<S: Scenario> WorkspaceNode<S> {
             return;
         };
         let certs = state.capabilities().certificates();
-        if !ops.is_empty() {
-            cx.broadcast(Msg::Log { ops, certs });
+        if ops.is_empty() {
+            // Nothing to repair with; a log of no operations tells a peer
+            // nothing its own absence of one does not.
+        } else {
+            cx.broadcast(Msg::Control(ControlMsg::Log { ops, certs }));
         }
     }
 
-    /// Merge every operation in a peer's repair broadcast.
+    /// Hand one control-plane message to the shared dispatch.
     ///
-    /// Counted as observed one operation at a time, exactly like [`Msg::Op`]:
-    /// what a node saw on the control plane is the question the revocation
-    /// properties ask, and a repair carrying ten operations is ten things seen.
-    fn on_log(
-        &mut self,
-        ops: Vec<Signed<CgkaOperation>>,
-        certs: Vec<Certificate>,
-        cx: &mut dyn Ctx<Self>,
-    ) {
-        // Certificates strictly first: they authorise the `Add`s in the log, so
-        // replaying the operations against an empty closure would refuse the
-        // history this message exists to hand over.
-        self.drive(Event::CertsArrived(certs), cx, 5);
-        for op in ops {
-            self.observed_ops += 1;
-            self.drive(Event::ControlOp(AuthorizedOp::bare(Arc::new(op))), cx, 4);
+    /// The whole of what this node does with the control plane, and none of it
+    /// is written here: `WorkspaceState::on_control` maps the message to the
+    /// events it stands for, and the facade calls the identical method. What
+    /// remains on this side is the three things a state machine cannot own —
+    /// the rate limit, which needs a clock; the instrumentation the properties
+    /// read; and the deferred client operations new key material may unblock.
+    ///
+    /// # The salt
+    ///
+    /// One call, so one salt, where the hand-written dispatch used a different
+    /// one per arm. It is derived from the message rather than fixed, because
+    /// `drive` seeds a fresh RNG from it: two repairs answered with the same
+    /// salt would re-key with an identical random stream and mint the *same*
+    /// epoch twice, leaving the second requester exactly as stuck as it was.
+    fn on_control(&mut self, msg: ControlMsg, cx: &mut dyn Ctx<Self>) {
+        // Before any work, exactly as in the facade: what is limited is the
+        // cost, so a peer ignoring its own sending cooldown must not be able to
+        // buy more re-keys by shouting. The window is zero today — see
+        // [`REPAIR_ANSWER_COOLDOWN`] — so this suppresses nothing and is here to
+        // be raised deliberately rather than discovered missing.
+        if let Some(key) = msg.answer_cooldown_key() {
+            let now = cx.now();
+            if self.repair_answers.claim(key, now) {
+                // Inside the budget; fall through and answer.
+            } else {
+                return;
+            }
+        } else {
+            // Not a message that costs this node unsolicited work.
         }
+
+        // Counted before merging and regardless of the outcome: this is what the
+        // node *saw* on the control plane, which is the question the revocation
+        // properties ask. A log carrying ten operations is ten things seen.
+        self.observed_ops += match &msg {
+            ControlMsg::Op { .. } => 1,
+            ControlMsg::Log { ops, .. } => ops.len() as u64,
+            ControlMsg::Certs(_)
+            | ControlMsg::Announce { .. }
+            | ControlMsg::Repair { .. }
+            | ControlMsg::Namespace { .. } => 0,
+        };
+
+        let salt = control_salt(&msg);
+        let me = cx.me();
+        let now = wall_clock(cx.now());
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let mut rng = node_rng(me, salt);
+        let Ok(effects) = state.on_control(msg, &mut rng, now) else {
+            return;
+        };
+        self.apply_effects(effects, cx, salt);
+        // New key material may make a client operation that was waiting on the
+        // group runnable, which is why this is here and not only in `drive`.
         self.flush_deferred_ops(cx);
-    }
-
-    /// Answer a peer that says it can never decrypt what we publish.
-    ///
-    /// The salt is derived from the epoch the requester named rather than being
-    /// a constant: `drive` seeds a fresh RNG per call, and two repairs answered
-    /// with the same salt would re-key with the identical random stream — which
-    /// would mint the *same* epoch twice and leave the second requester exactly
-    /// as stuck as it was.
-    fn on_repair(
-        &mut self,
-        member: MemberId,
-        target: RepairTarget,
-        epoch: EpochId,
-        cx: &mut dyn Ctx<Self>,
-    ) {
-        let salt = u64::from_le_bytes(epoch.as_bytes()[..8].try_into().unwrap_or([0u8; 8]));
-        self.drive(
-            Event::RepairRequested {
-                requester: member,
-                target,
-                epoch,
-            },
-            cx,
-            salt,
-        );
     }
 
     /// Recompute the modelled overlay from the workspace state.
@@ -1999,13 +2044,7 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn admits(&self, from: NodeId, msg: &Msg) -> bool {
         match msg {
             Msg::Hello { .. } | Msg::Welcome { .. } => true,
-            Msg::Op { .. }
-            | Msg::Log { .. }
-            | Msg::Certs(_)
-            | Msg::Entry { .. }
-            | Msg::Segment { .. }
-            | Msg::Repair { .. }
-            | Msg::Namespace { .. } => {
+            Msg::Control(_) | Msg::Entry { .. } | Msg::Segment { .. } => {
                 self.roster.contains(&from) || self.bootstrap.contains(&from)
             }
         }
@@ -2013,17 +2052,24 @@ impl<S: Scenario> WorkspaceNode<S> {
 
     /// Whether an entry authored by `author` should be applied.
     ///
-    /// The simulator's counterpart of the check `ingest_all` performs in the
-    /// facade, and the same predicate one indirection shorter. Production maps an
-    /// `iroh-docs` author id to a member through the manifest's self-attested
-    /// author claims before consulting the closure; there are no author ids here,
-    /// because a node id already *is* the identity the transport authenticates —
-    /// so this resolves the node id to the member key it deterministically holds
-    /// and asks the closure directly.
+    /// `WorkspaceState::author_may_write`, the same predicate the facade calls
+    /// on every entry — not a counterpart to it. It has three links: the
+    /// self-attested author claim in the manifest, the signed binding from that
+    /// device to a user, and the signed grant from that user to a role. Only the
+    /// last two used to be asked here, because the simulator never published an
+    /// author claim, and the shortened check passed entries the full one refuses.
+    /// That is the phase-11 defect in its own harness: a check that lives in one
+    /// backend is a check the properties do not bind.
+    ///
+    /// An author id and a member key are the same value here, because a node id
+    /// already *is* the identity the transport authenticates. The indirection
+    /// survives anyway, and deliberately: the claim still has to reach this node
+    /// through the manifest before the entry is accepted, so a peer that is
+    /// behind refuses and retries exactly as production does.
     ///
     /// A node id no `Add` ever introduced still yields a well-formed member key,
-    /// since key material is a pure function of the id. It simply has no binding
-    /// and no grant, so the closure gives it no role — which is exactly how a
+    /// since key material is a pure function of the id. It has no claim, no
+    /// binding and no grant — so it fails at the first link, which is how a
     /// forger's entry is refused.
     ///
     /// Own entries pass unconditionally, for the reason the facade documents: a
@@ -2033,12 +2079,9 @@ impl<S: Scenario> WorkspaceNode<S> {
         if author.0 == self.me {
             return true;
         }
-        self.state.as_ref().is_some_and(|state| {
-            state
-                .capabilities()
-                .role_of_member(&member_bytes_of(author.0))
-                .is_some_and(Role::can_write)
-        })
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.author_may_write(&member_bytes_of(author.0)))
     }
 
     /// Record an entry in the modelled replica.
@@ -2137,23 +2180,29 @@ impl<S: Scenario> WorkspaceNode<S> {
             return;
         }
         self.observe(key, author, &chunk);
-        // Observed and then refused, and the order is the whole distinction.
-        // `iroh-docs` reconciles a replica by key and records whatever arrives,
-        // so an entry written by somebody with no role *is* in the replica — what
-        // production refuses is applying it, in `ingest_all`, and that refusal is
-        // the only thing standing between a member's document and text an
-        // outsider wrote into it.
-        //
-        // Modelled here because it was missing, not because it is new: this is
-        // the receiver-side check `workspace.rs` performs on every entry, and
-        // without it the simulator was strictly weaker than production on the one
-        // plane an attacker can reach without holding any key at all.
-        if !self.author_may_write(author) {
-            return;
-        }
         let secret = WorkspaceSecret::new(workspace_secret_bytes());
+        // The manifest first, and **not** author-checked — exactly as production
+        // reads it, with `fetch_chunks(.., check_author = false)`. The check
+        // resolves an author to a member through the manifest, so checking the
+        // manifest with it is a deadlock: a joiner could never read the record
+        // that would let it read the record. What protects this key is the CGKA,
+        // not a role.
         if key == secret.manifest_key() {
             self.drive(Event::ManifestArrived { chunk }, cx, salt);
+            return;
+        }
+        // Observed and then refused, and the order is the whole distinction.
+        // A replica records whatever reconciles into it, so an entry written by
+        // somebody with no role *is* in the replica — what production refuses is
+        // applying it, and that refusal is the only thing standing between a
+        // member's document and text an outsider wrote into it.
+        if !self.author_may_write(author) {
+            // Held, not dropped. Production re-reads every entry on every ingest
+            // pass, so a refusal there is a *delay*: the certificate or the
+            // author claim that makes the entry acceptable is still in flight,
+            // and the next pass lets it through. Dropping here would make the
+            // refusal permanent and turn ordinary catch-up into lost content.
+            self.refused.push((key, author, chunk));
             return;
         }
         // Every document in the pool, not just the first. Matching only one key
@@ -2162,6 +2211,23 @@ impl<S: Scenario> WorkspaceNode<S> {
         // really a receiver that never tried.
         if let Some(doc) = DOCS.into_iter().find(|d| key == secret.storage_key(*d)) {
             self.drive(Event::ChunkArrived { doc, chunk }, cx, salt);
+        }
+    }
+
+    /// Re-offer every entry refused because its author was not yet certified.
+    ///
+    /// The modelled half of what `ingest_all` gets for free by re-reading the
+    /// index each pass. Driven from `Effect::ManifestUpdated`, because the
+    /// manifest is where both links of the predicate live: the author claim, and
+    /// the device record the role is resolved through.
+    ///
+    /// Entries still refused go back on the list, so a genuinely forged one is
+    /// retried and refused forever rather than being quietly accepted — the
+    /// property that watches for that is
+    /// `no_honest_node_ever_accepts_a_forged_entry`.
+    fn retry_refused(&mut self, cx: &mut dyn Ctx<Self>, salt: u64) {
+        for (key, author, chunk) in std::mem::take(&mut self.refused) {
+            self.on_entry(self.namespace, key, author, chunk, cx, salt);
         }
     }
 
@@ -2469,7 +2535,12 @@ impl<S: Scenario> WorkspaceNode<S> {
         // next, and none of it is anything a real node writes down.
         self.inbox.clear();
         self.deferred_ops.clear();
-        self.repair_sent.clear();
+        self.refused.clear();
+        // Re-created rather than cleared, because a limiter carries its window
+        // as well as its history and a `Cooldown` that lost its window would
+        // silently stop suppressing anything.
+        self.repair_sent = Cooldown::new(REPAIR_COOLDOWN);
+        self.repair_answers = Cooldown::new(REPAIR_ANSWER_COOLDOWN);
         self.roster.clear();
         self.observed_ops = 0;
 
@@ -2695,18 +2766,16 @@ impl<S: Scenario> WorkspaceNode<S> {
         for (i, doc) in DOCS.into_iter().enumerate() {
             self.drive(Event::Resync { doc }, cx, 9000 + i as u64);
         }
-        // The manifest too, and it is not an afterthought: it is published only
-        // when it *changes*, so a dropped manifest chunk has nothing behind it
-        // to carry the content. Device records live there, and the roster is
-        // derived from device records — omit this and a peer whose record was
-        // lost in transit is refused forever, which looks like a membership bug
-        // and is really a missing re-announcement.
-        self.drive(Event::ResyncManifest, cx, 9100);
-        self.drive(Event::ResyncNamespace, cx, 9101);
-        // Certificates too, and for a sharper reason than either of the above: a
-        // lost approval leaves a quorum that formed on one node and nowhere
-        // else, so the action is performed there and refused everywhere.
-        self.drive(Event::ResyncCertificates, cx, 9102);
+        // And the three things announced once, from the core's own list. Each is
+        // published when it *changes* and has no later write behind it: a lost
+        // manifest chunk costs its author a place on somebody's roster, a lost
+        // rotation strands a member on an abandoned replica, and a lost approval
+        // leaves a quorum that formed on one node and nowhere else. Iterating
+        // `ANNOUNCED_ONCE` rather than listing them is what stops this path and
+        // the resync tick below from disagreeing again.
+        for (i, event) in ANNOUNCED_ONCE.into_iter().enumerate() {
+            self.drive(event, cx, 9100 + i as u64);
+        }
     }
 
     /// Apply and complete everything queued while this node was still joining.
@@ -2747,10 +2816,16 @@ impl<S: Scenario> WorkspaceNode<S> {
         let mut pending_mint: Option<(u32, Vec<u8>)> = None;
         let mut pending_republish = false;
         let mut pending_eviction: Option<MemberId> = None;
+        let mut pending_reseal: Vec<(MemberId, DocumentUuid)> = Vec::new();
+        let mut pending_retry = false;
         for effect in effects {
             match effect {
-                Effect::BroadcastOp { op, proof } => cx.broadcast(Msg::Op { op, proof }),
-                Effect::BroadcastCerts(certs) => cx.broadcast(Msg::Certs(certs)),
+                Effect::BroadcastOp { op, proof } => {
+                    cx.broadcast(Msg::Control(ControlMsg::Op { op, proof }));
+                }
+                Effect::BroadcastCerts(certs) => {
+                    cx.broadcast(Msg::Control(ControlMsg::Certs(certs)));
+                }
                 // A removed member spliced a leaf back into the tree. Undoing it
                 // is a `Remove`, fed back as an ordinary event so the
                 // removal-before-rotation ordering is the same one a deliberate
@@ -2798,6 +2873,14 @@ impl<S: Scenario> WorkspaceNode<S> {
                 Effect::RequestRepair { target, epoch } => {
                     self.ask_for_repair(target, epoch, cx);
                 }
+                // The one repair answered by *fetching* rather than from state:
+                // an asset's content key lives in a chunk under its own blinded
+                // key, which here means the modelled replica. Deferred past this
+                // loop for the reason minting is — re-sealing publishes, which
+                // comes straight back through this pump.
+                Effect::ResealAssetKey { requester, asset } => {
+                    pending_reseal.push((requester, asset));
+                }
                 // Minting is I/O in production — the caller creates a namespace
                 // and hands its capability back. Here the "capability" is the
                 // generation itself, derived from the minting node and epoch so
@@ -2807,7 +2890,7 @@ impl<S: Scenario> WorkspaceNode<S> {
                     pending_mint = Some((epoch, minted_ticket(me, epoch)));
                 }
                 Effect::PublishNamespace { epoch, chunk } => {
-                    cx.broadcast(Msg::Namespace { epoch, chunk });
+                    cx.broadcast(Msg::Control(ControlMsg::Namespace { epoch, chunk }));
                 }
                 // The new index starts empty, so adopting without re-publishing
                 // would take this node's documents out of circulation.
@@ -2832,10 +2915,23 @@ impl<S: Scenario> WorkspaceNode<S> {
                         .unwrap_or_default();
                     self.index.retain(|key, _| carried.contains(key));
                     self.replica.retain(|key, _| carried.contains(key));
+                    // Refused entries go with them, and this is not tidying.
+                    // `retry_refused` re-offers under whatever namespace is
+                    // current, so an entry held from the abandoned replica would
+                    // be replayed as though it had arrived on the new one —
+                    // smuggling past the namespace check the rotation exists to
+                    // impose.
+                    self.refused.clear();
                     pending_republish = true;
                 }
                 // Purely local; nothing to tell the network about.
-                Effect::Applied { .. } | Effect::ManifestUpdated => {}
+                // The manifest is where both links of the author predicate live:
+                // the self-attested author claim, and the device record its role
+                // is resolved through. So this is exactly when an entry refused
+                // earlier may have become acceptable.
+                Effect::ManifestUpdated => pending_retry = true,
+                // Purely local; nothing to tell the network about.
+                Effect::Applied { .. } => {}
             }
         }
         self.refresh_roster();
@@ -2856,31 +2952,77 @@ impl<S: Scenario> WorkspaceNode<S> {
         } else {
             // No leaf was spliced in by a former member.
         }
+        for (requester, asset) in pending_reseal {
+            self.reseal_asset_key(requester, asset, cx, salt);
+        }
+        if pending_retry {
+            self.retry_refused(cx, salt ^ 0x2E7);
+        } else {
+            // The manifest did not move, so nothing that was refused can have
+            // become acceptable since.
+        }
+    }
+
+    /// Answer one member's asset-key repair, if this node holds the key chunk.
+    ///
+    /// The simulator's counterpart of the facade's `answer_asset_key_repair`.
+    /// Both fetch the chunk stored under the asset's own blinded key and hand it
+    /// to `WorkspaceState::reseal_asset_key`, which re-encrypts those 32 bytes
+    /// under a fresh epoch. That is the whole cost of restoring a multi-gigabyte
+    /// asset to a member admitted after it was written — the segments are sealed
+    /// under the asset's content key, not under a group secret, so nothing else
+    /// has to move.
+    ///
+    /// Holding no chunk is not a failure. Some other member answers, exactly as
+    /// with a document repair a viewer cannot serve.
+    fn reseal_asset_key(
+        &mut self,
+        requester: MemberId,
+        asset: DocumentUuid,
+        cx: &mut dyn Ctx<Self>,
+        salt: u64,
+    ) {
+        let key = WorkspaceSecret::new(workspace_secret_bytes()).asset_key_key(asset);
+        let Some((_, chunk)) = self.replica.get(&key).cloned() else {
+            return;
+        };
+        let me = cx.me();
+        // A salt of its own, derived from the one that brought us here: `drive`
+        // seeds a fresh RNG per call, and re-using the caller's would hand the
+        // re-key the same random stream as the request that prompted it.
+        let mut rng = node_rng(me, salt ^ 0xA55E);
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let Ok(effects) = state.reseal_asset_key(requester, asset, &chunk, &mut rng) else {
+            return;
+        };
+        self.apply_effects(effects, cx, salt ^ 0xA55E);
     }
 
     /// Broadcast a repair request, at most once per window per `(target, epoch)`.
     ///
     /// The core raises one of these for every unreachable chunk that arrives,
     /// which is what makes a lost request recoverable; turning that into a
-    /// bounded rate is this side's job, because the rate depends on a clock and
-    /// the core has none.
+    /// bounded rate is this side's job, because the rate depends on a clock the
+    /// core is never given here — only the window and the instant are, and the
+    /// limiter itself is the core's [`Cooldown`], shared with the facade so the
+    /// two cannot drift apart on what "the same request" means.
     fn ask_for_repair(&mut self, target: RepairTarget, epoch: EpochId, cx: &mut dyn Ctx<Self>) {
         let Some(member) = self.state.as_ref().map(WorkspaceState::member_id) else {
             return;
         };
         let now = cx.now();
-        let fresh = match self.repair_sent.get(&(target, epoch)) {
-            Some(sent) => now.saturating_sub(*sent) >= REPAIR_COOLDOWN,
-            // Never asked for this one, so there is nothing to suppress.
-            None => true,
-        };
-        if fresh {
-            self.repair_sent.insert((target, epoch), now);
-            cx.broadcast(Msg::Repair {
-                member,
+        if self.repair_sent.claim((target, epoch), now) {
+            // Raw bytes, because that is what the wire carries: a `MemberId`
+            // wraps an expanded Ed25519 point, and shipping one would make this
+            // variant an order of magnitude larger than every other. The
+            // receiver decompresses, and refuses a value that will not.
+            cx.broadcast(Msg::Control(ControlMsg::Repair {
+                member: member.to_bytes(),
                 target,
                 epoch,
-            });
+            }));
         } else {
             // Already asked within the window. Silence is correct here: the
             // answer is a group-wide re-key, so asking twice for the same epoch
@@ -2892,13 +3034,7 @@ impl<S: Scenario> WorkspaceNode<S> {
     fn flush_inbox(&mut self, cx: &mut dyn Ctx<Self>) {
         for msg in std::mem::take(&mut self.inbox) {
             match msg {
-                Msg::Op { op, proof } => {
-                    self.observed_ops += 1;
-                    self.drive(Event::ControlOp(AuthorizedOp::new(*op, proof)), cx, 0);
-                    self.flush_deferred_ops(cx);
-                }
-                Msg::Certs(certs) => self.drive(Event::CertsArrived(certs), cx, 0),
-                Msg::Log { ops, certs } => self.on_log(ops, certs, cx),
+                Msg::Control(control) => self.on_control(control, cx),
                 Msg::Entry {
                     namespace,
                     key,
@@ -2911,14 +3047,6 @@ impl<S: Scenario> WorkspaceNode<S> {
                     bytes,
                     ..
                 } => self.on_segment(namespace, key, bytes),
-                Msg::Namespace { epoch, chunk } => {
-                    self.drive(Event::NamespaceArrived { epoch, chunk }, cx, 0);
-                }
-                Msg::Repair {
-                    member,
-                    target,
-                    epoch,
-                } => self.on_repair(member, target, epoch, cx),
                 // Join-protocol messages; by the time we flush, joining is done.
                 Msg::Hello { .. } | Msg::Welcome { .. } => {}
             }
@@ -2943,10 +3071,10 @@ impl<S: Scenario> WorkspaceNode<S> {
             // No proof: the attacker holds no certificate, which is the point.
             // It is refused by the membership check before the capability check
             // is even reached.
-            cx.broadcast(Msg::Op {
+            cx.broadcast(Msg::Control(ControlMsg::Op {
                 op: Box::new(signed),
                 proof: Vec::new(),
-            });
+            }));
         }
         self.forge_entry(cx);
     }
@@ -3037,14 +3165,14 @@ impl<S: Scenario> WorkspaceNode<S> {
         }
 
         if let Ok(Some(op)) = cgka.add_member(victim_id, victim_secret.share_key()) {
-            cx.broadcast(Msg::Op {
+            cx.broadcast(Msg::Control(ControlMsg::Op {
                 op: Box::new(op),
                 proof,
-            });
+            }));
         } else {
             // Nothing minted; the certificates still go out on their own, since
             // the self-promotion does not depend on the splice landing.
-            cx.broadcast(Msg::Certs(proof));
+            cx.broadcast(Msg::Control(ControlMsg::Certs(proof)));
         }
     }
 
@@ -3253,6 +3381,25 @@ impl<S: Scenario> WorkspaceNode<S> {
             cx,
             0xE7,
         );
+        // And the author claim, without which no peer can resolve this node's
+        // entries back to its member key — so every entry it writes is refused
+        // by `WorkspaceState::author_may_write` and the node is mute while
+        // appearing perfectly healthy. Production makes the same two claims side
+        // by side, in `Workspace::assemble`.
+        //
+        // The author id is the member key itself here. Production derives a
+        // *distinct* per-workspace author from the workspace secret, so that an
+        // id syncing in the clear cannot link one device across two workspaces;
+        // the simulator has one workspace and no such linkage to protect
+        // against, and collapsing the two values keeps the indirection visible
+        // without inventing a second identifier to carry it.
+        self.drive(
+            Event::AnnounceAuthor {
+                author: member_bytes_of(me.0),
+            },
+            cx,
+            0xE8,
+        );
     }
 }
 
@@ -3269,6 +3416,13 @@ impl<S: Scenario> Node for WorkspaceNode<S> {
         let share_secret = ShareSecretKey::generate(&mut node_rng(me, 0xB2));
         self.signer = Some(signer.clone());
         self.share_secret = Some(share_secret);
+        // Before the restart branch, so both paths get a configured limiter.
+        // The harness builds nodes through `Default`, which gives a `Cooldown` a
+        // zero window — switched off. This is the one unconditional seam where
+        // the windows can be applied, so a limiter left unconfigured here would
+        // be a limit that reads as present and suppresses nothing.
+        self.repair_sent = Cooldown::new(REPAIR_COOLDOWN);
+        self.repair_answers = Cooldown::new(REPAIR_ANSWER_COOLDOWN);
 
         if self.started {
             // A restart, not a start. Neither branch below may run: re-founding
@@ -3424,16 +3578,11 @@ impl<S: Scenario> WorkspaceNode<S> {
                 // permanently undecryptable.
                 self.inbox.push(other);
             }
-            Msg::Op { op, proof } => {
-                // Counted before merging, and regardless of the outcome: this is
-                // what the node *saw* on the control plane, which is the
-                // question the revocation properties ask.
-                self.observed_ops += 1;
-                self.drive(Event::ControlOp(AuthorizedOp::new(*op, proof)), cx, 2);
-                self.flush_deferred_ops(cx);
-            }
-            Msg::Certs(certs) => self.drive(Event::CertsArrived(certs), cx, 2),
-            Msg::Log { ops, certs } => self.on_log(ops, certs, cx),
+            // The whole control plane, through the dispatch the facade calls.
+            // Everything a message means — which event, in which order, and what
+            // is refused before either — lives in `WorkspaceState::on_control`,
+            // so there is nothing here for the two backends to disagree about.
+            Msg::Control(control) => self.on_control(control, cx),
             Msg::Entry {
                 namespace,
                 key,
@@ -3446,17 +3595,6 @@ impl<S: Scenario> WorkspaceNode<S> {
                 bytes,
                 ..
             } => self.on_segment(namespace, key, bytes),
-            // The group has abandoned the namespace this node was syncing. A
-            // device removed before the rotation cannot decrypt the capability
-            // and stays behind, which is the entire mechanism.
-            Msg::Namespace { epoch, chunk } => {
-                self.drive(Event::NamespaceArrived { epoch, chunk }, cx, 5);
-            }
-            Msg::Repair {
-                member,
-                target,
-                epoch,
-            } => self.on_repair(member, target, epoch, cx),
         }
     }
 
@@ -3585,17 +3723,24 @@ impl<S: Scenario> WorkspaceNode<S> {
                     let salt = 5000 + u64::from(self.resyncs_done) * 16 + i as u64;
                     self.drive(Event::Resync { doc }, cx, salt);
                 }
-                // The manifest shares the round's salt space, one slot past the
-                // documents. It is re-announced on the same schedule because it
-                // is lost the same way, and because the roster derives from it:
-                // a device record that never arrives costs its owner a place on
-                // that peer's roster indefinitely.
-                let manifest_salt = 5000 + u64::from(self.resyncs_done) * 16 + DOCS.len() as u64;
-                self.drive(Event::ResyncManifest, cx, manifest_salt);
-                // And the rotation. Announced once when it happens, so a member
-                // that missed it is stranded on a replica the group abandoned
-                // until one of these reaches it.
-                self.drive(Event::ResyncNamespace, cx, manifest_salt + 1);
+                // The three announced-once things share the round's salt space,
+                // one slot per item past the documents. They are re-announced on
+                // the same schedule because they are lost the same way and have
+                // no later write behind them.
+                //
+                // All three, from the core's own list, and the third is the one
+                // this tick used to omit: certificates were left to `Msg::Log`
+                // on the sparser `LOG_REPAIR_EVERY` cadence, which is a
+                // *different mechanism* rather than a slower one. That made this
+                // path and `republish` disagree about a list whose whole purpose
+                // is to be shared. If the certificate broadcast proves too
+                // talkative, lengthen [`RESYNC_INTERVAL`] — do not shorten the
+                // list, because a per-item cadence is the drift `ANNOUNCED_ONCE`
+                // exists to refuse.
+                let announced_salt = 5000 + u64::from(self.resyncs_done) * 16 + DOCS.len() as u64;
+                for (i, event) in ANNOUNCED_ONCE.into_iter().enumerate() {
+                    self.drive(event, cx, announced_salt + i as u64);
+                }
                 // Control-plane repair, on a deliberately sparser cadence. The
                 // real `Workspace` ships its log on `NeighborUp` behind a
                 // ten-second per-peer cooldown, so a log broadcast every
