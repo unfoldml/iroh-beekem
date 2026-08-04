@@ -5,21 +5,26 @@ on:
     branches: [main]
   pull_request:
 
-# A superseded run tells us nothing; cancel it rather than pay for it.
+# superseded runs are canceled
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # Backtraces cost nothing until something fails, and a property-test failure
-  # without one is far more expensive to chase down.
+  # enable backtraces for all jobs, not just the test job, so that a panic in any job prints a stack trace.
   RUST_BACKTRACE: 1
 
 jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # The three suites together run in minutes now that the root manifest
+    # optimises dependencies; without that they ran for over 45 minutes and,
+    # with no timeout here, inherited GitHub's six-hour default — which is how
+    # the regression stayed invisible. A breach of this budget means something
+    # regressed, not that the runner was busy.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

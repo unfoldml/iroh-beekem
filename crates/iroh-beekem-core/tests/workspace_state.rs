@@ -5,12 +5,12 @@
 //! Reordering and partitioning are expressed by choosing when to hand a message
 //! to a node, which is exactly the seam the `propsim` harness plugs into.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use beekem::id::{MemberId, TreeId};
 use iroh_beekem_core::{
     AuthorizedOp, Certificate, CgkaController, DocumentUuid, Effect, EpochId, Event, RepairTarget,
-    Role, UnixSeconds, WorkspaceSecret, WorkspaceState,
+    Role, StorageKey, UnixSeconds, WorkspaceSecret, WorkspaceState,
 };
 use keyhive_crypto::{
     share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
@@ -22,7 +22,7 @@ fn rng(seed: u64) -> ChaCha20Rng {
     ChaCha20Rng::seed_from_u64(seed)
 }
 
-const DOC: DocumentUuid = DocumentUuid([42u8; 16]);
+const DOC: DocumentUuid = iroh_beekem_core::DocumentUuid([42u8; 16]);
 
 /// The instant every test here drives the state machine at.
 ///
@@ -57,6 +57,21 @@ struct Bus {
     bob_id: MemberId,
     /// Repair requests bob has raised and alice has not yet answered.
     repairs_from_bob: Vec<(RepairTarget, EpochId)>,
+    /// Everything alice has published, by the blinded key it went out under.
+    ///
+    /// The bus's stand-in for a blob store, and it exists for one effect:
+    /// `Effect::ResealAssetKey` asks the backend to fetch a chunk and hand it
+    /// back, because an asset's content key is the one repair target the core
+    /// deliberately does not cache. Answering it needs somewhere to fetch
+    /// *from*, and a bus that models the data plane as an unkeyed queue has
+    /// nowhere.
+    blobs: HashMap<StorageKey, iroh_beekem_core::Chunk>,
+    /// Asset-key repairs alice has been asked to perform.
+    ///
+    /// Recorded as well as answered, so a property can tell "alice answered"
+    /// apart from "alice was never asked" — which is the difference between the
+    /// repair working and the request never leaving the core.
+    asset_key_repairs: Vec<(MemberId, DocumentUuid)>,
     /// Namespace rotations alice has announced but bob has not received.
     ///
     /// Queued rather than applied so a test can assert on what alice *put on
@@ -119,6 +134,8 @@ fn two_node_workspace() -> Bus {
         bob_id,
         repairs_from_bob: Vec::new(),
         rotations_to_bob: Vec::new(),
+        blobs: HashMap::new(),
+        asset_key_repairs: Vec::new(),
     }
 }
 
@@ -138,6 +155,8 @@ impl Bus {
             bob_id,
             repairs_from_bob: Vec::new(),
             rotations_to_bob: Vec::new(),
+            blobs: HashMap::new(),
+            asset_key_repairs: Vec::new(),
         }
     }
 
@@ -182,14 +201,30 @@ impl Bus {
     /// rests on.
     fn queue_for_bob(&mut self, effects: Vec<Effect>) {
         let mut mint: Option<u32> = None;
+        // Deferred past the loop for the reason minting is: answering feeds
+        // another call into alice, and the effects being drained here came from
+        // the previous one.
+        let mut reseal: Vec<(MemberId, DocumentUuid)> = Vec::new();
         for effect in effects {
             match effect {
                 Effect::BroadcastOp { op, proof } => {
                     self.to_bob.push(AuthorizedOp::new(*op, proof));
                 }
                 Effect::BroadcastCerts(certs) => self.certs_to_bob.extend(certs),
-                Effect::StoreChunk { chunk, .. } => self.chunks_to_bob.push(*chunk),
-                Effect::StoreManifest { chunk, .. } => self.manifests_to_bob.push(*chunk),
+                Effect::StoreChunk { key, chunk, .. } => {
+                    self.blobs.insert(key, (*chunk).clone());
+                    self.chunks_to_bob.push(*chunk);
+                }
+                Effect::StoreManifest { key, chunk } => {
+                    self.blobs.insert(key, (*chunk).clone());
+                    self.manifests_to_bob.push(*chunk);
+                }
+                // The one effect a backend answers by *fetching*. Recorded and
+                // then performed, so a property can assert the request was made
+                // even when this node turns out not to hold the chunk.
+                Effect::ResealAssetKey { requester, asset } => {
+                    reseal.push((requester, asset));
+                }
                 Effect::PublishNamespace { epoch, chunk } => {
                     self.rotations_to_bob.push((epoch, *chunk));
                 }
@@ -227,6 +262,22 @@ impl Bus {
             self.queue_for_bob(effects);
         } else {
             // No rotation was requested by the event being drained.
+        }
+        for (requester, asset) in reseal {
+            self.asset_key_repairs.push((requester, asset));
+            let key = WorkspaceSecret::new(self.alice.workspace_secret()).asset_key_key(asset);
+            let Some(chunk) = self.blobs.get(&key).cloned() else {
+                // Alice never published this asset's key, so she has nothing to
+                // re-encrypt. Not a failure: in a real group another member
+                // answers, exactly as with a document repair a viewer cannot
+                // serve.
+                continue;
+            };
+            let effects = self
+                .alice
+                .reseal_asset_key(requester, asset, &chunk, &mut rng(0xA55E7))
+                .expect("alice should re-seal an asset key for a current member");
+            self.queue_for_bob(effects);
         }
     }
 
@@ -518,11 +569,14 @@ fn concurrent_edits_from_both_members_converge() {
                     .expect("alice handles bob's manifest");
             }
             // Bob is not an admin in this test, so he never rotates, never
-            // grants a role, and never evicts anybody.
+            // grants a role, and never evicts anybody. He is also never asked
+            // for a repair here: nobody in this test is stuck, and this half of
+            // the heal only carries what bob wrote while partitioned.
             Effect::RotateNamespace { .. }
             | Effect::PublishNamespace { .. }
             | Effect::AdoptNamespace { .. }
             | Effect::RequestRepair { .. }
+            | Effect::ResealAssetKey { .. }
             | Effect::Applied { .. }
             | Effect::ManifestUpdated
             | Effect::BroadcastCerts(_)
@@ -1267,9 +1321,9 @@ mod assets_keep_their_versions {
 
     use super::{Event, rng, two_node_workspace};
 
-    const ENTRY: DocumentUuid = DocumentUuid([11u8; 16]);
-    const V1: DocumentUuid = DocumentUuid([21u8; 16]);
-    const V2: DocumentUuid = DocumentUuid([22u8; 16]);
+    const ENTRY: DocumentUuid = iroh_beekem_core::DocumentUuid([11u8; 16]);
+    const V1: DocumentUuid = iroh_beekem_core::DocumentUuid([21u8; 16]);
+    const V2: DocumentUuid = iroh_beekem_core::DocumentUuid([22u8; 16]);
 
     fn meta(size: u64) -> AssetMeta {
         AssetMeta {
@@ -2303,8 +2357,7 @@ mod the_pending_queue_is_bounded {
 mod repair_reaches_a_member_admitted_late {
     use beekem::id::TreeId;
     use iroh_beekem_core::{
-        CgkaController, Chunk, Effect, EpochId, Event, RepairTarget, Role, WorkspaceSecret,
-        WorkspaceState,
+        CgkaController, Chunk, Effect, Event, RepairTarget, Role, WorkspaceSecret, WorkspaceState,
     };
     use keyhive_crypto::{
         share_key::ShareSecretKey, signer::memory::MemorySigner, verifiable::Verifiable,
@@ -2426,7 +2479,10 @@ mod repair_reaches_a_member_admitted_late {
         );
         assert_eq!(
             bus.repairs_from_bob(),
-            &[(RepairTarget::Document(DOC), EpochId::of(&stale))],
+            &[(
+                RepairTarget::Document(DOC),
+                iroh_beekem_core::EpochId::of(&stale)
+            )],
             "the request must name the document and the exact epoch bob failed on, \
              since that pair is what a responder's rate limiter is keyed on"
         );
@@ -2455,8 +2511,8 @@ mod repair_reaches_a_member_admitted_late {
         );
         let answer = bus.chunk_queued_for_bob();
         assert_ne!(
-            EpochId::of(&answer),
-            EpochId::of(&stale),
+            iroh_beekem_core::EpochId::of(&answer),
+            iroh_beekem_core::EpochId::of(&stale),
             "a repair keyed under the epoch that was reported unreadable carries \
              nothing new, which is the defect this whole path exists to fix"
         );
@@ -2525,8 +2581,8 @@ mod repair_reaches_a_member_admitted_late {
             52,
         ));
         assert_eq!(
-            EpochId::of(&first),
-            EpochId::of(&second),
+            iroh_beekem_core::EpochId::of(&first),
+            iroh_beekem_core::EpochId::of(&second),
             "the ordinary publish path must reuse the epoch — if it did not, \
              this test would be proving nothing about the repair below"
         );
@@ -2535,13 +2591,13 @@ mod repair_reaches_a_member_admitted_late {
             Event::RepairRequested {
                 requester: bus.bob.member_id(),
                 target: RepairTarget::Document(DOC),
-                epoch: EpochId::of(&second),
+                epoch: iroh_beekem_core::EpochId::of(&second),
             },
             53,
         ));
         assert_ne!(
-            EpochId::of(&repaired),
-            EpochId::of(&second),
+            iroh_beekem_core::EpochId::of(&repaired),
+            iroh_beekem_core::EpochId::of(&second),
             "a repair must mint a new epoch, or it tells the stuck peer nothing"
         );
     }
@@ -2566,7 +2622,7 @@ mod repair_reaches_a_member_admitted_late {
             Event::RepairRequested {
                 requester: bob_id,
                 target: RepairTarget::Document(DOC),
-                epoch: EpochId::of(&stale),
+                epoch: iroh_beekem_core::EpochId::of(&stale),
             },
             &mut rng(61),
             T0,
@@ -2599,7 +2655,7 @@ mod repair_reaches_a_member_admitted_late {
             Event::RepairRequested {
                 requester: bus.bob.member_id(),
                 target: RepairTarget::Document(iroh_beekem_core::DocumentUuid([99u8; 16])),
-                epoch: EpochId::of(&stale),
+                epoch: iroh_beekem_core::EpochId::of(&stale),
             },
             70,
         );
@@ -2633,7 +2689,7 @@ mod repair_reaches_a_member_admitted_late {
             Event::RepairRequested {
                 requester: bus.bob.member_id(),
                 target: RepairTarget::Manifest,
-                epoch: EpochId::of(&stale),
+                epoch: iroh_beekem_core::EpochId::of(&stale),
             },
             80,
         );
@@ -2646,8 +2702,8 @@ mod repair_reaches_a_member_admitted_late {
             })
             .expect("a manifest repair must produce a manifest replica");
         assert_ne!(
-            EpochId::of(&manifest),
-            EpochId::of(&stale),
+            iroh_beekem_core::EpochId::of(&manifest),
+            iroh_beekem_core::EpochId::of(&stale),
             "the replacement must be keyed under an epoch the requester can derive"
         );
     }
@@ -4710,6 +4766,373 @@ mod an_action_needs_a_quorum {
             2,
             "a receiver refused a member's own departure because no quorum had \
              approved it"
+        );
+    }
+}
+
+/// The wire's framing, and the dispatch that turns it into events.
+///
+/// These bind `WorkspaceState::on_control`, which both backends call. Before it
+/// existed the same mapping was written twice — once in the `iroh-beekem` facade
+/// and once in the simulator — and several things asserted here were reachable
+/// from neither suite: the receive caps existed only in the facade, the ordering
+/// rule inside a log was a comment in two places and an assertion in none, and a
+/// repair naming an unparseable member could not be *expressed* by the simulator
+/// because its message carried a typed `MemberId`.
+mod a_control_message_drives_the_state_machine {
+    use iroh_beekem_core::{
+        ControlMsg, DocumentUuid, EpochId, MAX_LOG_CERTS, MAX_LOG_OPS, RepairTarget,
+        WorkspaceSecret,
+    };
+
+    use super::{DOC, Effect, Event, T0, rng, two_node_workspace};
+
+    /// Given a founded workspace, upon encoding a message and decoding it back,
+    /// we expect the decoded message to drive the state machine to the same
+    /// result as the original. This is the only thing binding the wire format to
+    /// the protocol: `encode`/`decode` were tested for round-tripping and
+    /// `on_control` for behaviour, and nothing said the two agreed.
+    #[test]
+    fn decoding_a_message_then_handling_it_is_the_same_as_handling_it() {
+        let mut bus = two_node_workspace();
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "alice writes".into(),
+            },
+            40,
+        );
+        let op = bus
+            .alice
+            .op_log()
+            .expect("alice should export her operation log")
+            .pop()
+            .expect("a founded workspace has at least one operation");
+
+        let direct = ControlMsg::Op {
+            op: Box::new(op),
+            proof: bus.alice.capabilities().certificates(),
+        };
+        let bytes = direct.encode().expect("encoding a control message");
+        let round_tripped = ControlMsg::decode(&bytes).expect("decoding a control message");
+
+        // Two independent receivers, so neither sees the other's merge and the
+        // comparison is between the messages rather than between two orders.
+        let mut left = two_node_workspace();
+        let mut right = two_node_workspace();
+        let from_direct = left
+            .bob
+            .on_control(direct, &mut rng(7), T0)
+            .expect("the original message should be accepted");
+        let from_decoded = right
+            .bob
+            .on_control(round_tripped, &mut rng(7), T0)
+            .expect("the decoded message should be accepted");
+
+        assert_eq!(
+            from_direct.len(),
+            from_decoded.len(),
+            "a message that survived the wire must ask for exactly what the \
+             original asked for, or the encoding is losing something the \
+             protocol depends on"
+        );
+        assert_eq!(
+            left.bob.group_size(),
+            right.bob.group_size(),
+            "two receivers handed the same operation, one over the wire, must \
+             agree about the group"
+        );
+    }
+
+    /// Given a peer's repair broadcast, upon its operation log exceeding
+    /// `MAX_LOG_OPS`, we expect the whole message to be refused and nothing
+    /// merged. The bound is an amplification control: one unsolicited message
+    /// must not be able to buy an attacker unbounded signature checks on every
+    /// node that hears it.
+    #[test]
+    fn an_operation_log_above_the_cap_is_refused_without_merging() {
+        let mut bus = two_node_workspace();
+        let op = bus
+            .alice
+            .op_log()
+            .expect("alice should export her operation log")
+            .pop()
+            .expect("a founded workspace has at least one operation");
+        let before = bus.bob.group_size();
+
+        let outcome = bus.bob.on_control(
+            ControlMsg::Log {
+                ops: vec![op; MAX_LOG_OPS + 1],
+                certs: Vec::new(),
+            },
+            &mut rng(8),
+            T0,
+        );
+
+        assert!(
+            outcome.is_err(),
+            "an oversized log must be refused as an error rather than reported \
+             as a message that merely changed nothing, or a caller cannot tell \
+             the two apart"
+        );
+        assert_eq!(
+            bus.bob.group_size(),
+            before,
+            "nothing may be merged from a message refused for its size; \
+             checking the bound after doing the work would defeat the bound"
+        );
+    }
+
+    /// The same bound on the other half of the exchange. Lower, because
+    /// certificates are minted by administrative action rather than by every key
+    /// change, so a legitimate store is far smaller than a legitimate log.
+    #[test]
+    fn a_certificate_batch_above_the_cap_is_refused_without_absorbing() {
+        let mut bus = two_node_workspace();
+        let cert = bus
+            .alice
+            .capabilities()
+            .certificates()
+            .pop()
+            .expect("a founded workspace has at least one certificate");
+
+        let outcome = bus.bob.on_control(
+            ControlMsg::Certs(vec![cert; MAX_LOG_CERTS + 1]),
+            &mut rng(9),
+            T0,
+        );
+
+        assert!(
+            outcome.is_err(),
+            "an oversized certificate batch must be refused: each certificate \
+             costs the receiver a signature check, and a batch that is all new \
+             costs a closure recompute as well"
+        );
+    }
+
+    /// Given a log whose operations are authorised only by certificates in the
+    /// same message, upon handling it, we expect the member those operations
+    /// admit to be present. Certificates must be absorbed *before* the
+    /// operations: an operation refused for want of a certificate is dropped
+    /// rather than parked, and no later certificate brings it back — so getting
+    /// this order wrong loses exactly the history the message exists to repair.
+    #[test]
+    fn the_certificates_in_a_log_are_absorbed_before_its_operations() {
+        let source = two_node_workspace();
+        let ops = source
+            .alice
+            .op_log()
+            .expect("alice should export her operation log");
+        let certs = source.alice.capabilities().certificates();
+        assert!(
+            ops.len() > 1,
+            "this test is vacuous unless admitting bob produced an operation \
+             beyond the founding add"
+        );
+
+        // A fresh receiver that has seen nothing: it holds no certificate, so
+        // every `Add` in the log depends on the ones travelling beside it.
+        let mut receiver = two_node_workspace();
+        let before = receiver.bob.current_member_count();
+        receiver
+            .bob
+            .on_control(ControlMsg::Log { ops, certs }, &mut rng(10), T0)
+            .expect("a log with its own certificates should be accepted");
+
+        assert!(
+            receiver.bob.current_member_count() >= before,
+            "a log shipped with the certificates authorising it must merge; if \
+             the operations were replayed against an empty closure they would \
+             be refused one by one and the repair would deliver nothing"
+        );
+    }
+
+    /// Given a repair request, upon it naming thirty-two bytes that are not a
+    /// point on the curve, we expect the message to be refused. Such a value
+    /// could never have been introduced by any `Add`, so the sender is not a
+    /// member — and answering costs the whole group a re-key.
+    ///
+    /// This was unrepresentable in the simulator until the two backends shared
+    /// one message type: its `Msg::Repair` carried a typed `MemberId`, so the
+    /// reasoning the wire format records had never been exercised anywhere.
+    #[test]
+    fn a_repair_naming_bytes_that_are_not_a_member_key_is_refused() {
+        let mut bus = two_node_workspace();
+        // An epoch has to come from a chunk, because it *is* the digest of the
+        // key that chunk was encrypted under. There is no way to invent one, and
+        // that is deliberate: "I cannot decrypt epoch E" is only sayable about
+        // an epoch that existed.
+        bus.alice_does(
+            Event::LocalEdit {
+                doc: DOC,
+                text: "something to key".into(),
+            },
+            41,
+        );
+        let epoch = EpochId::of(
+            bus.chunks_to_bob
+                .first()
+                .expect("an edit publishes a chunk"),
+        );
+
+        let outcome = bus.alice.on_control(
+            ControlMsg::Repair {
+                // All 0x02 does not decompress to a curve point.
+                member: [0x02; 32],
+                target: RepairTarget::Manifest,
+                epoch,
+            },
+            &mut rng(11),
+            T0,
+        );
+
+        assert!(
+            outcome.is_err(),
+            "a repair naming an unparseable member must be refused rather than \
+             answered: answering mints a fresh epoch for the whole group, and \
+             nobody holding those bytes is in it"
+        );
+    }
+
+    /// Given any workspace, upon an announce arriving, we expect no state change
+    /// and no effect. The message is a nudge and nothing else: acting on it
+    /// means re-reading a replicated index, which only a backend that has one
+    /// can do. Producing an effect here would be producing one the simulator
+    /// could only map to nothing.
+    #[test]
+    fn an_announce_changes_no_state_and_asks_for_nothing() {
+        let mut bus = two_node_workspace();
+        let before = bus.bob.document_text(DOC);
+
+        let effects = bus
+            .bob
+            .on_control(ControlMsg::Announce { key: [7u8; 32] }, &mut rng(12), T0)
+            .expect("an announce is always well formed");
+
+        assert!(
+            effects.is_empty(),
+            "an announce must ask for nothing; re-reading the index belongs to \
+             the transport, which is the only side that has one, got {effects:?}"
+        );
+        assert_eq!(
+            bus.bob.document_text(DOC),
+            before,
+            "an announce carries no content and must leave every document as it \
+             was"
+        );
+    }
+
+    /// Given an asset whose content key alice has published, upon a member
+    /// asking to be repaired for it, we expect alice to ask her backend to fetch
+    /// the key chunk rather than to answer from state.
+    ///
+    /// This is what makes an asset repair cheap: segments are sealed under the
+    /// asset's own content key, so restoring a multi-gigabyte asset costs one
+    /// re-encryption of 32 bytes. The arm used to return no effects at all,
+    /// which meant a request was received, silently unanswered, and invisible to
+    /// every property.
+    #[test]
+    fn an_asset_key_repair_asks_the_backend_to_fetch_the_key() {
+        let mut bus = two_node_workspace();
+        let asset = DocumentUuid([9u8; 16]);
+        let (_key, effects) = bus
+            .alice
+            .seal_asset_key(asset, &mut rng(13))
+            .expect("an admin may publish an asset key");
+        bus.queue_for_bob(effects);
+
+        // An epoch bob names; any real one will do, since what is under test is
+        // the shape of the answer rather than which key it re-encrypts.
+        let chunk = bus
+            .blobs
+            .values()
+            .next()
+            .cloned()
+            .expect("sealing an asset key stores a chunk");
+        let epoch = EpochId::of(&chunk);
+
+        let effects = bus
+            .alice
+            .on_control(
+                ControlMsg::Repair {
+                    member: bus.bob_id.to_bytes(),
+                    target: RepairTarget::AssetKey(asset),
+                    epoch,
+                },
+                &mut rng(14),
+                T0,
+            )
+            .expect("a repair from a current member should be accepted");
+
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::ResealAssetKey { requester, asset: a }
+                    if *requester == bus.bob_id && *a == asset
+            )),
+            "an asset-key repair must ask the backend to fetch the chunk: the \
+             key is in a blob the core deliberately does not cache, so a core \
+             that answered from state would be caching a secret to save a \
+             decryption, and one that answered nothing repairs nobody. \
+             Got {effects:?}"
+        );
+    }
+
+    /// The counterpart to the test above, over the bus: the effect is not merely
+    /// emitted, it is answerable. Alice fetches the chunk she published and
+    /// re-seals it under a fresh epoch.
+    #[test]
+    fn an_asset_key_repair_is_answered_by_a_member_that_holds_the_chunk() {
+        let mut bus = two_node_workspace();
+        let asset = DocumentUuid([11u8; 16]);
+        let (_key, effects) = bus
+            .alice
+            .seal_asset_key(asset, &mut rng(15))
+            .expect("an admin may publish an asset key");
+        bus.queue_for_bob(effects);
+        bus.manifests_to_bob.clear();
+        bus.chunks_to_bob.clear();
+
+        let chunk = bus
+            .blobs
+            .values()
+            .next()
+            .cloned()
+            .expect("sealing an asset key stores a chunk");
+        let epoch = EpochId::of(&chunk);
+
+        let effects = bus
+            .alice
+            .on_control(
+                ControlMsg::Repair {
+                    member: bus.bob_id.to_bytes(),
+                    target: RepairTarget::AssetKey(asset),
+                    epoch,
+                },
+                &mut rng(16),
+                T0,
+            )
+            .expect("a repair from a current member should be accepted");
+        bus.queue_for_bob(effects);
+
+        assert_eq!(
+            bus.asset_key_repairs,
+            vec![(bus.bob_id, asset)],
+            "the backend must be asked exactly once, for the member that asked \
+             and the asset it named"
+        );
+        let republished = bus
+            .blobs
+            .get(&WorkspaceSecret::new(bus.alice.workspace_secret()).asset_key_key(asset))
+            .cloned()
+            .expect("answering a repair republishes the key chunk");
+        assert_ne!(
+            EpochId::of(&republished),
+            epoch,
+            "the answer must be keyed under a *fresh* epoch: re-encrypting under \
+             the one the requester already failed on reproduces a ciphertext it \
+             still cannot read, which is the whole reason anti-entropy alone \
+             cannot repair this"
         );
     }
 }

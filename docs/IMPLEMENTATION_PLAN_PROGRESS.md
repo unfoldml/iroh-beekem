@@ -40,6 +40,7 @@ outranks both.
 | 9 | blob collection (`temp_tag` + the `iroh-docs` protect callback, `NodeOptions`); delta publishing (`Extent`, `published_up_to`, quiescent resync, `RepairTarget::DocumentHistory`); large assets (`asset.rs`, envelope encryption, blinded segment key spaces, `attach_file`/`export_asset`, lazy download policy, the pending-asset intent log); rotation re-indexes assets; `Msg::Segment` and range reconciliation in the simulator; `Assets`/`AssetChurn` scenarios | [asset.rs](../crates/iroh-beekem-core/src/asset.rs), [blinding.rs](../crates/iroh-beekem-core/src/blinding.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs), [node.rs](../crates/iroh-beekem/src/node.rs) |
 | 10 | versioning: `version.rs` with `UnixSeconds`/`VersionId`/`VersionInfo`/`Checkpoint`/`AssetVersion`; a supplied clock on `WorkspaceState::handle`; per-document `authors` claims and `set_change_merge_interval(-1)`; `document_versions`/`document_text_at`/`Event::RevertDocument`; digest-keyed checkpoints with `RestoreOutcome`; per-version asset key spaces with `attach_version`/`export_asset_version`/`revert_asset`; `WsOp::Revert` in the generated workload; parked chunks no longer cached as delivered | [version.rs](../crates/iroh-beekem-core/src/version.rs), [state.rs](../crates/iroh-beekem-core/src/state.rs), [manifest.rs](../crates/iroh-beekem-core/src/manifest.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs) |
 | 11 | the named suite gaps: multi-device enrolment (`Scenario::SECOND_DEVICE`, `Msg::Hello::as_device_of`, `Onboarding`/`DeviceChurn`); the receiver-side author check in the simulator's `on_entry` and a data-plane forger (`FORGED_DOC`, `ROGUE_AUTHOR`); `AssetAfterRemoval`; loss and fabrication over `World::history()` with `append_only_workload`; post-revocation manifest and role changes (`FILE_AFTER_REVOKE`, `PROMOTE_AFTER_REVOKE`); `ANNOUNCED_ONCE` shared by `resync` and `republish` | [sim/lib.rs](../crates/iroh-beekem-sim/src/lib.rs), [properties.rs](../crates/iroh-beekem-sim/tests/properties.rs), [workspace.rs](../crates/iroh-beekem/src/workspace.rs) |
+| 12 | one control-plane dispatch: `ControlMsg` and the chunk codec move to [core/wire.rs](../crates/iroh-beekem-core/src/wire.rs) with `MAX_LOG_OPS`/`MAX_LOG_CERTS`; `WorkspaceState::on_control` replaces the facade's `apply_control_msg` and the simulator's `apply_msg` control arms; `Msg::Control(ControlMsg)`; `ANNOUNCED_ONCE` and `Cooldown` move to the core, the latter generic over wall and virtual time; `Effect::ResealAssetKey` gives the asset-key repair an answer on **both** backends, where the core previously returned nothing and the simulator answered nobody; one `author_may_write`, with the simulator publishing an author claim, exempting the manifest and replaying refused entries | [state.rs](../crates/iroh-beekem-core/src/state.rs), [wire.rs](../crates/iroh-beekem-core/src/wire.rs), [cooldown.rs](../crates/iroh-beekem-core/src/cooldown.rs) |
 
 The threat model — what is confidential and from whom, and what a member, a removed member and the
 holder of a leaked invite can each actually do — lives in [README.md](../README.md) under *Threat
@@ -61,7 +62,7 @@ settled; if a user story needs a different answer, change it.
   written: blobs and gossip before docs, which is handed both.
 
 - **Missed control operations are repaired by re-shipping the whole log** on `NeighborUp`
-  (`ControlMsg::Log`, [wire.rs](../crates/iroh-beekem/src/wire.rs)). A peer that misses an operation
+  (`ControlMsg::Log`, [wire.rs](../crates/iroh-beekem-core/src/wire.rs)). A peer that misses an operation
   can never derive keys for anything encrypted after it, so *some* repair is needed; whole-log resend
   is simply the cheapest one to write.
 
@@ -82,13 +83,17 @@ settled; if a user story needs a different answer, change it.
   change, or — worst — a quorum that formed on one node and nowhere else, leaving an action performed
   there and refused everywhere.
 
-  In `iroh-beekem` there are two such paths — the public `Workspace::resync` and the internal
-  `republish` a `NeighborUp` takes — and they had drifted: `republish` drove all three while `resync`
-  drove only the manifest and the namespace. The hole was reachable by a library caller and by no
-  in-tree test, since every one of them reaches anti-entropy through the other path. They now share
-  `ANNOUNCED_ONCE` ([workspace.rs](../crates/iroh-beekem/src/workspace.rs)), which makes that
-  divergence unrepresentable rather than merely fixed. The simulator's `republish` drives all three
-  and its periodic `Tick::Resync` covers certificates through `Msg::Log` on a sparser cadence.
+  There are **three such paths across two backends**, and the list had drifted twice. First inside
+  `iroh-beekem`, between the public `Workspace::resync` and the internal `republish` a `NeighborUp`
+  takes: `republish` drove all three while `resync` drove only the manifest and the namespace, a hole
+  reachable by a library caller and by no in-tree test, since every one of them reaches anti-entropy
+  through the other path. Then across the crate boundary, where the simulator's `republish` drove all
+  three and its periodic `Tick::Resync` drove two, leaving certificates to the sparser `Msg::Log`
+  cadence. All three now share `ANNOUNCED_ONCE`
+  ([state.rs](../crates/iroh-beekem-core/src/state.rs)), which makes both divergences
+  unrepresentable rather than merely fixed. A per-path cadence is precisely what the shared list
+  exists to refuse: if the certificate broadcast proves too talkative for the harness, the fix is to
+  lengthen `RESYNC_INTERVAL`, not to shorten the list.
 
 - **Content flows through Loro as CRDT updates**, so a chunk applies only when the CGKA can reach the
   PCS key it names *and* Loro has the operations it depends on — that second condition is what
@@ -153,7 +158,7 @@ settled; if a user story needs a different answer, change it.
   tested: a revert converges with a concurrent edit like any other write, and the version reverted away
   from stays listed, so a revert can be reverted.
 
-- **Attribution is recorded, not derived, and that is a correctness decision rather than a taste one.**
+- **Attribution is recorded, not derived**
   The obvious design — derive each device's Loro peer id from the workspace secret and the member id, so
   every peer can invert it — corrupts documents. Assigning a peer id also fixes the operation counter a
   replica writes next, so any device that loses a document's local history while another replica keeps
@@ -455,11 +460,12 @@ sound, because a permanently severed node cannot converge. Such a property then 
 according to whether the seed happened to enable partitions at all, which looks like flakiness and is
 really an unsound scenario.
 
-**The simulator must model the control plane's repair, not just the data plane's.** A lost `Msg::Op`
-is unrecoverable — a peer that misses the operation establishing a PCS key can never derive it, and
-re-announcing content re-encrypts under that same key. `Msg::Log` is the simulator's counterpart to
-`ControlMsg::Log`; without it the harness is strictly more fragile than production and every resulting
-failure is an artefact.
+**The simulator must model the control plane's repair, not just the data plane's.** A lost
+`ControlMsg::Op` is unrecoverable — a peer that misses the operation establishing a PCS key can never
+derive it, and re-announcing content re-encrypts under that same key. `ControlMsg::Log` is the
+repair, and the simulator no longer *models* it: `Msg::Control` wraps the core's own type, and both
+backends dispatch it through `WorkspaceState::on_control`. Without the log exchange the harness is
+strictly more fragile than production and every resulting failure is an artefact.
 
 **A restart in propsim is a freeze, not amnesia.** `dispatch_start` calls `on_start` on the *same* node
 object; there is no `on_crash` hook and no per-node storage seam, so `WorkspaceNode::reboot` authors the
@@ -471,7 +477,8 @@ cannot catch the bug, while `on_start`'s founding branch is unconditional. Note 
 new tree and so reports exactly one administrator, as does everybody else. The fork is invisible to any
 property that asks each node about itself rather than comparing them.
 
-**Keep and grow:** panic-freedom on hostile input ([wire.rs](../crates/iroh-beekem/src/wire.rs)); the
+**Keep and grow:** panic-freedom on hostile input
+([wire.rs](../crates/iroh-beekem-core/src/wire.rs)); the
 real-QUIC suite in [two_node.rs](../crates/iroh-beekem/tests/two_node.rs), which proves **the transport
 wiring is connected** and should *not* grow protocol assertions; focused crypto regressions in
 [beekem_loop.rs](../crates/iroh-beekem-core/tests/beekem_loop.rs).
@@ -628,8 +635,19 @@ themselves — each was mis-stated in a way that would have produced a passing t
    needed two fixes. The simulator applied **no author check at all** — `author_may_write` existed only
    in the facade — so the harness was strictly weaker than production on the one plane an attacker
    reaches without holding a key. And the forger had no data plane: `forge()` broadcast only a
-   control-plane `Msg::Op`, while `FORGE` applies to legitimate members whose entries *should* be
+   control-plane operation, while `FORGE` applies to legitimate members whose entries *should* be
    indexed.
+
+   Phase 12 finished it, because the first fix had been made by *writing the check again* rather than
+   by calling the one that existed — and the copy was shorter. `WorkspaceState::author_may_write` has
+   three links: the self-attested author claim in the manifest, the binding from that device to a
+   user, and the grant from that user to a role. The simulator asked the closure directly and skipped
+   the first, which it had to, because it published no author claim. It now publishes one beside its
+   endpoint, calls the core's predicate, exempts the manifest from it — the predicate resolves an
+   author *through* the manifest, so checking the manifest with it is a deadlock — and replays
+   entries refused while a claim or a grant was still in flight, which production gets free by
+   re-reading the index every pass. This is the entry that motivates the whole of phase 12: a check
+   living in one backend is a check the properties do not bind, whichever backend it lives in.
 
    "Never enters the index" is also the wrong claim, and this document said it. A forging node is a
    member: it holds the namespace write capability, so its entry really does reconcile into every

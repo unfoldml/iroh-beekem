@@ -17,7 +17,16 @@ cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, capabi
                                  # forgery rejection, insider falsification tests
 cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer,
                                  # outsiders, insiders, revenants, assets
-                                 # ~5 min: runs under swarm faults (partitions, latency, reorder)
+                                 # ~3 min: runs under swarm faults (partitions, latency, reorder).
+                                 # Cost is proportional to the *number of events*, because the
+                                 # simulator deep-clones every node's state per event, and that
+                                 # clone is four Loro snapshot round trips plus the CGKA tree.
+                                 # This is why the root manifest optimises dependencies: at
+                                 # `opt-level = 0` the same suite took over 45 min and one
+                                 # property test alone took 40 s. Do not remove those profiles.
+                                 # Neither `RESYNC_INTERVAL` nor `MAX_RESYNCS` is a free lever —
+                                 # propsim ends every run here at 15 virtual seconds and their
+                                 # product already fills it; see `MAX_RESYNCS` in sim/src/lib.rs.
 cargo test -p iroh-beekem        # two real endpoints over real QUIC, plus blob collection
                                  # and the large-asset round trip. Do NOT run alongside the
                                  # simulator: these wait on wall-clock outcomes and a
@@ -53,10 +62,17 @@ Three crates ([Cargo.toml](Cargo.toml)):
 
 ## The one structural rule
 
-**`iroh-beekem-core` performs no I/O.** `WorkspaceState::handle(Event, csprng) -> Vec<Effect>`
-([state.rs](crates/iroh-beekem-core/src/state.rs)) is the single entry point to the protocol; the
-core returns what it wants done and two backends perform it — `apply_effects`
-([workspace.rs](crates/iroh-beekem/src/workspace.rs)) and `WorkspaceNode::drive`
+**`iroh-beekem-core` performs no I/O.** The protocol has two entry points, both in
+[state.rs](crates/iroh-beekem-core/src/state.rs):
+
+* `WorkspaceState::handle(Event, csprng, now) -> Vec<Effect>` — one event.
+* `WorkspaceState::on_control(ControlMsg, csprng, now) -> Vec<Effect>` — one control-plane message.
+
+`on_control` is `handle` with the wire's framing in front of it. It exists because that framing was
+written twice — once in the facade and once in the simulator — and the two copies drifted.
+
+The core returns what it wants done and two backends perform it — `apply_effects`
+([workspace.rs](crates/iroh-beekem/src/workspace.rs)) and `WorkspaceNode::apply_effects`
 ([lib.rs](crates/iroh-beekem-sim/src/lib.rs)).
 
 This is the only thing in this file framed as an invariant, and it earns that because it constrains
@@ -73,8 +89,12 @@ cargo tree -p iroh-beekem-core -e normal --prefix none \
   `Node::on_msg` is a synchronous callback — a state machine needing a runtime could not be plugged
   into the simulator at all. `CoreError::SignerYielded` is the loud failure if a signer ever stops
   being ready-on-poll.
-- **Adding an `Event` or `Effect` variant means updating both backends**, or the simulator and the
-  real transport silently diverge in behaviour.
+- **Two things in the core look like exceptions and are not.** `wire.rs` frames bytes, which opens no
+  socket; `cooldown.rs` is *given* an instant and never reads one, exactly as `handle` is given
+  `now`. A limiter that called `Instant::now` would break the rule; one that takes the instant as an
+  argument is what lets the same policy be checked against wall time and against virtual time.
+- **Adding an `Event`, `Effect` or `ControlMsg` variant means updating both backends**, or the
+  simulator and the real transport silently diverge in behaviour. 
 
 
 ## Engineering and Coding practices
@@ -169,6 +189,20 @@ them *without* noticing will not fail loudly.
   change is worse still: it mints a grant and no operation, so the log exchange is its *only*
   anti-entropy.
 
+- **Neither backend may re-implement the control-plane dispatch.** `WorkspaceState::on_control`
+  ([state.rs](crates/iroh-beekem-core/src/state.rs)) maps a `ControlMsg` to the events it stands for,
+  and both `handle_control_msg` ([workspace.rs](crates/iroh-beekem/src/workspace.rs)) and the
+  simulator's `on_control` ([lib.rs](crates/iroh-beekem-sim/src/lib.rs)) call it. The failure it
+  prevents is the one phase 11 records: the receiver-side author check lived in the facade alone, so
+  a property that read as "no honest node accepts a forged entry" asserted something weaker than its
+  name. Three things stay outside, and each for a reason the core cannot argue away:
+
+  * the **rate limit**, which needs a clock — the core says *which* messages are chargeable
+    (`ControlMsg::answer_cooldown_key`) and each backend says how often;
+  * the **re-ingest**, which needs an index to re-read — this is why `ControlMsg::Announce` returns
+    no effects, and it is deliberate rather than an omission;
+  * the **instrumentation** the properties read, which is harness bookkeeping and not protocol.
+
 - **The invite's nonce is claimed *after* every other check, and the order is the point.**
   `Workspace::join` runs `Invite::verify` first and `Node::claim_invite` last. Claiming first would
   let a garbled, expired or misaddressed copy of a ticket burn the nonce of the one that would have
@@ -242,10 +276,11 @@ them *without* noticing will not fail loudly.
   live in the manifest, and the roster derives from device records, so a lost manifest chunk costs a
   peer its place on somebody's roster until the next membership change happens to republish it.
 - **The simulator must model the control plane's repair, not just the data plane's.** A lost
-  `Msg::Op` is unrecoverable — a peer that misses the operation establishing a PCS key can never
-  derive it, and re-announcing content re-encrypts under that same key. `Msg::Log` is the simulator's
-  counterpart to `ControlMsg::Log`; without it the harness is strictly more fragile than production
-  and every resulting failure is an artefact.
+  `ControlMsg::Op` is unrecoverable — a peer that misses the operation establishing a PCS key can
+  never derive it, and re-announcing content re-encrypts under that same key. `ControlMsg::Log` is
+  the repair, and the simulator carries the *same type* rather than a counterpart to it: `Msg`
+  wraps it as `Msg::Control`. Without the log exchange the harness is strictly more fragile than
+  production and every resulting failure is an artefact.
 - **Fault plans must set `Mode::Liveness` explicitly.** `Faults::swarm()` defaults to `Mode::Safety`,
   which injures uniformly and **never heals a partition** — under which no `eventually_within`
   property is sound, because a permanently severed node cannot converge. Such a property then passes
@@ -287,11 +322,14 @@ them *without* noticing will not fail loudly.
 - **Certificates need anti-entropy like the manifest and the namespace do.** A grant, proposal or
   approval is broadcast once with no write behind it, so `Event::ResyncCertificates` must be driven
   from both backends' resync paths. Without it a dropped approval leaves a quorum that formed on one
-  node and nowhere else — an action performed there and refused everywhere. In `iroh-beekem` the
-  three live in `ANNOUNCED_ONCE` ([workspace.rs](crates/iroh-beekem/src/workspace.rs)) and both the
-  public `resync` and the internal `republish` iterate it. They are one list because they had already
-  drifted once: `resync` drove two of the three, reachable by a library caller and by no in-tree test.
-  Adding a fourth thing announced once means adding it there, not at a call site.
+  node and nowhere else — an action performed there and refused everywhere. The three live in
+  `ANNOUNCED_ONCE` ([state.rs](crates/iroh-beekem-core/src/state.rs)), and **three paths across two
+  backends** iterate it: the facade's public `resync` and internal `republish`, and the simulator's
+  `republish` and resync tick. They are one list because they had drifted twice — first inside the
+  facade, where `resync` drove two of the three and was reachable by a library caller and by no
+  in-tree test; then across the crate boundary, where the simulator's tick drove two and its
+  `republish` drove three. Adding a fourth thing announced once means adding it there, not at a
+  call site.
 - **A published chunk must not be permanently tagged.** Awaiting `AddProgress` resolves through
   `with_tag()`, which mints a *permanent* tag — so `store_chunk` uses `.temp_tag()` and holds the guard
   across `set_hash` and no longer. Before it, blob collection reclaimed nothing however it was
@@ -340,17 +378,37 @@ them *without* noticing will not fail loudly.
   and `RepairTarget::AssetKey` costs one re-encryption of 32 bytes. Keying segments with CGKA
   application secrets directly would have made both repair and rotation O(bytes).
 
-- **A receiver refuses an entry whose author holds no writing role, and both backends do it.**
-  `ingest_all` in [workspace.rs](crates/iroh-beekem/src/workspace.rs) consults
-  `WorkspaceState::author_may_write`; the simulator's `on_entry` consults the closure directly, since
-  it has no `iroh-docs` author ids to map. The entry is **observed and then refused**, in that order,
-  and the order is the design: a forging node is a *member*, so it holds the namespace write
-  capability and its entry genuinely reconciles into every peer's replica whatever author it claims.
-  Nothing stops it arriving; the author check is what stops it counting. A property asserting such an
-  entry "never enters the index" is therefore asserting something false —
-  `no_honest_node_ever_accepts_a_forged_entry` in
+  That repair is the one the core cannot answer from state, because the key is in a blob it
+  deliberately does not cache. So it *asks*: `on_repair_requested` emits `Effect::ResealAssetKey`,
+  each backend fetches the chunk and calls `WorkspaceState::reseal_asset_key`. Returning no effects
+  instead — which is what the arm used to do — is why the simulator answered no asset repair at all
+  for as long as that mechanism existed, and why no property could see it.
+
+- **A receiver refuses an entry whose author holds no writing role, and there is one predicate.**
+  `WorkspaceState::author_may_write` has three links: the self-attested author claim in the manifest,
+  the signed binding from that device to a user, and the signed grant from that user to a role.
+  `ingest_all` in [workspace.rs](crates/iroh-beekem/src/workspace.rs) calls it, and the simulator's
+  `on_entry` calls the same method. It used to ask the closure directly and skip the first link,
+  because it published no author claim — a shorter check, admitting entries the real one refuses.
+  That is the phase-11 defect happening inside the harness meant to catch it.
+
+  The entry is **observed and then refused**, in that order, and the order is the design: a forging
+  node is a *member*, so it holds the namespace write capability and its entry genuinely reconciles
+  into every peer's replica whatever author it claims. Nothing stops it arriving; the author check is
+  what stops it counting. A property asserting such an entry "never enters the index" is therefore
+  asserting something false — `no_honest_node_ever_accepts_a_forged_entry` in
   [properties.rs](crates/iroh-beekem-sim/tests/properties.rs) states it over the *document* instead,
   and its counterpart asserts the entry does arrive, which is what keeps the first non-vacuous.
+
+  Two things follow, and both are load-bearing. **The manifest is exempt.** The predicate resolves an
+  author *through* the manifest, so author-checking the manifest is a deadlock — a joiner could never
+  read the record that would let it read the record. What protects that key is the CGKA. **A refusal
+  is a delay, not a verdict.** The claim or the grant may still be in flight, so the entry must be
+  re-offered: production gets this free, because `ingest_all` re-reads the index every pass and
+  records an entry as seen only once *applied*; the simulator keeps a `refused` list and replays it
+  on `Effect::ManifestUpdated`. Dropping on refusal turns an ordinary catch-up race into lost
+  content. The list is cleared on adopting a namespace, or a held entry would be replayed as though
+  it had arrived on the new replica.
 
 - **A test node must be spawned with `Relay::Disabled`, through `test_node`.** Both endpoints in any
   test live on one machine, so a relay can never be the path that works — but with the default

@@ -34,3 +34,31 @@ zeroize = { version = "1.8", features = ["derive"] }
 all = { level = "deny", priority = 10 }
 pedantic = { level = "warn", priority = 3 }
 redundant_clone = { level = "deny", priority = 9 }
+
+# Dependencies are always optimised, because none of them is what anyone steps
+# through and all of the expensive ones are on the simulator's hot path. propsim
+# deep-clones every node's state after every event, and `WorkspaceState::clone`
+# answers that with four Loro snapshot encode/decode round trips — three
+# documents and the manifest — plus the CGKA tree, per node, per event. Loro,
+# curve25519-dalek, ChaCha20 and blake3 unoptimised therefore dominate the entire
+# suite rather than merely contributing to it.
+#
+# Measured, one sim property test over six seeds: 40.4 s at opt-level 0 against
+# 2.75 s at opt-level 2, and the full 106-test suite 180 s. This is the single
+# reason `cargo test -p iroh-beekem-sim` was running for over 45 minutes in CI.
+#
+# `debug-assertions` and `overflow-checks` are left on: the speed comes from
+# optimising the arithmetic, not from removing the checks the suite relies on.
+# `debug = false` on dependencies is what keeps `target/` from reaching the 34 GB
+# it grew to, and cuts link time with it.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
+
+# Workspace crates are optimised for test builds only. `cargo build` and
+# `cargo run` keep the unoptimised `dev` profile, so ordinary edit-compile cycles
+# stay fast and the code stays steppable; it is only the test binaries — where
+# the simulator spends minutes inside its own harness code — that pay to be fast
+# at run time instead of at build time.
+[profile.test]
+opt-level = 2
