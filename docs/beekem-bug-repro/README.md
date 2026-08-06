@@ -2,6 +2,11 @@
 
 Filed against `beekem` 0.3.0.
 
+> **Other reproductions in this directory.** A second, unrelated defect is written up in
+> [concurrent-remove-debug-assert.md](concurrent-remove-debug-assert.md), with its own
+> standalone test: a `debug_assert!` in `BeeKem` that denies the case the line below it
+> handles, and aborts every debug build on an ordinary concurrent interleaving.
+
 ## Summary
 
 `Cgka::remove` (`src/cgka.rs:283`) evaluates its

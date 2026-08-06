@@ -30,6 +30,16 @@ propsim-core = { git = "https://github.com/unfoldml/propsim", rev = "fc358b00afe
 # (Tiers 1 and 2) are usable today. The Elle/Jepsen backends and `propsim-iroh`
 # are shape-only stubs, so nothing here depends on them.
 propsim = { git = "https://github.com/unfoldml/propsim", rev = "fc358b00afe68478b9a575d5e2814c3b75438e26" }
+# The engine itself, for `run_deterministic` and `evaluate_properties`. The
+# facade re-exports neither, and the world runner needs both: `Run::run` stops at
+# the first failing property of the first failing seed and discards the shrunk
+# counterexample it computed, while a world asserts a whole property vector and a
+# reader needs to know whether one property failed on one seed or all of them
+# failed on every seed. See `tests/properties/harness.rs`.
+#
+# Must stay on the same revision as `propsim` above, or the two crates' `Property`
+# types are distinct and nothing type-checks.
+propsim-sim = { git = "https://github.com/unfoldml/propsim", rev = "fc358b00afe68478b9a575d5e2814c3b75438e26" }
 
 [lints]
 workspace = true

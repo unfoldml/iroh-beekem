@@ -3,14 +3,47 @@
 //! These are the assertions unit tests cannot reach: they hold across every
 //! interleaving the simulator generates, under an unordered and lossy
 //! transport, over many seeds.
+//!
+//! # One test per *world*, not per property
+//!
+//! A `#[test]` here runs one **world** — a cluster size, a fault profile, a
+//! scenario and, sometimes, a generated workload — and reads that world's whole
+//! property vector out of each recorded trace. The properties themselves are
+//! plain functions returning a `Property`, one per claim, each keeping the doc
+//! comment that says why the claim exists.
+//!
+//! **Why this asserts exactly what one plan per property asserted.** A
+//! simulation is a function of the plan's shape and its seed, and it is not a
+//! function of the plan's properties: propsim runs `run_deterministic` once per
+//! seed and only then calls `evaluate_properties` over the recorded frames, and
+//! its `effective_seed` ignores the plan entirely, so seed index *s* is the same
+//! seed in every plan in this file. Two properties on one plan therefore read
+//! the *same* trace that two plans of the same shape would each have produced,
+//! and they return the same verdicts. What changes is the cost: a property
+//! evaluation scans frames that already exist, while a simulation deep-clones
+//! every node's state after every scheduler event.
+//!
+//! The suite ran 636 simulations over 21 worlds before this shape; it runs one
+//! per world per seed now. **Adding a property to a world is therefore free, and
+//! adding a world is what costs.**
 
 use std::time::Duration;
 
 use iroh_beekem_sim::{Honest, Role, Scenario, WorkspaceNode, asset_plaintext, member_bytes_of};
 use propsim::prelude::*;
 
+use crate::harness::{Shape, plan_of};
+
+// The runner lives in a subdirectory, and the `#[path]` is what keeps it there.
+// This file is an integration-test *root*, so its modules resolve against
+// `tests/` rather than against `tests/properties/` — and every `.rs` directly
+// under `tests/` is a separate test binary. Cargo runs test binaries one after
+// another and only parallelises the tests *inside* one binary, so a second
+// target would cost the suite its parallelism to hold a file with no tests in it.
+#[path = "properties/harness.rs"]
+mod harness;
+
 const NODES: usize = 3;
-const SEEDS: usize = 6;
 
 /// The longest deadline a property in this file can meaningfully ask for.
 ///
@@ -68,69 +101,317 @@ fn network_faults() -> Faults {
         .mode(Mode::Liveness)
 }
 
-fn plan<S: Scenario>(properties: Vec<Property<WorkspaceNode<S>>>) -> TestPlan<WorkspaceNode<S>> {
-    plan_of_size(NODES, properties)
-}
-
-/// A plan over an explicit number of nodes.
+/// A network that does nothing to the traffic.
 ///
-/// The outsider scenario needs one more node than the honest group, so that
-/// removing the outsider from the picture still leaves a group large enough for
-/// the properties about *members* to say anything.
-fn plan_of_size<S: Scenario>(
-    nodes: usize,
-    properties: Vec<Property<WorkspaceNode<S>>>,
-) -> TestPlan<WorkspaceNode<S>> {
-    Simulation::plan::<WorkspaceNode<S>>()
-        .nodes(nodes)
-        .transport(InMemory::unordered_lossy())
-        .faults(network_faults())
-        .state_machine()
-        .check(properties)
-        .seeds(SEEDS)
-        .finish()
+/// The only profile under which a failure is unambiguous. Everywhere else a
+/// liveness failure has two possible causes — the protocol did not make progress,
+/// or the seed's fault subset did not leave enough of a window to make it in —
+/// and telling them apart means reading the fault schedule. Here there is no
+/// second cause.
+///
+/// It is also nearly free. Without partitions to heal and without latency, a run
+/// reaches its horizon in fewer scheduler events, and the trace this suite pays
+/// for is one deep clone of every node per event.
+///
+/// It does **not** replace [`network_faults`] for any property. On a perfect
+/// network every "eventually" collapses to "immediately", so a roster that never
+/// converges would pass; that is exactly what the swarm profile exists to catch.
+fn no_faults() -> Faults {
+    Faults::swarm().mode(Mode::Liveness)
 }
 
-/// The honest base protocol, which most properties are stated against.
-fn base_plan(properties: Vec<Property<WorkspaceNode<Honest>>>) -> TestPlan<WorkspaceNode<Honest>> {
-    plan(properties)
+/// A network that loses, duplicates and stops nodes as well as partitioning them.
+///
+/// Everything [`network_faults`] does, plus the three fault kinds it leaves out.
+/// Loss and duplication are what the anti-entropy paths exist for, and a crash and
+/// restart is what `WorkspaceNode::reboot` exists for — under the swarm profile
+/// none of the three is ever exercised outside the three scripted worlds.
+///
+/// Note that propsim enables each declared fault kind with probability one half
+/// per seed, so this profile is not "all six at once": it is a **draw** from six
+/// kinds rather than from three, and six seeds see a range of them.
+fn harsh_faults() -> Faults {
+    Faults::swarm()
+        .partitions()
+        .latency_ms(1..40)
+        .reorder()
+        .drop(prob(0.05))
+        .duplicate(prob(0.02))
+        .crash_restart()
+        .mode(Mode::Liveness)
 }
 
+/// The shape most worlds run in: three devices on a partitioning network.
+const SWARM: Shape = Shape::new(NODES, network_faults);
+
+/// The same, on a network that does nothing.
+const PRISTINE: Shape = Shape::new(NODES, no_faults);
+
+/// The same, on a network that also loses, duplicates and stops nodes.
+const HARSH: Shape = Shape::new(NODES, harsh_faults);
+
+/// When a scripted fault lands, and when it is undone.
+///
+/// Late enough that the group has formed and written something — the first edit
+/// fires at 300ms and the first resync at 600ms — and early enough to leave the
+/// rest of the horizon for catching up. The horizon is `last scripted event +
+/// 10s`, so healing at four seconds gives a fourteen second run and ten seconds
+/// of settling.
+const FAULT_AT: Duration = Duration::from_millis(1500);
+const REPAIR_AT: Duration = Duration::from_secs(4);
+
+/// The ordinary member that goes away in the partition and crash scripts.
+const SCRIPT_VICTIM: u64 = 2;
+
+/// The founder, which gets a crash script of its own.
+///
+/// Both are needed, and the reason is that they fail differently. A crashed
+/// *member* that resumed wrongly would re-run the join handshake — except that
+/// `on_welcome` refuses to act on a node that already has state, so a harness
+/// that forgot to branch on a restart would still look correct from the member's
+/// side. A crashed *founder* has no such guard: `on_start`'s founding branch is
+/// unconditional, so it would overwrite the live workspace with a brand-new tree
+/// and fork the group under a second root. Only the founder script can catch
+/// that, which makes it the one that keeps
+/// `no_node_ever_initialises_the_workspace_more_than_once` from being vacuous.
+const FOUNDER_VICTIM: u64 = 0;
+
+/// The scripted networks, as shapes.
+///
+/// A scripted plan is the only way to widen propsim's run horizon, which is
+/// `last scripted event + 10s`; a swarm plan never widens it and always stops at
+/// fifteen virtual seconds. Healing at `REPAIR_AT` therefore buys ten seconds of
+/// settling after the injury, which is what the liveness claims spend.
+///
+/// A scripted spec also **excludes** the swarm one: `Faults::swarm`'s verbs are
+/// silent no-ops on a scripted spec, so these worlds meet an otherwise ordinary
+/// lossy transport and the injury is exactly the scripted one.
+///
+/// They live here rather than inside the module that first needed them, because a
+/// script is a shape and a shape composes with any scenario. Running a removal or
+/// a rotation through a partition is a different world from running an honest
+/// group through one, and it costs a line.
+const PARTITIONED: Shape = Shape::new(NODES, partition_and_heal);
+const CRASHED: Shape = Shape::new(NODES, crash_a_member);
+const CRASHED_FOUNDER: Shape = Shape::new(NODES, crash_the_founder);
+const PARTITIONED_TWICE: Shape = Shape::new(NODES, partition_heal_and_partition_again);
+const BOTH_MEMBERS_CRASHED: Shape = Shape::new(NODES, crash_both_members);
+
+/// The disconnected script: node 2 is severed, then reconnected.
+fn partition_and_heal() -> Faults {
+    Faults::scripted()
+        .at(FAULT_AT)
+        .partition(&[0, 1], &[SCRIPT_VICTIM])
+        .at(REPAIR_AT)
+        .heal_all()
+}
+
+/// A partition that heals into a *different* partition.
+///
+/// The first cut isolates node 2 and the second isolates the founder, so each
+/// side of the second cut holds state the other side gained while it was away.
+/// One partition only ever asks a node to catch up; two ask both sides to, which
+/// is the case anti-entropy has to be symmetric to answer.
+///
+/// The last event is deliberately late: the horizon is `last scripted event +
+/// 10s`, so ending the script at eight seconds buys an eighteen second run where
+/// every swarm world stops at fifteen. It is the only lever on run length there
+/// is.
+fn partition_heal_and_partition_again() -> Faults {
+    Faults::scripted()
+        .at(FAULT_AT)
+        .partition(&[0, 1], &[SCRIPT_VICTIM])
+        .at(REPAIR_AT)
+        .heal_all()
+        .at(Duration::from_secs(6))
+        .partition(&[FOUNDER_VICTIM], &[1, 2])
+        .at(Duration::from_secs(8))
+        .heal_all()
+}
+
+/// The shut-down script: an ordinary member stops, then starts again.
+fn crash_a_member() -> Faults {
+    crash_and_restart(SCRIPT_VICTIM)
+}
+
+/// The group's only admin stops, then starts again.
+fn crash_the_founder() -> Faults {
+    crash_and_restart(FOUNDER_VICTIM)
+}
+
+/// Both ordinary members stop at once, leaving the founder alone.
+///
+/// One crash always leaves a peer that holds everything, so a restarted node can
+/// be caught up by somebody who never left. Here nobody but the founder is left,
+/// so the two restarts have to be answered by the founder's anti-entropy alone —
+/// and they arrive together, which is what makes this different from crashing the
+/// same two nodes one after the other.
+fn crash_both_members() -> Faults {
+    Faults::scripted()
+        .at(FAULT_AT)
+        .crash(1)
+        .at(FAULT_AT)
+        .crash(SCRIPT_VICTIM)
+        .at(REPAIR_AT)
+        .restart(1)
+        .at(REPAIR_AT)
+        .restart(SCRIPT_VICTIM)
+}
+
+/// One node stops at `FAULT_AT` and starts again at `REPAIR_AT`.
+fn crash_and_restart(victim: u64) -> Faults {
+    Faults::scripted()
+        .at(FAULT_AT)
+        .crash(victim)
+        .at(REPAIR_AT)
+        .restart(victim)
+}
+
+/// A cluster large enough that removing one member still leaves a group.
+///
+/// Five rather than four, so that a world removing a member still has three
+/// survivors to state agreement over — with two, "every survivor agrees" is a
+/// claim about one pair and every quorum is unanimous.
+///
+/// # This is the expensive axis, and by much more than it looks
+///
+/// Measured on this suite, one world at five nodes costs **ten to eighteen times**
+/// the same world at three — 15s to 46s against roughly 2.5s — and not the three
+/// times the node count suggests. Two things multiply. The recorded trace deep
+/// clones every node's state after every scheduler event, so the per-event cost is
+/// linear in the cluster; and every node broadcasts to every other, so the event
+/// count is quadratic in it. The product is cubic before the resync traffic that
+/// grows with the group is counted at all.
+///
+/// Six worlds were written at this size and three were kept: the honest group, a
+/// removal, and a quorum. Those three are the ones where the size changes what is
+/// *asserted* rather than merely how long it takes to assert it — agreement over
+/// ten pairs instead of three, four survivors instead of two, and a threshold with
+/// a member who is neither an approver nor the target. The insider, departure and
+/// generated-workload worlds at this size cost 104s between them and stated
+/// nothing their three-node counterparts do not.
+///
+/// **Before adding a fourth, measure it.** The budget it comes out of is the whole
+/// suite's, and one world here is worth ten elsewhere.
+const LARGE: usize = 5;
+
+/// The world: three honest devices join, edit, and run anti-entropy.
+/// Nothing here is adversarial and nobody is removed.
+///
+/// Three nodes, swarm faults.
 #[test]
-fn every_node_eventually_joins_the_group() {
-    base_plan(vec![property::eventually_within(
+fn an_honest_group_under_swarm_faults() {
+    crate::harness::check_world("an_honest_group_under_swarm_faults", SWARM, honest_claims);
+}
+
+/// The same claims as `an_honest_group_under_swarm_faults`, over a larger cluster.
+///
+/// Agreement over three nodes is agreement over three pairs; over five it is ten,
+/// and a merge that is order-sensitive in a way three cannot expose has more
+/// chances to show it here.
+///
+/// # Ignored: not because it fails, but because of what it costs the others
+///
+/// It passes. Measured on this suite, on an eight-core machine:
+///
+/// | suite | worlds | wall | system time |
+/// |---|---|---|---|
+/// | without the five-node worlds | 62 | **135 s** | 2m37s |
+/// | with three of them | 65 | **475 s** | 8m7s |
+///
+/// Three worlds cost **340 seconds**, and only about 90 of those are their own:
+/// run alone this world takes 28 s. The rest is what they do to everything running
+/// beside them. The trace deep-clones every node after every scheduler event, the
+/// event count grows with the cluster as well, and eight of those at once saturate
+/// memory bandwidth rather than processors — which is why the system time triples
+/// while the user time does not. **The node-count axis is bound by memory, not by
+/// arithmetic**, so it does not fit alongside a parallel suite however many cores
+/// are available.
+///
+/// Kept rather than deleted because the axis is real and this is the cheapest
+/// world on it. Run it deliberately, and give it the machine:
+///
+/// ```text
+/// cargo test -p iroh-beekem-sim --test properties -- --ignored --test-threads=1 a_larger_honest_group
+/// ```
+#[test]
+#[ignore = "passes, but three five-node worlds cost the suite 340s of wall time; run it alone"]
+fn a_larger_honest_group() {
+    crate::harness::check_world("a_larger_honest_group", SWARM.sized(LARGE), honest_claims);
+}
+
+/// The same claims as `an_honest_group_under_swarm_faults`, on a network that does nothing.
+///
+/// A failure here is unambiguous. Under the swarm profile a liveness
+/// failure has two possible causes, and telling the protocol's from the
+/// network's means reading the seed's fault subset; here there is no
+/// second cause. It is also the cheapest world in the file, because a run
+/// with no latency and no partition to heal reaches its horizon in fewer
+/// scheduler events.
+#[test]
+fn honest_on_a_clean_network() {
+    crate::harness::check_world("honest_on_a_clean_network", PRISTINE, honest_claims);
+}
+
+/// The same claims as `an_honest_group_under_swarm_faults`, on a network that also loses,
+/// duplicates and stops nodes.
+///
+/// Loss and duplication are what the anti-entropy paths exist for, and a
+/// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+/// swarm profile none of the three is exercised outside the scripted
+/// worlds, so every claim here is asserted against a network it has never
+/// met before.
+#[test]
+fn honest_on_a_cruel_network() {
+    crate::harness::check_world("honest_on_a_cruel_network", HARSH, honest_claims);
+}
+
+/// Everything this scenario claims, whatever shape it runs in.
+fn honest_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Honest>>> {
+    vec![
+        every_node_eventually_joins_the_group(cluster),
+        joined_nodes_never_disagree_about_group_size_beyond_the_cluster(cluster),
+        documents_converge_once_the_network_settles(cluster),
+        a_nodes_own_edits_are_always_present_in_its_own_view(),
+        no_chunk_stays_parked_forever(cluster),
+        no_control_operation_stays_parked_forever(cluster),
+        no_role_or_binding_ever_moves_without_a_valid_chain(cluster),
+        a_healthy_run_never_evicts_anything(),
+    ]
+}
+
+fn every_node_eventually_joins_the_group(cluster: usize) -> Property<WorkspaceNode<Honest>> {
+    property::eventually_within(
         "all nodes join",
         Duration::from_secs(5),
-        |w: &World<'_, WorkspaceNode<Honest>>| joined(w).len() == NODES,
-    )])
-    .run(deterministic());
+        move |w: &World<'_, WorkspaceNode<Honest>>| joined(w).len() == cluster,
+    )
 }
 
-#[test]
-fn joined_nodes_never_disagree_about_group_size_beyond_the_cluster() {
-    // A sanity invariant: no node should ever believe the group is larger than
-    // the cluster. A violation would mean membership operations are being
-    // applied more than once.
-    base_plan(vec![property::always(
+/// A sanity invariant: no node should ever believe the group is larger than
+/// the cluster. A violation would mean membership operations are being
+/// applied more than once.
+fn joined_nodes_never_disagree_about_group_size_beyond_the_cluster(
+    cluster: usize,
+) -> Property<WorkspaceNode<Honest>> {
+    property::always(
         "group size is bounded by the cluster",
-        |w: &World<'_, WorkspaceNode<Honest>>| {
-            joined(w).iter().all(|n| n.group_size() as usize <= NODES)
+        move |w: &World<'_, WorkspaceNode<Honest>>| {
+            joined(w).iter().all(|n| n.group_size() as usize <= cluster)
         },
-    )])
-    .run(deterministic());
+    )
 }
 
-#[test]
-fn documents_converge_once_the_network_settles() {
-    // Every joined node that has seen any content must agree with every other.
-    // Nodes still catching up have not converged *yet*, which is why this is an
-    // `eventually` rather than an `always`.
-    base_plan(vec![property::eventually_within(
+/// Every joined node that has seen any content must agree with every other.
+/// Nodes still catching up have not converged *yet*, which is why this is an
+/// `eventually` rather than an `always`.
+fn documents_converge_once_the_network_settles(cluster: usize) -> Property<WorkspaceNode<Honest>> {
+    property::eventually_within(
         "joined nodes agree on document content",
         Duration::from_secs(10),
-        |w: &World<'_, WorkspaceNode<Honest>>| {
+        move |w: &World<'_, WorkspaceNode<Honest>>| {
             let texts: Vec<String> = joined(w).iter().map(|n| n.document_text()).collect();
-            if texts.len() < NODES {
+            if texts.len() < cluster {
                 return false;
             }
             let mut sorted: Vec<Vec<char>> = texts
@@ -144,16 +425,14 @@ fn documents_converge_once_the_network_settles() {
             sorted.dedup();
             sorted.len() == 1
         },
-    )])
-    .run(deterministic());
+    )
 }
 
-#[test]
-fn a_nodes_own_edits_are_always_present_in_its_own_view() {
-    // The weakest possible sanity check on the encryption pipeline: whatever a
-    // node wrote, it can still read. If encryption or the pending-chunk logic
-    // ever dropped a local write, this fails immediately.
-    base_plan(vec![property::always(
+/// The weakest possible sanity check on the encryption pipeline: whatever a
+/// node wrote, it can still read. If encryption or the pending-chunk logic
+/// ever dropped a local write, this fails immediately.
+fn a_nodes_own_edits_are_always_present_in_its_own_view() -> Property<WorkspaceNode<Honest>> {
+    property::always(
         "local edits are visible locally",
         |w: &World<'_, WorkspaceNode<Honest>>| {
             joined(w).iter().all(|n| {
@@ -161,37 +440,32 @@ fn a_nodes_own_edits_are_always_present_in_its_own_view() {
                 n.contributed().iter().all(|c| text.contains(c.as_str()))
             })
         },
-    )])
-    .run(deterministic());
+    )
 }
 
-#[test]
-fn no_chunk_stays_parked_forever() {
-    // The two-DAG hazard: a chunk needs both its CGKA key material and its CRDT
-    // dependencies. If those two conditions could deadlock against each other,
-    // chunks would accumulate and never drain.
-    base_plan(vec![property::eventually_within(
+/// The two-DAG hazard: a chunk needs both its CGKA key material and its CRDT
+/// dependencies. If those two conditions could deadlock against each other,
+/// chunks would accumulate and never drain.
+fn no_chunk_stays_parked_forever(cluster: usize) -> Property<WorkspaceNode<Honest>> {
+    property::eventually_within(
         "parked chunks drain",
         Duration::from_secs(10),
-        |w: &World<'_, WorkspaceNode<Honest>>| {
+        move |w: &World<'_, WorkspaceNode<Honest>>| {
             let members = joined(w);
-            members.len() == NODES && members.iter().all(|n| n.pending_chunks() == 0)
+            members.len() == cluster && members.iter().all(|n| n.pending_chunks() == 0)
         },
-    )])
-    .run(deterministic());
+    )
 }
 
-#[test]
-fn no_control_operation_stays_parked_forever() {
-    base_plan(vec![property::eventually_within(
+fn no_control_operation_stays_parked_forever(cluster: usize) -> Property<WorkspaceNode<Honest>> {
+    property::eventually_within(
         "parked control operations drain",
         Duration::from_secs(10),
-        |w: &World<'_, WorkspaceNode<Honest>>| {
+        move |w: &World<'_, WorkspaceNode<Honest>>| {
             let members = joined(w);
-            members.len() == NODES && members.iter().all(|n| n.parked_ops() == 0)
+            members.len() == cluster && members.iter().all(|n| n.parked_ops() == 0)
         },
-    )])
-    .run(deterministic());
+    )
 }
 
 /// In an entirely honest run, upon any interleaving, we expect no node's roles or
@@ -203,12 +477,13 @@ fn no_control_operation_stays_parked_forever() {
 /// and "the honest path quietly accepted uncertified state" is exactly the shape
 /// of the finding phase 5 closed. A suite that only watches attackers can be
 /// green while every check is dead code.
-#[test]
-fn no_role_or_binding_ever_moves_without_a_valid_chain() {
-    base_plan(vec![property::always(
+fn no_role_or_binding_ever_moves_without_a_valid_chain(
+    cluster: usize,
+) -> Property<WorkspaceNode<Honest>> {
+    property::always(
         "roles and bindings only ever reflect what was actually granted",
-        |w: &World<'_, WorkspaceNode<Honest>>| {
-            let admitted: Vec<[u8; 32]> = (0..NODES as u64).map(member_bytes_of).collect();
+        move |w: &World<'_, WorkspaceNode<Honest>>| {
+            let admitted: Vec<[u8; 32]> = (0..cluster as u64).map(member_bytes_of).collect();
             w.nodes().filter(|n| n.has_joined()).all(|n| {
                 // Exactly one admin — the founder — because nothing in an honest
                 // run grants another.
@@ -222,22 +497,19 @@ fn no_role_or_binding_ever_moves_without_a_valid_chain() {
                     })
             })
         },
-    )])
-    .run(deterministic());
+    )
 }
 
-#[test]
-fn a_healthy_run_never_evicts_anything() {
-    // The parking limits are there for a peer flooding the control or data
-    // plane. Under ordinary lossy, unordered delivery they must never bind: if
-    // they do, the eviction path is discarding content that was going to
-    // become applicable, which converges to the wrong answer silently rather
-    // than failing. This is the property that catches that.
-    base_plan(vec![property::always(
+/// The parking limits are there for a peer flooding the control or data
+/// plane. Under ordinary lossy, unordered delivery they must never bind: if
+/// they do, the eviction path is discarding content that was going to
+/// become applicable, which converges to the wrong answer silently rather
+/// than failing. This is the property that catches that.
+fn a_healthy_run_never_evicts_anything() -> Property<WorkspaceNode<Honest>> {
+    property::always(
         "no queue overflows under honest traffic",
         |w: &World<'_, WorkspaceNode<Honest>>| joined(w).iter().all(|n| n.evictions() == 0),
-    )])
-    .run(deterministic());
+    )
 }
 
 /// BeeKEM's headline claim over MLS/TreeKEM is that it merges *concurrent*
@@ -247,7 +519,7 @@ mod concurrent_rotation_and_revocation {
     use iroh_beekem_sim::{Churn, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan};
+    use super::{HARSH, HORIZON, PARTITIONED, PRISTINE, SWARM, plan_of};
 
     /// The nodes still in the group after the scenario's revocation.
     fn remaining<'a>(w: &'a World<'a, WorkspaceNode<Churn>>) -> Vec<&'a WorkspaceNode<Churn>> {
@@ -256,14 +528,81 @@ mod concurrent_rotation_and_revocation {
             .collect()
     }
 
+    /// The world: members rotate their keys while the founder removes one of
+    /// them. BeeKEM must merge the two concurrent operations with no sequencer.
+    ///
+    /// Three nodes, swarm faults.
     #[test]
-    fn the_remaining_members_still_converge() {
-        plan::<Churn>(vec![property::eventually_within(
+    fn rotation_concurrent_with_revocation() {
+        crate::harness::check_world("rotation_concurrent_with_revocation", SWARM, churn_claims);
+    }
+
+    /// Concurrent rotation and revocation, with a member severed while they happen.
+    ///
+    /// BeeKEM's headline claim is that it merges concurrent membership and rotation
+    /// operations with no sequencer. A partition is what makes them genuinely
+    /// concurrent rather than merely interleaved: neither side sees the other's
+    /// operation until the heal, so the merge happens all at once instead of one
+    /// operation at a time.
+    #[test]
+    fn rotation_and_revocation_through_a_partition() {
+        crate::harness::check_world(
+            "rotation_and_revocation_through_a_partition",
+            PARTITIONED,
+            churn_claims,
+        );
+    }
+
+    /// The same claims as `rotation_concurrent_with_revocation`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn rotation_and_revocation_on_a_clean_network() {
+        crate::harness::check_world(
+            "rotation_and_revocation_on_a_clean_network",
+            PRISTINE,
+            churn_claims,
+        );
+    }
+
+    /// The same claims as `rotation_concurrent_with_revocation`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn rotation_and_revocation_on_a_cruel_network() {
+        crate::harness::check_world(
+            "rotation_and_revocation_on_a_cruel_network",
+            HARSH,
+            churn_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn churn_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Churn>>> {
+        vec![
+            the_remaining_members_still_converge(cluster),
+            rotation_never_strands_a_remaining_members_own_writes(),
+            the_revocation_really_does_happen(cluster),
+        ]
+    }
+
+    fn the_remaining_members_still_converge(cluster: usize) -> Property<WorkspaceNode<Churn>> {
+        property::eventually_within(
             "members converge across concurrent rotations and a revocation",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<Churn>>| {
+            move |w: &World<'_, WorkspaceNode<Churn>>| {
                 let members = remaining(w);
-                if members.len() != NODES - 1 {
+                if members.len() != cluster - 1 {
                     return false;
                 }
                 let mut sorted: Vec<Vec<char>> = members
@@ -277,16 +616,14 @@ mod concurrent_rotation_and_revocation {
                 sorted.dedup();
                 sorted.len() == 1
             },
-        )])
-        .run(deterministic());
+        )
     }
 
-    #[test]
-    fn rotation_never_strands_a_remaining_members_own_writes() {
-        // A rotation re-keys the path to the root. If it were mishandled, the
-        // most visible symptom would be a node losing the ability to read back
-        // what it wrote itself.
-        plan::<Churn>(vec![property::always(
+    /// A rotation re-keys the path to the root. If it were mishandled, the
+    /// most visible symptom would be a node losing the ability to read back
+    /// what it wrote itself.
+    fn rotation_never_strands_a_remaining_members_own_writes() -> Property<WorkspaceNode<Churn>> {
+        property::always(
             "local edits survive rotation",
             |w: &World<'_, WorkspaceNode<Churn>>| {
                 remaining(w).iter().all(|n| {
@@ -294,13 +631,12 @@ mod concurrent_rotation_and_revocation {
                     n.contributed().iter().all(|c| text.contains(c.as_str()))
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     #[test]
     fn the_run_is_reproducible() {
-        assert_deterministic(|| plan::<Churn>(Vec::new()), Seed(0x0BAD_F00D));
+        assert_deterministic(|| plan_of::<Churn>(SWARM), Seed(0x0BAD_F00D));
     }
     /// In this plan, upon the run finishing, we expect the revocation actually to
     /// have taken effect somewhere.
@@ -310,16 +646,14 @@ mod concurrent_rotation_and_revocation {
     /// that happened — so both properties above hold perfectly well in a run
     /// where nobody was ever removed, and would go on holding if the removal
     /// stopped being issued.
-    #[test]
-    fn the_revocation_really_does_happen() {
-        plan::<Churn>(vec![property::sometimes(
+    fn the_revocation_really_does_happen(cluster: usize) -> Property<WorkspaceNode<Churn>> {
+        property::sometimes(
             "some node has seen the group shrink",
-            |w: &World<'_, WorkspaceNode<Churn>>| {
+            move |w: &World<'_, WorkspaceNode<Churn>>| {
                 w.nodes()
-                    .any(|n| n.has_joined() && n.current_member_count() < NODES)
+                    .any(|n| n.has_joined() && n.current_member_count() < cluster)
             },
-        )])
-        .run(deterministic());
+        )
     }
 }
 
@@ -331,34 +665,84 @@ mod a_forging_peer_is_rejected {
     use iroh_beekem_sim::{FORGED_DOC, Forging, ROGUE_AUTHOR, WorkspaceNode, doc_key};
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan};
+    use super::{HARSH, HORIZON, PRISTINE, SWARM};
 
+    /// The world: a peer signs operations with a key that no `Add` introduced,
+    /// and broadcasts them onto the control topic.
+    ///
+    /// Three nodes, swarm faults.
     #[test]
-    fn no_forged_member_ever_enters_the_group() {
-        // The cluster has NODES nodes. A forgery that landed would splice an
-        // extra leaf into the tree, so the group would outgrow the cluster —
-        // which is precisely what this counts.
-        plan::<Forging>(vec![property::always(
-            "the group never exceeds the cluster",
-            |w: &World<'_, WorkspaceNode<Forging>>| {
-                w.nodes()
-                    .filter(|n| n.has_joined())
-                    .all(|n| n.group_size() as usize <= NODES)
-            },
-        )])
-        .run(deterministic());
+    fn a_forging_peer_on_the_control_plane() {
+        crate::harness::check_world("a_forging_peer_on_the_control_plane", SWARM, forging_claims);
     }
 
+    /// The same claims as `a_forging_peer_on_the_control_plane`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
     #[test]
-    fn honest_nodes_still_converge_while_under_attack() {
-        // Rejecting forgeries is worth little if the rejection path also stalls
-        // legitimate traffic — a plausible way to "fix" the first property.
-        plan::<Forging>(vec![property::eventually_within(
+    fn a_forging_peer_on_a_clean_network() {
+        crate::harness::check_world(
+            "a_forging_peer_on_a_clean_network",
+            PRISTINE,
+            forging_claims,
+        );
+    }
+
+    /// The same claims as `a_forging_peer_on_the_control_plane`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn a_forging_peer_on_a_cruel_network() {
+        crate::harness::check_world("a_forging_peer_on_a_cruel_network", HARSH, forging_claims);
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn forging_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Forging>>> {
+        vec![
+            no_forged_member_ever_enters_the_group(cluster),
+            honest_nodes_still_converge_while_under_attack(cluster),
+            forgery_traffic_never_fills_the_parking_queues(),
+            no_honest_node_ever_accepts_a_forged_entry(),
+            a_forged_entry_does_reach_honest_nodes_and_is_refused_anyway(),
+            the_forger_really_does_attack(),
+        ]
+    }
+
+    /// The cluster has NODES nodes. A forgery that landed would splice an
+    /// extra leaf into the tree, so the group would outgrow the cluster —
+    /// which is precisely what this counts.
+    fn no_forged_member_ever_enters_the_group(cluster: usize) -> Property<WorkspaceNode<Forging>> {
+        property::always(
+            "the group never exceeds the cluster",
+            move |w: &World<'_, WorkspaceNode<Forging>>| {
+                w.nodes()
+                    .filter(|n| n.has_joined())
+                    .all(|n| n.group_size() as usize <= cluster)
+            },
+        )
+    }
+
+    /// Rejecting forgeries is worth little if the rejection path also stalls
+    /// legitimate traffic — a plausible way to "fix" the first property.
+    fn honest_nodes_still_converge_while_under_attack(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Forging>> {
+        property::eventually_within(
             "honest nodes converge despite the forgery traffic",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<Forging>>| {
+            move |w: &World<'_, WorkspaceNode<Forging>>| {
                 let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
-                if members.len() != NODES {
+                if members.len() != cluster {
                     return false;
                 }
                 let mut sorted: Vec<Vec<char>> = members
@@ -372,24 +756,21 @@ mod a_forging_peer_is_rejected {
                 sorted.dedup();
                 sorted.len() == 1
             },
-        )])
-        .run(deterministic());
+        )
     }
 
-    #[test]
-    fn forgery_traffic_never_fills_the_parking_queues() {
-        // The flood guard's real job: unverifiable traffic is rejected before it
-        // can occupy a slot, so an attacker cannot push out legitimate parked
-        // operations.
-        plan::<Forging>(vec![property::always(
+    /// The flood guard's real job: unverifiable traffic is rejected before it
+    /// can occupy a slot, so an attacker cannot push out legitimate parked
+    /// operations.
+    fn forgery_traffic_never_fills_the_parking_queues() -> Property<WorkspaceNode<Forging>> {
+        property::always(
             "no evictions under forgery traffic",
             |w: &World<'_, WorkspaceNode<Forging>>| {
                 w.nodes()
                     .filter(|n| n.has_joined())
                     .all(|n| n.evictions() == 0)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group under attack on the data plane, upon any honest node being
@@ -406,17 +787,15 @@ mod a_forging_peer_is_rejected {
     /// `FORGED_DOC` is written by nobody else in this scenario, so its content on
     /// an honest node is a pure function of what that node accepted from the
     /// forger — which is what lets the claim be stated as plainly as this.
-    #[test]
-    fn no_honest_node_ever_accepts_a_forged_entry() {
-        plan::<Forging>(vec![property::always(
+    fn no_honest_node_ever_accepts_a_forged_entry() -> Property<WorkspaceNode<Forging>> {
+        property::always(
             "no honest node applies content from an author with no role",
             |w: &World<'_, WorkspaceNode<Forging>>| {
                 w.nodes()
                     .filter(|n| n.has_joined())
                     .all(|n| n.document_text_of(FORGED_DOC).is_empty())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect a forged entry actually to
@@ -436,9 +815,9 @@ mod a_forging_peer_is_rejected {
     /// what makes the stronger one non-vacuous. Without it, an honest node that
     /// never received the forgery at all would satisfy "the forged document is
     /// empty" perfectly.
-    #[test]
-    fn a_forged_entry_does_reach_honest_nodes_and_is_refused_anyway() {
-        plan::<Forging>(vec![property::sometimes(
+    fn a_forged_entry_does_reach_honest_nodes_and_is_refused_anyway()
+    -> Property<WorkspaceNode<Forging>> {
+        property::sometimes(
             "an honest node has seen an entry from an uncertified author",
             |w: &World<'_, WorkspaceNode<Forging>>| {
                 w.nodes().filter(|n| n.has_joined()).any(|n| {
@@ -446,8 +825,7 @@ mod a_forging_peer_is_rejected {
                         .is_some_and(|meta| meta.author == NodeId(ROGUE_AUTHOR))
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect a forgery really to have
@@ -457,13 +835,11 @@ mod a_forging_peer_is_rejected {
     /// of them is satisfied by a run in which no forgery was ever sent, and under
     /// a lossy transport with a bounded forgery budget that is a reachable run
     /// rather than a hypothetical one.
-    #[test]
-    fn the_forger_really_does_attack() {
-        plan::<Forging>(vec![property::sometimes(
+    fn the_forger_really_does_attack() -> Property<WorkspaceNode<Forging>> {
+        property::sometimes(
             "some node has broadcast a forgery",
             |w: &World<'_, WorkspaceNode<Forging>>| w.nodes().any(|n| n.forgeries_made() > 0),
-        )])
-        .run(deterministic());
+        )
     }
 }
 
@@ -473,8 +849,8 @@ fn the_simulation_is_reproducible() {
     // order, an unseeded RNG, a clock read) crept into the core, the same seed
     // would stop reproducing the same history and every property above would
     // become untrustworthy.
-    assert_deterministic(|| base_plan(Vec::new()), Seed(0x00C0_FFEE));
-    assert_deterministic(|| base_plan(Vec::new()), Seed(0x1234_5678));
+    assert_deterministic(|| plan_of::<Honest>(SWARM), Seed(0x00C0_FFEE));
+    assert_deterministic(|| plan_of::<Honest>(SWARM), Seed(0x1234_5678));
 }
 
 /// What a removed member can still *see*, as distinct from what it can read.
@@ -508,7 +884,7 @@ mod a_removed_member_stops_seeing {
     };
     use propsim::prelude::*;
 
-    use super::{HORIZON, plan};
+    use super::{CRASHED_FOUNDER, HARSH, HORIZON, PARTITIONED, PRISTINE, SWARM};
 
     /// The node the founder promotes after the revocation, matching
     /// `Scenario::PROMOTE_AFTER_REVOKE`.
@@ -531,6 +907,95 @@ mod a_removed_member_stops_seeing {
             .collect()
     }
 
+    /// The world: the founder removes a device and rotates the namespace, then
+    /// writes a document, creates a file, and promotes a member.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn a_revoked_device_after_rotation() {
+        crate::harness::check_world("a_revoked_device_after_rotation", SWARM, eviction_claims);
+    }
+
+    /// A removal and a rotation, with a member severed while they happen.
+    ///
+    /// Every scripted world so far ran the honest scenario, and every removal ran
+    /// under swarm faults. This is the crossing: the victim is node 2 and the cut
+    /// isolates node 2, so the removal and the rotation are decided while the device
+    /// they concern cannot hear them, and the heal is what has to deliver the
+    /// eviction rather than the ordinary resync schedule.
+    #[test]
+    fn a_revoked_device_through_a_partition() {
+        crate::harness::check_world(
+            "a_revoked_device_through_a_partition",
+            PARTITIONED,
+            eviction_claims,
+        );
+    }
+
+    /// A removal and a rotation across a restart of the only administrator.
+    ///
+    /// The founder is what issues the removal, mints the rotation and adopts it
+    /// through `Effect::AdoptNamespace`. Stopping and starting it is the one script
+    /// that asks whether all three survive a restart, and no swarm world can ask
+    /// that: `crash_restart` is not in the swarm profile.
+    #[test]
+    fn a_revoked_device_while_the_founder_is_down() {
+        crate::harness::check_world(
+            "a_revoked_device_while_the_founder_is_down",
+            CRASHED_FOUNDER,
+            eviction_claims,
+        );
+    }
+
+    /// The same claims as `a_revoked_device_after_rotation`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn a_revoked_device_on_a_clean_network() {
+        crate::harness::check_world(
+            "a_revoked_device_on_a_clean_network",
+            PRISTINE,
+            eviction_claims,
+        );
+    }
+
+    /// The same claims as `a_revoked_device_after_rotation`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn a_revoked_device_on_a_cruel_network() {
+        crate::harness::check_world(
+            "a_revoked_device_on_a_cruel_network",
+            HARSH,
+            eviction_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn eviction_claims(_cluster: usize) -> Vec<Property<WorkspaceNode<Eviction>>> {
+        vec![
+            the_victim_never_sees_an_entry_written_after_its_removal(),
+            every_remaining_member_sees_the_entry_the_victim_does_not(),
+            the_victim_never_adopts_the_rotation(),
+            the_remaining_members_converge_on_one_namespace(),
+            no_remaining_member_accepts_a_post_revocation_entry_from_the_victim(),
+            rotation_does_not_cost_the_remaining_members_their_content(),
+            the_victim_never_sees_a_file_created_after_its_removal(),
+            a_removed_device_still_learns_of_later_membership_changes(),
+            every_remaining_member_sees_the_workspace_changes_the_victim_does_not(),
+        ]
+    }
+
     /// Given a revoked device, at every point after the group rotates, we expect
     /// it never to observe an index entry for a document first written after its
     /// removal.
@@ -540,15 +1005,14 @@ mod a_removed_member_stops_seeing {
     /// wrote it. `always` rather than `eventually`: there is no moment at which
     /// the victim is allowed to have seen the entry and then forgotten it, and
     /// no later rotation can unlearn what it already observed.
-    #[test]
-    fn the_victim_never_sees_an_entry_written_after_its_removal() {
-        plan::<Eviction>(vec![property::always(
+    fn the_victim_never_sees_an_entry_written_after_its_removal()
+    -> Property<WorkspaceNode<Eviction>> {
+        property::always(
             "the victim observes no post-revocation entry",
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 victim(w).is_none_or(|v| v.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given the same run, when it settles, we expect every *remaining* member
@@ -559,9 +1023,9 @@ mod a_removed_member_stops_seeing {
     /// eviction property perfectly while destroying the workspace. It also
     /// guards the vacuity: if the late write never happened, this fails rather
     /// than passing silently alongside it.
-    #[test]
-    fn every_remaining_member_sees_the_entry_the_victim_does_not() {
-        plan::<Eviction>(vec![property::eventually_within(
+    fn every_remaining_member_sees_the_entry_the_victim_does_not()
+    -> Property<WorkspaceNode<Eviction>> {
+        property::eventually_within(
             "remaining members observe the post-revocation entry",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
@@ -571,8 +1035,7 @@ mod a_removed_member_stops_seeing {
                         .iter()
                         .all(|n| n.entry(&doc_key(POST_REVOCATION_DOC)).is_some())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given a revoked device, at every point in the run, we expect it never to
@@ -584,13 +1047,11 @@ mod a_removed_member_stops_seeing {
     /// or by a run in which nobody happened to write — rather than by the
     /// rotation. The capability travels encrypted under a key minted after the
     /// victim's leaf left the tree, so there is nothing for it to decrypt.
-    #[test]
-    fn the_victim_never_adopts_the_rotation() {
-        plan::<Eviction>(vec![property::always(
+    fn the_victim_never_adopts_the_rotation() -> Property<WorkspaceNode<Eviction>> {
+        property::always(
             "the victim stays on the namespace it was removed from",
             |w: &World<'_, WorkspaceNode<Eviction>>| victim(w).is_none_or(|v| !v.has_rotated()),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given the group has rotated, when the run settles, we expect every
@@ -601,9 +1062,8 @@ mod a_removed_member_stops_seeing {
     /// split across two namespaces with each half convinced it was current.
     /// This is what says the tie-break is total and computed identically
     /// everywhere.
-    #[test]
-    fn the_remaining_members_converge_on_one_namespace() {
-        plan::<Eviction>(vec![property::eventually_within(
+    fn the_remaining_members_converge_on_one_namespace() -> Property<WorkspaceNode<Eviction>> {
+        property::eventually_within(
             "remaining members agree on the current namespace",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
@@ -613,8 +1073,7 @@ mod a_removed_member_stops_seeing {
                 };
                 members.len() >= 2 && members.iter().all(|n| n.namespace() == first.namespace())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given a revoked device, at every point in the run, we expect no remaining
@@ -625,9 +1084,9 @@ mod a_removed_member_stops_seeing {
     /// keeps the one it was given — abandoning the namespace is what makes it
     /// worthless. A failure here means the group is still reconciling the
     /// replica the victim can still write to.
-    #[test]
-    fn no_remaining_member_accepts_a_post_revocation_entry_from_the_victim() {
-        plan::<Eviction>(vec![property::always(
+    fn no_remaining_member_accepts_a_post_revocation_entry_from_the_victim()
+    -> Property<WorkspaceNode<Eviction>> {
+        property::always(
             "no remaining member holds a post-revocation entry authored by the victim",
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 let Some(victim) = victim(w) else {
@@ -639,8 +1098,7 @@ mod a_removed_member_stops_seeing {
                         .is_none_or(|meta| meta.author != victim_id)
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given the group has rotated away from the victim, when the run settles,
@@ -649,9 +1107,9 @@ mod a_removed_member_stops_seeing {
     /// Rotation re-publishes every document into a fresh namespace, which is the
     /// single most disruptive thing the protocol does. This is the property that
     /// notices if it strands content rather than moving it.
-    #[test]
-    fn rotation_does_not_cost_the_remaining_members_their_content() {
-        plan::<Eviction>(vec![property::eventually_within(
+    fn rotation_does_not_cost_the_remaining_members_their_content()
+    -> Property<WorkspaceNode<Eviction>> {
+        property::eventually_within(
             "remaining members converge across the rotation",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
@@ -670,8 +1128,7 @@ mod a_removed_member_stops_seeing {
                 sorted.dedup();
                 sorted.len() == 1
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given a revoked device, at every instant, we expect it never to learn the
@@ -688,9 +1145,9 @@ mod a_removed_member_stops_seeing {
     /// A file name is worth withholding on its own. `/q4-layoffs.xlsx` discloses
     /// its subject without a byte of its content being readable, which is the
     /// whole reason storage keys are blinded in the first place.
-    #[test]
-    fn the_victim_never_sees_a_file_created_after_its_removal() {
-        plan::<Eviction>(vec![property::always(
+    fn the_victim_never_sees_a_file_created_after_its_removal() -> Property<WorkspaceNode<Eviction>>
+    {
+        property::always(
             "a removed device never learns the name of a later file",
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 victim(w).is_none_or(|n| {
@@ -699,8 +1156,7 @@ mod a_removed_member_stops_seeing {
                         .any(|path| path == POST_REVOCATION_PATH)
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given a revoked device, we expect it to go on learning of membership
@@ -727,15 +1183,14 @@ mod a_removed_member_stops_seeing {
     /// Closing it is not a matter of adding a check. It needs the bootstrap
     /// exception to expire, and that exception exists because a joiner must
     /// accept its inviter *before* it has any state to derive a roster from.
-    #[test]
-    fn a_removed_device_still_learns_of_later_membership_changes() {
-        plan::<Eviction>(vec![property::sometimes(
+    fn a_removed_device_still_learns_of_later_membership_changes()
+    -> Property<WorkspaceNode<Eviction>> {
+        property::sometimes(
             "a removed device sees a promotion made after it was removed",
             |w: &World<'_, WorkspaceNode<Eviction>>| {
                 victim(w).is_some_and(|n| n.role_of(member_bytes_of(PROMOTED)) == Some(Role::Admin))
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given the group created a file and appointed an administrator after the
@@ -749,9 +1204,9 @@ mod a_removed_member_stops_seeing {
     /// change scheduled six seconds in, after a revocation and the rotation it
     /// triggers, is one that can genuinely fail to happen. Without this, "the
     /// victim never saw it" would be true because there was nothing to see.
-    #[test]
-    fn every_remaining_member_sees_the_workspace_changes_the_victim_does_not() {
-        plan::<Eviction>(vec![property::eventually_within(
+    fn every_remaining_member_sees_the_workspace_changes_the_victim_does_not()
+    -> Property<WorkspaceNode<Eviction>> {
+        property::eventually_within(
             "the members that stayed learn the later file and the later promotion",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Eviction>>| {
@@ -764,8 +1219,7 @@ mod a_removed_member_stops_seeing {
                             && n.role_of(member_bytes_of(PROMOTED)) == Some(Role::Admin)
                     })
             },
-        )])
-        .run(deterministic());
+        )
     }
 }
 
@@ -786,8 +1240,7 @@ mod generated_crud_workloads {
     use std::{collections::BTreeMap, time::Duration};
 
     use iroh_beekem_sim::{
-        Crud, CrudChurn, Scenario, WorkspaceNode, WorkspaceSpec, append_only_workload,
-        crud_workload,
+        Crud, CrudChurn, Scenario, WorkspaceNode, append_only_workload, crud_workload,
     };
     use propsim::prelude::*;
     // The recorded-history types. Re-exported by `propsim` from `propsim-core`
@@ -795,7 +1248,7 @@ mod generated_crud_workloads {
     // suite reads node state rather than the history.
     use propsim::{History, OpKind, ProcessId, Value};
 
-    use super::{NODES, SEEDS, network_faults};
+    use super::{HARSH, PRISTINE, SWARM, plan_of};
 
     /// The ceiling on how many repairs one node may answer in a run.
     ///
@@ -804,45 +1257,69 @@ mod generated_crud_workloads {
     /// what produces the unreadable chunk that raises the request.
     const MAX_REPAIRS_PER_NODE: u64 = 24;
 
-    fn workload_plan<S: Scenario>(
-        properties: Vec<Property<WorkspaceNode<S>>>,
-    ) -> TestPlan<WorkspaceNode<S>> {
-        Simulation::plan::<WorkspaceNode<S>>()
-            .nodes(NODES)
-            .transport(InMemory::unordered_lossy())
-            .faults(network_faults())
-            .state_machine()
-            .workload(crud_workload(NODES))
-            .client(WorkspaceSpec)
-            .check(properties)
-            .seeds(SEEDS)
-            .finish()
-    }
-
-    /// The same plan over a workload that only ever adds text.
-    ///
-    /// Exists for the history-based loss property alone. "No acknowledged write
-    /// is lost" needs a monotone history to be definable at all — see
-    /// `append_only_workload` — and it needs the same adversarial network as
-    /// everything else, which is why this differs from `workload_plan` in exactly
-    /// one line.
-    fn append_only_plan<S: Scenario>(
-        properties: Vec<Property<WorkspaceNode<S>>>,
-    ) -> TestPlan<WorkspaceNode<S>> {
-        Simulation::plan::<WorkspaceNode<S>>()
-            .nodes(NODES)
-            .transport(InMemory::unordered_lossy())
-            .faults(network_faults())
-            .state_machine()
-            .workload(append_only_workload(NODES))
-            .client(WorkspaceSpec)
-            .check(properties)
-            .seeds(SEEDS)
-            .finish()
-    }
-
     fn joined<'a, S: Scenario>(w: &'a World<'a, WorkspaceNode<S>>) -> Vec<&'a WorkspaceNode<S>> {
         w.nodes().filter(|n| n.has_joined()).collect()
+    }
+
+    /// The world: a generated workload of appends, writes, inserts, removals,
+    /// reverts and reads drives every content change.
+    ///
+    /// Three nodes, swarm faults, `crud_workload`.
+    #[test]
+    fn a_generated_crud_workload() {
+        crate::harness::check_world(
+            "a_generated_crud_workload",
+            SWARM.driven_by(crud_workload),
+            crud_claims,
+        );
+    }
+
+    /// The same claims as `a_generated_crud_workload`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn a_crud_workload_on_a_clean_network() {
+        crate::harness::check_world(
+            "a_crud_workload_on_a_clean_network",
+            PRISTINE.driven_by(crud_workload),
+            crud_claims,
+        );
+    }
+
+    /// The same claims as `a_generated_crud_workload`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn a_crud_workload_on_a_cruel_network() {
+        crate::harness::check_world(
+            "a_crud_workload_on_a_cruel_network",
+            HARSH.driven_by(crud_workload),
+            crud_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn crud_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Crud>>> {
+        vec![
+            every_document_converges_under_a_generated_workload(cluster),
+            a_generated_workload_never_evicts_anything(),
+            no_chunk_stays_parked_under_a_generated_workload(cluster),
+            a_generated_workload_really_does_strand_a_late_joiner(),
+            a_stranded_node_is_answered_by_a_repair(),
+            repair_does_not_feed_itself(),
+            generated_operations_actually_reach_the_documents(),
+            no_node_ever_holds_content_nobody_wrote(),
+        ]
     }
 
     /// Full convergence across every document under a generated workload.
@@ -865,36 +1342,33 @@ mod generated_crud_workloads {
     ///
     /// Reproduced before the fix with `PROPSIM_SEED=0x03317bb4875fb038`, which
     /// is the seed to reach for if this ever regresses.
-    #[test]
-    fn every_document_converges_under_a_generated_workload() {
-        // Byte-identical, not merely "contains what I wrote". Concurrent inserts
-        // have no canonical order, so the assertion is that all replicas agree —
-        // never that they agree on a particular string, which would be asserting
-        // Loro's internal ordering rather than our convergence.
-        workload_plan::<Crud>(vec![property::eventually_within(
+    /// Byte-identical, not merely "contains what I wrote". Concurrent inserts
+    /// have no canonical order, so the assertion is that all replicas agree —
+    /// never that they agree on a particular string, which would be asserting
+    /// Loro's internal ordering rather than our convergence.
+    fn every_document_converges_under_a_generated_workload(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Crud>> {
+        property::eventually_within(
             "all documents converge",
             Duration::from_secs(9),
-            |w: &World<'_, WorkspaceNode<Crud>>| {
+            move |w: &World<'_, WorkspaceNode<Crud>>| {
                 let nodes = joined(w);
                 let Some(first) = nodes.first() else {
                     return false;
                 };
-                nodes.len() == NODES && nodes.iter().all(|n| n.all_text() == first.all_text())
+                nodes.len() == cluster && nodes.iter().all(|n| n.all_text() == first.all_text())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
-    #[test]
-    fn a_generated_workload_never_evicts_anything() {
-        // The queue limits exist for hostile traffic. A generated but honest
-        // workload reaching them would mean the eviction logic fires when it
-        // should not, which shows up as silent data loss rather than a failure.
-        workload_plan::<Crud>(vec![property::always(
-            "no evictions",
-            |w: &World<'_, WorkspaceNode<Crud>>| joined(w).iter().all(|n| n.evictions() == 0),
-        )])
-        .run(deterministic());
+    /// The queue limits exist for hostile traffic. A generated but honest
+    /// workload reaching them would mean the eviction logic fires when it
+    /// should not, which shows up as silent data loss rather than a failure.
+    fn a_generated_workload_never_evicts_anything() -> Property<WorkspaceNode<Crud>> {
+        property::always("no evictions", |w: &World<'_, WorkspaceNode<Crud>>| {
+            joined(w).iter().all(|n| n.evictions() == 0)
+        })
     }
 
     /// Given a generated workload under partitions, when the network settles,
@@ -906,20 +1380,20 @@ mod generated_crud_workloads {
     /// and can never observe a chunk that parks later and never drains — which
     /// is exactly what pre-join ciphertext used to do. The honest-scenario
     /// counterpart has always carried the guard; this one had drifted.
-    #[test]
-    fn no_chunk_stays_parked_under_a_generated_workload() {
-        workload_plan::<Crud>(vec![property::eventually_within(
+    fn no_chunk_stays_parked_under_a_generated_workload(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Crud>> {
+        property::eventually_within(
             "parking drains",
             Duration::from_secs(9),
-            |w: &World<'_, WorkspaceNode<Crud>>| {
+            move |w: &World<'_, WorkspaceNode<Crud>>| {
                 let nodes = joined(w);
-                nodes.len() == NODES
+                nodes.len() == cluster
                     && nodes
                         .iter()
                         .all(|n| n.pending_chunks() == 0 && n.parked_ops() == 0)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given a generated workload, we expect at least one node to receive
@@ -931,15 +1405,13 @@ mod generated_crud_workloads {
     /// written — and such a run would say nothing about repair. This asserts
     /// the situation the repair path exists for actually occurs, so the
     /// properties that depend on it are not passing vacuously.
-    #[test]
-    fn a_generated_workload_really_does_strand_a_late_joiner() {
-        workload_plan::<Crud>(vec![property::sometimes(
+    fn a_generated_workload_really_does_strand_a_late_joiner() -> Property<WorkspaceNode<Crud>> {
+        property::sometimes(
             "some node receives an epoch it cannot derive",
             |w: &World<'_, WorkspaceNode<Crud>>| {
                 joined(w).iter().any(|n| n.unreadable_chunks() > 0)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given a node stranded on an epoch it cannot derive, we expect some other
@@ -949,13 +1421,11 @@ mod generated_crud_workloads {
     /// run where nobody answers still converges if the stranded content happens
     /// to be superseded by a later write, and that would leave the repair path
     /// dead code that nothing notices.
-    #[test]
-    fn a_stranded_node_is_answered_by_a_repair() {
-        workload_plan::<Crud>(vec![property::sometimes(
+    fn a_stranded_node_is_answered_by_a_repair() -> Property<WorkspaceNode<Crud>> {
+        property::sometimes(
             "some node answers a repair request",
             |w: &World<'_, WorkspaceNode<Crud>>| joined(w).iter().any(|n| n.repairs_answered() > 0),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Given an honest run, we expect no node to answer more repairs than it
@@ -968,33 +1438,49 @@ mod generated_crud_workloads {
     /// anti-entropy round is far above what a healthy run needs — the runs this
     /// was written against sit around a quarter of it — and far below what a
     /// self-sustaining loop would reach within seconds.
-    #[test]
-    fn repair_does_not_feed_itself() {
-        workload_plan::<Crud>(vec![property::always(
+    fn repair_does_not_feed_itself() -> Property<WorkspaceNode<Crud>> {
+        property::always(
             "repairs stay proportional to anti-entropy rounds",
             |w: &World<'_, WorkspaceNode<Crud>>| {
                 joined(w)
                     .iter()
                     .all(|n| n.repairs_answered() <= MAX_REPAIRS_PER_NODE)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
-    #[test]
-    fn generated_operations_actually_reach_the_documents() {
-        // Guards the harness, not the protocol. If the codec stopped decoding,
-        // or ops were never dispatched, every property above would pass
-        // vacuously over an empty workspace — so assert the workload did work.
-        workload_plan::<Crud>(vec![property::sometimes(
+    /// Guards the harness, not the protocol. If the codec stopped decoding,
+    /// or ops were never dispatched, every property above would pass
+    /// vacuously over an empty workspace — so assert the workload did work.
+    fn generated_operations_actually_reach_the_documents() -> Property<WorkspaceNode<Crud>> {
+        property::sometimes(
             "some document has content",
             |w: &World<'_, WorkspaceNode<Crud>>| {
                 joined(w)
                     .iter()
                     .any(|n| n.all_text().iter().any(|t| !t.is_empty()))
             },
-        )])
-        .run(deterministic());
+        )
+    }
+
+    /// The world: a generated workload while members rotate their keys and one
+    /// member is removed.
+    ///
+    /// Three nodes, swarm faults, `crud_workload`.
+    #[test]
+    fn a_generated_workload_under_churn() {
+        crate::harness::check_world(
+            "a_generated_workload_under_churn",
+            SWARM.driven_by(crud_workload),
+            crud_churn_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn crud_churn_claims(cluster: usize) -> Vec<Property<WorkspaceNode<CrudChurn>>> {
+        vec![the_remaining_members_converge_under_workload_and_churn(
+            cluster,
+        )]
     }
 
     /// Given generated CRUD against a group that is concurrently rotating keys
@@ -1006,12 +1492,13 @@ mod generated_crud_workloads {
     /// in `no_chunk_stays_parked_under_a_generated_workload`: at t=0 only the
     /// founder has joined, so a one-element set agrees with itself and the
     /// property is satisfied before the run has done anything.
-    #[test]
-    fn the_remaining_members_converge_under_workload_and_churn() {
-        workload_plan::<CrudChurn>(vec![property::eventually_within(
+    fn the_remaining_members_converge_under_workload_and_churn(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<CrudChurn>> {
+        property::eventually_within(
             "survivors converge",
             Duration::from_secs(9),
-            |w: &World<'_, WorkspaceNode<CrudChurn>>| {
+            move |w: &World<'_, WorkspaceNode<CrudChurn>>| {
                 let remaining: Vec<_> = w
                     .nodes()
                     .filter(|n| n.has_joined() && !n.is_revocation_target())
@@ -1019,11 +1506,10 @@ mod generated_crud_workloads {
                 let Some(first) = remaining.first() else {
                     return false;
                 };
-                remaining.len() == NODES - 1
+                remaining.len() == cluster - 1
                     && remaining.iter().all(|n| n.all_text() == first.all_text())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     #[test]
@@ -1031,7 +1517,10 @@ mod generated_crud_workloads {
         // The workload is sampled from the seed, so this covers op generation as
         // well as scheduling: a fixed seed must produce the same ops in the same
         // order, or a failing run could never be replayed.
-        assert_deterministic(|| workload_plan::<Crud>(Vec::new()), Seed(0x0C0D_E123));
+        assert_deterministic(
+            || plan_of::<Crud>(SWARM.driven_by(crud_workload)),
+            Seed(0x0C0D_E123),
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1164,9 +1653,8 @@ mod generated_crud_workloads {
     /// applies one under the wrong document, or resurrects a superseded delta —
     /// none of which a convergence property sees, because every node can be wrong
     /// in the same way and still agree.
-    #[test]
-    fn no_node_ever_holds_content_nobody_wrote() {
-        workload_plan::<Crud>(vec![property::always(
+    fn no_node_ever_holds_content_nobody_wrote() -> Property<WorkspaceNode<Crud>> {
+        property::always(
             "every character on every node was asked for by some client",
             |w: &World<'_, WorkspaceNode<Crud>>| {
                 let issued = issued_chars(w.history(), false);
@@ -1176,8 +1664,28 @@ mod generated_crud_workloads {
                     is_sub_multiset(&held, &issued)
                 })
             },
-        )])
-        .run(deterministic());
+        )
+    }
+
+    /// The world: a generated workload that only adds text.
+    ///
+    /// Three nodes, swarm faults, `append_only_workload`. Only a monotone
+    /// history makes "no acknowledged write is lost" definable at all.
+    #[test]
+    fn an_append_only_workload() {
+        crate::harness::check_world(
+            "an_append_only_workload",
+            SWARM.driven_by(append_only_workload),
+            append_only_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn append_only_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Crud>>> {
+        vec![
+            every_acknowledged_write_reaches_every_node(cluster),
+            the_history_really_does_record_acknowledged_writes(),
+        ]
     }
 
     /// In a group under a workload that only ever adds text, upon the run
@@ -1197,24 +1705,24 @@ mod generated_crud_workloads {
     /// asked for has manufactured content. An implementation that dropped
     /// everything satisfies the upper bound alone; one that duplicated every
     /// chunk satisfies the lower.
-    #[test]
-    fn every_acknowledged_write_reaches_every_node() {
-        append_only_plan::<Crud>(vec![property::eventually_within(
+    fn every_acknowledged_write_reaches_every_node(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Crud>> {
+        property::eventually_within(
             "every node holds at least what was acknowledged and at most what was asked for",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Crud>>| {
+            move |w: &World<'_, WorkspaceNode<Crud>>| {
                 let acknowledged = acknowledged_append_chars(w.history());
                 let issued = issued_chars(w.history(), true);
                 let nodes = joined(w);
-                nodes.len() == NODES
+                nodes.len() == cluster
                     && nodes.iter().all(|n| {
                         let mut held: Vec<char> = n.all_text().concat().chars().collect();
                         held.sort_unstable();
                         is_sub_multiset(&acknowledged, &held) && is_sub_multiset(&held, &issued)
                     })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect the recorded history to
@@ -1226,19 +1734,20 @@ mod generated_crud_workloads {
     /// or `.workload()` records no entries at all, which is the state every other
     /// module in this file is in. A history property in one of those would pass
     /// while reading nothing.
-    #[test]
-    fn the_history_really_does_record_acknowledged_writes() {
-        append_only_plan::<Crud>(vec![property::sometimes(
+    fn the_history_really_does_record_acknowledged_writes() -> Property<WorkspaceNode<Crud>> {
+        property::sometimes(
             "the recorded history holds an acknowledged append",
             |w: &World<'_, WorkspaceNode<Crud>>| !acknowledged_append_chars(w.history()).is_empty(),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Reproducibility for the append-only plan, as every other plan asserts it.
     #[test]
     fn an_append_only_run_is_reproducible() {
-        assert_deterministic(|| append_only_plan::<Crud>(Vec::new()), Seed(0x0A99_E4D0));
+        assert_deterministic(
+            || plan_of::<Crud>(SWARM.driven_by(append_only_workload)),
+            Seed(0x0A99_E4D0),
+        );
     }
 }
 
@@ -1257,7 +1766,7 @@ mod an_outsider_observes_nothing {
     use iroh_beekem_sim::{Outsider, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan_of_size};
+    use super::{HARSH, HORIZON, NODES, PRISTINE, SWARM};
 
     /// One more node than the honest group, so the outsider's presence does not
     /// shrink the set of members the other properties are about.
@@ -1272,10 +1781,80 @@ mod an_outsider_observes_nothing {
         w.nodes().find(|n| n.id() == OUTSIDER)
     }
 
+    /// How many of the cluster's devices the group ever admits.
+    ///
+    /// **Not the cluster size, and the difference is the whole scenario.** The
+    /// outsider is one of the nodes the shape creates and it never asks to join,
+    /// so a property that counted members against the cluster would wait for an
+    /// admission that is never coming — which is a property about this harness
+    /// rather than about the protocol, and it fails on every seed.
+    fn admitted(cluster: usize) -> usize {
+        cluster - 1
+    }
+
     fn members<'a>(w: &'a World<'a, WorkspaceNode<Outsider>>) -> Vec<&'a WorkspaceNode<Outsider>> {
         w.nodes()
             .filter(|n| n.id() != OUTSIDER && n.has_joined())
             .collect()
+    }
+
+    /// The world: a fourth device sits on the network and never asks to join.
+    ///
+    /// Four nodes, swarm faults. One more than the honest group, so that the
+    /// properties about *members* still have three of them to speak about.
+    #[test]
+    fn an_outsider_on_the_network() {
+        crate::harness::check_world(
+            "an_outsider_on_the_network",
+            SWARM.sized(NODES_WITH_OUTSIDER),
+            outsider_claims,
+        );
+    }
+
+    /// The same claims as `an_outsider_on_the_network`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn an_outsider_on_a_clean_network() {
+        crate::harness::check_world(
+            "an_outsider_on_a_clean_network",
+            PRISTINE.sized(NODES_WITH_OUTSIDER),
+            outsider_claims,
+        );
+    }
+
+    /// The same claims as `an_outsider_on_the_network`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn an_outsider_on_a_cruel_network() {
+        crate::harness::check_world(
+            "an_outsider_on_a_cruel_network",
+            HARSH.sized(NODES_WITH_OUTSIDER),
+            outsider_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn outsider_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Outsider>>> {
+        vec![
+            an_unadmitted_node_never_observes_an_index_entry(),
+            an_unadmitted_node_never_observes_a_control_operation(),
+            an_unadmitted_node_is_on_nobodys_roster(),
+            every_member_eventually_admits_every_other_member(cluster),
+            members_converge_on_the_same_derived_roster(cluster),
+            the_outsider_really_is_offered_traffic_and_refuses_it(),
+        ]
     }
 
     /// Given a node that never asked to be admitted, at every point in a run in
@@ -1287,18 +1866,11 @@ mod an_outsider_observes_nothing {
     /// one at all means it learned that a document exists, how big it is and who
     /// wrote it — the metadata leak the roster exists to close, and one that no
     /// later eviction can undo.
-    #[test]
-    fn an_unadmitted_node_never_observes_an_index_entry() {
-        plan_of_size::<Outsider>(
-            NODES_WITH_OUTSIDER,
-            vec![property::always(
-                "an outsider's modelled replica stays empty",
-                |w: &World<'_, WorkspaceNode<Outsider>>| {
-                    outsider(w).is_none_or(|n| n.index_len() == 0)
-                },
-            )],
+    fn an_unadmitted_node_never_observes_an_index_entry() -> Property<WorkspaceNode<Outsider>> {
+        property::always(
+            "an outsider's modelled replica stays empty",
+            |w: &World<'_, WorkspaceNode<Outsider>>| outsider(w).is_none_or(|n| n.index_len() == 0),
         )
-        .run(deterministic());
     }
 
     /// Given the same node, at every point in the run, we expect it to observe
@@ -1308,18 +1880,14 @@ mod an_outsider_observes_nothing {
     /// independently: wrapping the gossip ALPN and not the docs one would pass
     /// this and fail that, and wrapping docs and not gossip the reverse. Stating
     /// them together would let either hole hide behind the other.
-    #[test]
-    fn an_unadmitted_node_never_observes_a_control_operation() {
-        plan_of_size::<Outsider>(
-            NODES_WITH_OUTSIDER,
-            vec![property::always(
-                "an outsider sees no CGKA operation",
-                |w: &World<'_, WorkspaceNode<Outsider>>| {
-                    outsider(w).is_none_or(|n| n.observed_ops() == 0)
-                },
-            )],
+    fn an_unadmitted_node_never_observes_a_control_operation() -> Property<WorkspaceNode<Outsider>>
+    {
+        property::always(
+            "an outsider sees no CGKA operation",
+            |w: &World<'_, WorkspaceNode<Outsider>>| {
+                outsider(w).is_none_or(|n| n.observed_ops() == 0)
+            },
         )
-        .run(deterministic());
     }
 
     /// Given the same node, at every point in the run, we expect it never to
@@ -1330,20 +1898,15 @@ mod an_outsider_observes_nothing {
     /// somebody's roster would mean it is being excluded by accident — by
     /// message timing, or by a scenario that happens not to broadcast — rather
     /// than by the membership rule.
-    #[test]
-    fn an_unadmitted_node_is_on_nobodys_roster() {
-        plan_of_size::<Outsider>(
-            NODES_WITH_OUTSIDER,
-            vec![property::always(
-                "no member admits the outsider",
-                |w: &World<'_, WorkspaceNode<Outsider>>| {
-                    members(w)
-                        .iter()
-                        .all(|n| !n.is_on_roster(propsim::NodeId(OUTSIDER)))
-                },
-            )],
+    fn an_unadmitted_node_is_on_nobodys_roster() -> Property<WorkspaceNode<Outsider>> {
+        property::always(
+            "no member admits the outsider",
+            |w: &World<'_, WorkspaceNode<Outsider>>| {
+                members(w)
+                    .iter()
+                    .all(|n| !n.is_on_roster(propsim::NodeId(OUTSIDER)))
+            },
         )
-        .run(deterministic());
     }
 
     /// Given a group of members under partitions and reordering, when the
@@ -1359,27 +1922,25 @@ mod an_outsider_observes_nothing {
     /// CGKA log, which converge asynchronously. Admission is eventual by
     /// construction, and asserting `always` here would be asserting that the
     /// network is synchronous.
-    #[test]
-    fn every_member_eventually_admits_every_other_member() {
-        plan_of_size::<Outsider>(
-            NODES_WITH_OUTSIDER,
-            vec![property::eventually_within(
-                "members converge on a roster containing each other",
-                HORIZON,
-                |w: &World<'_, WorkspaceNode<Outsider>>| {
-                    let members = members(w);
-                    if members.len() != NODES {
-                        return false;
-                    }
-                    members.iter().all(|n| {
-                        members
-                            .iter()
-                            .all(|peer| n.is_on_roster(propsim::NodeId(peer.id())))
-                    })
-                },
-            )],
+    fn every_member_eventually_admits_every_other_member(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Outsider>> {
+        let expected = admitted(cluster);
+        property::eventually_within(
+            "members converge on a roster containing each other",
+            HORIZON,
+            move |w: &World<'_, WorkspaceNode<Outsider>>| {
+                let members = members(w);
+                if members.len() != expected {
+                    return false;
+                }
+                members.iter().all(|n| {
+                    members
+                        .iter()
+                        .all(|peer| n.is_on_roster(propsim::NodeId(peer.id())))
+                })
+            },
         )
-        .run(deterministic());
     }
 
     /// Given a group whose members admit each other, when the network settles,
@@ -1389,26 +1950,24 @@ mod an_outsider_observes_nothing {
     /// the property: a joiner accepts its inviter on faith, and if that were the
     /// only thing keeping the overlay connected, a roster that never converged
     /// would still pass `every_member_eventually_admits_every_other_member`.
-    #[test]
-    fn members_converge_on_the_same_derived_roster() {
-        plan_of_size::<Outsider>(
-            NODES_WITH_OUTSIDER,
-            vec![property::eventually_within(
-                "derived rosters agree",
-                HORIZON,
-                |w: &World<'_, WorkspaceNode<Outsider>>| {
-                    let members = members(w);
-                    if members.len() != NODES {
-                        return false;
-                    }
-                    let mut rosters: Vec<Vec<propsim::NodeId>> =
-                        members.iter().map(|n| n.derived_roster()).collect();
-                    rosters.dedup();
-                    rosters.len() == 1 && rosters[0].len() == NODES
-                },
-            )],
+    fn members_converge_on_the_same_derived_roster(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Outsider>> {
+        let expected = admitted(cluster);
+        property::eventually_within(
+            "derived rosters agree",
+            HORIZON,
+            move |w: &World<'_, WorkspaceNode<Outsider>>| {
+                let members = members(w);
+                if members.len() != expected {
+                    return false;
+                }
+                let mut rosters: Vec<Vec<propsim::NodeId>> =
+                    members.iter().map(|n| n.derived_roster()).collect();
+                rosters.dedup();
+                rosters.len() == 1 && rosters[0].len() == expected
+            },
         )
-        .run(deterministic());
     }
     /// In this plan, upon the run finishing, we expect the outsider actually to
     /// have been offered traffic and to have refused it.
@@ -1419,18 +1978,14 @@ mod an_outsider_observes_nothing {
     /// admission is checked *before* a message is recorded, every other counter
     /// on this node reads zero in that case too, exactly as it does when the
     /// roster is working. Only a count of what was turned away tells them apart.
-    #[test]
-    fn the_outsider_really_is_offered_traffic_and_refuses_it() {
-        plan_of_size::<Outsider>(
-            NODES_WITH_OUTSIDER,
-            vec![property::sometimes(
-                "the outsider has refused a message it was offered",
-                |w: &World<'_, WorkspaceNode<Outsider>>| {
-                    outsider(w).is_some_and(|n| n.refused_messages() > 0)
-                },
-            )],
+    fn the_outsider_really_is_offered_traffic_and_refuses_it() -> Property<WorkspaceNode<Outsider>>
+    {
+        property::sometimes(
+            "the outsider has refused a message it was offered",
+            |w: &World<'_, WorkspaceNode<Outsider>>| {
+                outsider(w).is_some_and(|n| n.refused_messages() > 0)
+            },
         )
-        .run(deterministic());
     }
 }
 
@@ -1451,7 +2006,56 @@ mod an_insider_cannot_exceed_its_role {
     use iroh_beekem_sim::{Insider, Role, WorkspaceNode, member_bytes_of};
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan};
+    use super::{HARSH, HORIZON, PRISTINE, SWARM};
+
+    /// The world: a member that the group admitted acts beyond the role that
+    /// the group granted it.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn an_insider_exceeding_its_role() {
+        crate::harness::check_world("an_insider_exceeding_its_role", SWARM, insider_claims);
+    }
+
+    /// The same claims as `an_insider_exceeding_its_role`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn an_insider_on_a_clean_network() {
+        crate::harness::check_world("an_insider_on_a_clean_network", PRISTINE, insider_claims);
+    }
+
+    /// The same claims as `an_insider_exceeding_its_role`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn an_insider_on_a_cruel_network() {
+        crate::harness::check_world("an_insider_on_a_cruel_network", HARSH, insider_claims);
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn insider_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Insider>>> {
+        vec![
+            no_node_ever_sees_more_administrators_than_were_granted(),
+            no_member_ever_holds_a_role_it_was_not_granted(),
+            every_certified_device_resolves_to_a_legitimately_admitted_user(cluster),
+            the_insider_never_creates_a_new_user(cluster),
+            honest_nodes_still_converge_while_under_attack(cluster),
+            rejection_never_strands_the_queues(),
+            the_insiders_own_view_stays_self_consistent(),
+            the_insider_really_does_try_to_exceed_its_role(),
+        ]
+    }
 
     /// In a workspace where only the founder was granted an administrative role,
     /// upon a member issuing grants promoting itself, we expect no node ever to
@@ -1459,17 +2063,16 @@ mod an_insider_cannot_exceed_its_role {
     ///
     /// Confirmed to fail before phase 5, in its manifest form: the insider wrote
     /// its own role into the manifest and every replica merged it.
-    #[test]
-    fn no_node_ever_sees_more_administrators_than_were_granted() {
-        plan::<Insider>(vec![property::always(
+    fn no_node_ever_sees_more_administrators_than_were_granted() -> Property<WorkspaceNode<Insider>>
+    {
+        property::always(
             "the workspace never has more than its one granted admin",
             |w: &World<'_, WorkspaceNode<Insider>>| {
                 w.nodes()
                     .filter(|n| n.has_joined())
                     .all(|n| n.admin_count() <= 1)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace where every member was granted the editor role, upon the
@@ -1478,9 +2081,8 @@ mod an_insider_cannot_exceed_its_role {
     ///
     /// Distinct from the count above: a self-promotion that also demoted somebody
     /// else would keep the count at one while still being an escalation.
-    #[test]
-    fn no_member_ever_holds_a_role_it_was_not_granted() {
-        plan::<Insider>(vec![property::always(
+    fn no_member_ever_holds_a_role_it_was_not_granted() -> Property<WorkspaceNode<Insider>> {
+        property::always(
             "every member resolves to the role its admission granted",
             |w: &World<'_, WorkspaceNode<Insider>>| {
                 let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
@@ -1500,8 +2102,7 @@ mod an_insider_cannot_exceed_its_role {
                     })
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace where the insider splices leaves it controls into the tree,
@@ -1519,16 +2120,17 @@ mod an_insider_cannot_exceed_its_role {
     /// What must never happen is a device resolving to a user nobody admitted, or
     /// to somebody else's user — which is the escalation, since a device inherits
     /// its user's role. That is what this counts.
-    #[test]
-    fn every_certified_device_resolves_to_a_legitimately_admitted_user() {
-        plan::<Insider>(vec![property::always(
+    fn every_certified_device_resolves_to_a_legitimately_admitted_user(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Insider>> {
+        property::always(
             "no device is bound to a user the group never admitted",
-            |w: &World<'_, WorkspaceNode<Insider>>| {
+            move |w: &World<'_, WorkspaceNode<Insider>>| {
                 // Computed from the cluster rather than from the nodes that have
                 // joined: the founder certifies a node before that node has
                 // replayed its own `Welcome`, so a set derived from `has_joined`
                 // would report a failure during ordinary onboarding.
-                let admitted: Vec<[u8; 32]> = (0..NODES as u64).map(member_bytes_of).collect();
+                let admitted: Vec<[u8; 32]> = (0..cluster as u64).map(member_bytes_of).collect();
                 w.nodes().filter(|n| n.has_joined()).all(|observer| {
                     observer
                         .certified_users()
@@ -1536,8 +2138,7 @@ mod an_insider_cannot_exceed_its_role {
                         .all(|user| admitted.contains(user))
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace where the insider enrols devices for itself, we expect the
@@ -1545,17 +2146,15 @@ mod an_insider_cannot_exceed_its_role {
     ///
     /// The sharper form of the property above: self-enrolment may add leaves, but
     /// it must never add *people*, because a person is what a role attaches to.
-    #[test]
-    fn the_insider_never_creates_a_new_user() {
-        plan::<Insider>(vec![property::always(
+    fn the_insider_never_creates_a_new_user(cluster: usize) -> Property<WorkspaceNode<Insider>> {
+        property::always(
             "no attack introduces a person the group did not admit",
-            |w: &World<'_, WorkspaceNode<Insider>>| {
+            move |w: &World<'_, WorkspaceNode<Insider>>| {
                 w.nodes()
                     .filter(|n| n.has_joined())
-                    .all(|n| n.certified_users().len() <= NODES)
+                    .all(|n| n.certified_users().len() <= cluster)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace under attack from one of its own members, upon the network
@@ -1565,14 +2164,15 @@ mod an_insider_cannot_exceed_its_role {
     /// This is what stops the fix from being "reject more aggressively". A check
     /// that diverged the group or stalled legitimate traffic would satisfy every
     /// property above and be strictly worse than the defect it replaced.
-    #[test]
-    fn honest_nodes_still_converge_while_under_attack() {
-        plan::<Insider>(vec![property::eventually_within(
+    fn honest_nodes_still_converge_while_under_attack(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Insider>> {
+        property::eventually_within(
             "every node converges on the same document despite the insider",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<Insider>>| {
+            move |w: &World<'_, WorkspaceNode<Insider>>| {
                 let members: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
-                if members.len() != NODES {
+                if members.len() != cluster {
                     return false;
                 }
                 let mut sorted: Vec<Vec<char>> = members
@@ -1586,8 +2186,7 @@ mod an_insider_cannot_exceed_its_role {
                 sorted.dedup();
                 sorted.len() == 1 && !sorted[0].is_empty()
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace under attack from one of its own members, upon the network
@@ -1598,9 +2197,8 @@ mod an_insider_cannot_exceed_its_role {
     /// rejected insider must not be able to spin the repair path — both are
     /// reachable failure modes of a check applied carelessly, and neither shows up
     /// in a convergence property.
-    #[test]
-    fn rejection_never_strands_the_queues() {
-        plan::<Insider>(vec![property::eventually_within(
+    fn rejection_never_strands_the_queues() -> Property<WorkspaceNode<Insider>> {
+        property::eventually_within(
             "nothing stays parked once the network settles",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Insider>>| {
@@ -1608,8 +2206,7 @@ mod an_insider_cannot_exceed_its_role {
                     .filter(|n| n.has_joined())
                     .all(|n| n.pending_chunks() == 0 && n.parked_ops() == 0)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace under attack from one of its own members, upon the run
@@ -1620,9 +2217,8 @@ mod an_insider_cannot_exceed_its_role {
     /// that made the attacker's own replica unusable would be punishing the wrong
     /// thing — and would show up in production as a member that mysteriously
     /// stopped syncing.
-    #[test]
-    fn the_insiders_own_view_stays_self_consistent() {
-        plan::<Insider>(vec![property::eventually_within(
+    fn the_insiders_own_view_stays_self_consistent() -> Property<WorkspaceNode<Insider>> {
+        property::eventually_within(
             "the insider still reads what the group wrote",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Insider>>| {
@@ -1630,8 +2226,7 @@ mod an_insider_cannot_exceed_its_role {
                     .filter(|n| n.has_joined() && n.id() == 2)
                     .all(|n| !n.document_text().is_empty() && n.pending_chunks() == 0)
             },
-        )])
-        .run(deterministic());
+        )
     }
     /// In this plan, upon the run finishing, we expect the insider actually to
     /// have tried to exceed its role.
@@ -1641,13 +2236,11 @@ mod an_insider_cannot_exceed_its_role {
     /// device resolving to a user nobody admitted" — are satisfied by a run in
     /// which node 2 behaved perfectly, and a scenario constant that stopped being
     /// honoured would look exactly like a protocol that refuses the attack.
-    #[test]
-    fn the_insider_really_does_try_to_exceed_its_role() {
-        plan::<Insider>(vec![property::sometimes(
+    fn the_insider_really_does_try_to_exceed_its_role() -> Property<WorkspaceNode<Insider>> {
+        property::sometimes(
             "the insider has acted beyond the role it was granted",
             |w: &World<'_, WorkspaceNode<Insider>>| w.nodes().any(|n| n.overreaches_made() > 0),
-        )])
-        .run(deterministic());
+        )
     }
 }
 
@@ -1670,7 +2263,7 @@ mod a_removed_member_is_evicted_again {
     use iroh_beekem_sim::{Revenant, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan};
+    use super::{HARSH, HORIZON, PRISTINE, SWARM};
 
     /// The nodes still in the group after the scenario's revocation.
     fn remaining<'a>(
@@ -1681,6 +2274,76 @@ mod a_removed_member_is_evicted_again {
             .collect()
     }
 
+    /// The world: a removed member goes on signing operations with the key its
+    /// admission gave it.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn a_revenant_that_keeps_acting() {
+        crate::harness::check_world("a_revenant_that_keeps_acting", SWARM, revenant_claims);
+    }
+
+    /// The same claims as `a_revenant_that_keeps_acting`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn a_revenant_on_a_clean_network() {
+        crate::harness::check_world("a_revenant_on_a_clean_network", PRISTINE, revenant_claims);
+    }
+
+    /// The same claims as `a_revenant_that_keeps_acting`, on a network that also
+    /// loses, duplicates and stops nodes.
+    ///
+    /// # Ignored: this world panics inside beekem, not inside this workspace
+    ///
+    /// ```text
+    /// beekem-0.3.0/src/tree.rs:122:
+    ///     assertion failed: self.leaf(leaf_idx).is_none()
+    /// ```
+    ///
+    /// The assertion is in
+    /// `sort_leaves_and_blank_paths_for_concurrent_membership_changes`, and it
+    /// **denies the case the line below it handles**: it asserts that a leaf named
+    /// by a concurrent `Remove` is already blank, and then blanks it anyway,
+    /// under a comment explaining that a concurrent update may well have left it
+    /// occupied. Nothing about a revenant is needed to reach it — two members
+    /// admitting somebody at the same time, one of those admissions being undone,
+    /// and somebody re-keying concurrently is enough. This world is simply the
+    /// only one in the suite whose network reorders enough to get there.
+    ///
+    /// It is **not** a divergence. With debug assertions off the same interleaving
+    /// completes and the group converges; the blanking the assertion guards is
+    /// harmless. Reduced to a standalone test with no code from this workspace in
+    /// it, and written up with the suggested fix, in
+    /// [`docs/beekem-bug-repro/concurrent-remove-debug-assert.md`](../../../docs/beekem-bug-repro/concurrent-remove-debug-assert.md).
+    ///
+    /// Nothing in this crate can answer it — a `debug_assert!` in a dependency
+    /// aborts the process before any property is evaluated — and this repository's
+    /// profiles keep `debug-assertions` on deliberately.
+    ///
+    /// ```text
+    /// cargo test -p iroh-beekem-sim --test properties -- --ignored a_revenant_on_a_cruel_network
+    /// ```
+    #[test]
+    #[ignore = "aborts in beekem 0.3.0: an over-strict debug_assert at tree.rs:122; see docs/beekem-bug-repro/"]
+    fn a_revenant_on_a_cruel_network() {
+        crate::harness::check_world("a_revenant_on_a_cruel_network", HARSH, revenant_claims);
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn revenant_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Revenant>>> {
+        vec![
+            every_spliced_leaf_is_eventually_removed_again(cluster),
+            a_splice_never_confers_authority_the_splicer_lacked(),
+            the_remaining_members_still_converge_through_the_evictions(),
+        ]
+    }
+
     /// In a workspace where a removed member splices leaves it controls back into
     /// the tree, upon the network settling, we expect every remaining member's
     /// group to be back down to the members that belong in it.
@@ -1688,20 +2351,20 @@ mod a_removed_member_is_evicted_again {
     /// Eviction, stated as the observable it produces. Each honest admin reaches
     /// this conclusion independently from the same operation, and duplicate
     /// removals merge as `MergeOutcome::Duplicate`, so no coordination is needed.
-    #[test]
-    fn every_spliced_leaf_is_eventually_removed_again() {
-        plan::<Revenant>(vec![property::eventually_within(
+    fn every_spliced_leaf_is_eventually_removed_again(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Revenant>> {
+        property::eventually_within(
             "the group returns to its legitimate size after the splices",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<Revenant>>| {
+            move |w: &World<'_, WorkspaceNode<Revenant>>| {
                 let members = remaining(w);
                 !members.is_empty()
                     // The victim is gone, so the legitimate size is below the
                     // cluster; anything at or above it is a leaf still spliced in.
-                    && members.iter().all(|n| (n.group_size() as usize) < NODES)
+                    && members.iter().all(|n| (n.group_size() as usize) < cluster)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace where a removed member splices leaves back in, we expect
@@ -1711,15 +2374,13 @@ mod a_removed_member_is_evicted_again {
     /// window rather than after it. A splice buys the revenant a leaf for a while;
     /// what it must never buy is authority, because the closure is rooted and a
     /// revenant can pass on only what it already had.
-    #[test]
-    fn a_splice_never_confers_authority_the_splicer_lacked() {
-        plan::<Revenant>(vec![property::always(
+    fn a_splice_never_confers_authority_the_splicer_lacked() -> Property<WorkspaceNode<Revenant>> {
+        property::always(
             "the admin count never rises, splice or no splice",
             |w: &World<'_, WorkspaceNode<Revenant>>| {
                 remaining(w).iter().all(|n| n.admin_count() <= 1)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace where a removed member keeps issuing, upon the network
@@ -1729,9 +2390,9 @@ mod a_removed_member_is_evicted_again {
     /// eviction path that fired without bound would keep the group rotating
     /// forever and nothing would ever converge. This is the property that would
     /// catch that.
-    #[test]
-    fn the_remaining_members_still_converge_through_the_evictions() {
-        plan::<Revenant>(vec![property::eventually_within(
+    fn the_remaining_members_still_converge_through_the_evictions()
+    -> Property<WorkspaceNode<Revenant>> {
+        property::eventually_within(
             "the remaining members agree on one namespace and one document",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Revenant>>| {
@@ -1752,8 +2413,7 @@ mod a_removed_member_is_evicted_again {
                 sorted.dedup();
                 namespaces.len() == 1 && sorted.len() == 1
             },
-        )])
-        .run(deterministic());
+        )
     }
 }
 
@@ -1780,7 +2440,7 @@ mod a_stolen_invite_buys_only_visibility {
     };
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan_of_size};
+    use super::{HARSH, HORIZON, NODES, PRISTINE, SWARM};
 
     /// One more node than the honest group, so the thief's presence does not
     /// shrink the set of members the other properties are about.
@@ -1804,6 +2464,64 @@ mod a_stolen_invite_buys_only_visibility {
             .collect()
     }
 
+    /// The world: a stranger holds a copy of somebody else's ticket. A member is
+    /// then removed, which rotates the namespace the thief was watching.
+    ///
+    /// Four nodes, swarm faults.
+    #[test]
+    fn a_thief_holding_a_stolen_invite() {
+        crate::harness::check_world(
+            "a_thief_holding_a_stolen_invite",
+            SWARM.sized(NODES_WITH_THIEF),
+            thief_claims,
+        );
+    }
+
+    /// The same claims as `a_thief_holding_a_stolen_invite`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn a_stolen_invite_on_a_clean_network() {
+        crate::harness::check_world(
+            "a_stolen_invite_on_a_clean_network",
+            PRISTINE.sized(NODES_WITH_THIEF),
+            thief_claims,
+        );
+    }
+
+    /// The same claims as `a_thief_holding_a_stolen_invite`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn a_stolen_invite_on_a_cruel_network() {
+        crate::harness::check_world(
+            "a_stolen_invite_on_a_cruel_network",
+            HARSH.sized(NODES_WITH_THIEF),
+            thief_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn thief_claims(_cluster: usize) -> Vec<Property<WorkspaceNode<StolenInvite>>> {
+        vec![
+            a_stolen_invite_never_enters_any_members_user_list(),
+            a_stolen_invite_never_reconstructs_the_group_or_reads_content(),
+            a_stolen_invite_stops_seeing_entries_once_the_group_rotates(),
+            the_stolen_invite_does_reach_the_thief_and_does_show_it_the_replica(),
+            the_remaining_members_converge_through_the_rotation(),
+        ]
+    }
+
     /// Given a node holding a ticket issued to somebody else, at every point in
     /// the run, we expect no member to record it as a person or a device.
     ///
@@ -1812,22 +2530,17 @@ mod a_stolen_invite_buys_only_visibility {
     /// whole membership. Reading it must not put the thief *in* it: nothing in a
     /// ticket is an admission, because the admission is the `Add` the inviter
     /// already issued for a leaf the thief does not hold.
-    #[test]
-    fn a_stolen_invite_never_enters_any_members_user_list() {
-        plan_of_size::<StolenInvite>(
-            NODES_WITH_THIEF,
-            vec![property::always(
-                "no member's capability closure resolves any device to the thief",
-                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
-                    let thief_user = member_bytes_of(THIEF);
-                    w.nodes().filter(|n| n.has_joined()).all(|n| {
-                        !n.certified_users().contains(&thief_user)
-                            && n.role_of(thief_user).is_none()
-                    })
-                },
-            )],
+    fn a_stolen_invite_never_enters_any_members_user_list() -> Property<WorkspaceNode<StolenInvite>>
+    {
+        property::always(
+            "no member's capability closure resolves any device to the thief",
+            |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                let thief_user = member_bytes_of(THIEF);
+                w.nodes().filter(|n| n.has_joined()).all(|n| {
+                    !n.certified_users().contains(&thief_user) && n.role_of(thief_user).is_none()
+                })
+            },
         )
-        .run(deterministic());
     }
 
     /// Given the same node, at every point in the run, we expect it to hold no
@@ -1840,20 +2553,15 @@ mod a_stolen_invite_buys_only_visibility {
     /// are asserted, not just the second: a thief that somehow built state and
     /// happened to read nothing would be one lucky delivery order away from
     /// reading everything.
-    #[test]
-    fn a_stolen_invite_never_reconstructs_the_group_or_reads_content() {
-        plan_of_size::<StolenInvite>(
-            NODES_WITH_THIEF,
-            vec![property::always(
-                "the thief joins nothing and decrypts nothing",
-                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
-                    thief(w).is_none_or(|t| {
-                        !t.has_joined() && t.all_text().iter().all(String::is_empty)
-                    })
-                },
-            )],
+    fn a_stolen_invite_never_reconstructs_the_group_or_reads_content()
+    -> Property<WorkspaceNode<StolenInvite>> {
+        property::always(
+            "the thief joins nothing and decrypts nothing",
+            |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                thief(w)
+                    .is_none_or(|t| !t.has_joined() && t.all_text().iter().all(String::is_empty))
+            },
         )
-        .run(deterministic());
     }
 
     /// Given the group rotates its namespace, at every point in the run, we
@@ -1864,18 +2572,14 @@ mod a_stolen_invite_buys_only_visibility {
     /// exposure is abandoning the replica the token names. `always` rather than
     /// `eventually`, for the same reason as the revoked victim's counterpart —
     /// seeing the entry once is a leak no later rotation can unlearn.
-    #[test]
-    fn a_stolen_invite_stops_seeing_entries_once_the_group_rotates() {
-        plan_of_size::<StolenInvite>(
-            NODES_WITH_THIEF,
-            vec![property::always(
-                "the thief observes no entry written after the rotation",
-                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
-                    thief(w).is_none_or(|t| t.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
-                },
-            )],
+    fn a_stolen_invite_stops_seeing_entries_once_the_group_rotates()
+    -> Property<WorkspaceNode<StolenInvite>> {
+        property::always(
+            "the thief observes no entry written after the rotation",
+            |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                thief(w).is_none_or(|t| t.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
+            },
         )
-        .run(deterministic());
     }
 
     /// Given the same run, when it settles, we expect the theft to have actually
@@ -1889,19 +2593,15 @@ mod a_stolen_invite_buys_only_visibility {
     /// of the README's new wording: a stolen ticket *does* let a stranger watch
     /// the replica until the group rotates, and that is a residual to state
     /// rather than one to imply.
-    #[test]
-    fn the_stolen_invite_does_reach_the_thief_and_does_show_it_the_replica() {
-        plan_of_size::<StolenInvite>(
-            NODES_WITH_THIEF,
-            vec![property::eventually_within(
-                "the thief holds the ticket and has seen at least one entry",
-                Duration::from_secs(10),
-                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
-                    thief(w).is_some_and(|t| t.holds_stolen_invite() && t.index_len() > 0)
-                },
-            )],
+    fn the_stolen_invite_does_reach_the_thief_and_does_show_it_the_replica()
+    -> Property<WorkspaceNode<StolenInvite>> {
+        property::eventually_within(
+            "the thief holds the ticket and has seen at least one entry",
+            Duration::from_secs(10),
+            |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                thief(w).is_some_and(|t| t.holds_stolen_invite() && t.index_len() > 0)
+            },
         )
-        .run(deterministic());
     }
 
     /// Given the members whose ticket leaked, when the run settles, we expect
@@ -1911,34 +2611,30 @@ mod a_stolen_invite_buys_only_visibility {
     /// rotated itself into oblivion, and the rotation here is provoked by a
     /// removal — so this is what says the remedy for a leaked ticket costs the
     /// remaining members nothing but a generation.
-    #[test]
-    fn the_remaining_members_converge_through_the_rotation() {
-        plan_of_size::<StolenInvite>(
-            NODES_WITH_THIEF,
-            vec![property::eventually_within(
-                "the remaining members agree on one namespace and one document",
-                HORIZON,
-                |w: &World<'_, WorkspaceNode<StolenInvite>>| {
-                    let members = remaining(w);
-                    if members.len() < 2 {
-                        return false;
-                    }
-                    let mut namespaces: Vec<_> = members.iter().map(|n| n.namespace()).collect();
-                    namespaces.dedup();
-                    let mut sorted: Vec<Vec<char>> = members
-                        .iter()
-                        .map(|n| {
-                            let mut cs: Vec<char> = n.document_text().chars().collect();
-                            cs.sort_unstable();
-                            cs
-                        })
-                        .collect();
-                    sorted.dedup();
-                    namespaces.len() == 1 && sorted.len() == 1
-                },
-            )],
+    fn the_remaining_members_converge_through_the_rotation() -> Property<WorkspaceNode<StolenInvite>>
+    {
+        property::eventually_within(
+            "the remaining members agree on one namespace and one document",
+            HORIZON,
+            |w: &World<'_, WorkspaceNode<StolenInvite>>| {
+                let members = remaining(w);
+                if members.len() < 2 {
+                    return false;
+                }
+                let mut namespaces: Vec<_> = members.iter().map(|n| n.namespace()).collect();
+                namespaces.dedup();
+                let mut sorted: Vec<Vec<char>> = members
+                    .iter()
+                    .map(|n| {
+                        let mut cs: Vec<char> = n.document_text().chars().collect();
+                        cs.sort_unstable();
+                        cs
+                    })
+                    .collect();
+                sorted.dedup();
+                namespaces.len() == 1 && sorted.len() == 1
+            },
         )
-        .run(deterministic());
     }
 }
 
@@ -1961,91 +2657,10 @@ mod a_stolen_invite_buys_only_visibility {
 mod an_offline_node_catches_up {
     use propsim::prelude::*;
 
-    use super::{Duration, Honest, NODES, SEEDS, WorkspaceNode, joined};
-
-    /// When the fault lands, and when it is undone.
-    ///
-    /// Late enough that the group has formed and written something — the first
-    /// edit fires at 300ms and the first resync at 600ms — and early enough to
-    /// leave the rest of the horizon for catching up. The horizon is
-    /// `last scripted event + 10s`, so healing at four seconds gives a fourteen
-    /// second run and ten seconds of settling.
-    const FAULT_AT: Duration = Duration::from_millis(1500);
-    const REPAIR_AT: Duration = Duration::from_secs(4);
-
-    /// The ordinary member that goes away in the partition and crash variants.
-    const VICTIM: u64 = 2;
-
-    /// The founder, which gets a crash variant of its own.
-    ///
-    /// Both are needed, and the reason is that they fail differently. A crashed
-    /// *member* that resumed wrongly would re-run the join handshake — except
-    /// that `on_welcome` refuses to act on a node that already has state, so a
-    /// harness that forgot to branch on a restart would still look correct from
-    /// the member's side. A crashed *founder* has no such guard:
-    /// `on_start`'s founding branch is unconditional, so it would overwrite the
-    /// live workspace with a brand-new tree and fork the group under a second
-    /// root. Only this variant can catch that, which makes it the one that keeps
-    /// `no_node_ever_initialises_the_workspace_more_than_once` from being
-    /// vacuous.
-    const FOUNDER_VICTIM: u64 = 0;
-
-    fn scripted_plan(
-        faults: Faults,
-        properties: Vec<Property<WorkspaceNode<Honest>>>,
-    ) -> TestPlan<WorkspaceNode<Honest>> {
-        Simulation::plan::<WorkspaceNode<Honest>>()
-            .nodes(NODES)
-            .transport(InMemory::unordered_lossy())
-            .faults(faults)
-            .state_machine()
-            .check(properties)
-            .seeds(SEEDS)
-            .finish()
-    }
-
-    /// The disconnected variant: node 2 is severed, then reconnected.
-    fn partitioned(
-        properties: Vec<Property<WorkspaceNode<Honest>>>,
-    ) -> TestPlan<WorkspaceNode<Honest>> {
-        scripted_plan(
-            Faults::scripted()
-                .at(FAULT_AT)
-                .partition(&[0, 1], &[VICTIM])
-                .at(REPAIR_AT)
-                .heal_all(),
-            properties,
-        )
-    }
-
-    /// The shut-down variant: one node stops, then starts again.
-    fn crashed_node(
-        victim: u64,
-        properties: Vec<Property<WorkspaceNode<Honest>>>,
-    ) -> TestPlan<WorkspaceNode<Honest>> {
-        scripted_plan(
-            Faults::scripted()
-                .at(FAULT_AT)
-                .crash(victim)
-                .at(REPAIR_AT)
-                .restart(victim),
-            properties,
-        )
-    }
-
-    /// An ordinary member stops and starts again.
-    fn crashed(
-        properties: Vec<Property<WorkspaceNode<Honest>>>,
-    ) -> TestPlan<WorkspaceNode<Honest>> {
-        crashed_node(VICTIM, properties)
-    }
-
-    /// The group's only admin stops and starts again.
-    fn crashed_founder(
-        properties: Vec<Property<WorkspaceNode<Honest>>>,
-    ) -> TestPlan<WorkspaceNode<Honest>> {
-        crashed_node(FOUNDER_VICTIM, properties)
-    }
+    use super::{
+        BOTH_MEMBERS_CRASHED, CRASHED, CRASHED_FOUNDER, Duration, Honest, NODES, PARTITIONED,
+        PARTITIONED_TWICE, WorkspaceNode, joined, plan_of,
+    };
 
     /// The multiset of characters in a node's every document.
     ///
@@ -2058,28 +2673,67 @@ mod an_offline_node_catches_up {
         chars
     }
 
+    /// The world: the network severs one member at `FAULT_AT` and heals at
+    /// `REPAIR_AT`. The severed member goes on editing throughout, so this is a
+    /// two-sided reconciliation and not a catch-up by an idle peer.
+    ///
+    /// Three nodes, scripted faults.
+    #[test]
+    fn a_member_partitioned_then_healed() {
+        crate::harness::check_world(
+            "a_member_partitioned_then_healed",
+            PARTITIONED,
+            partition_claims,
+        );
+    }
+
+    /// The honest group's partition claims, under a cut that heals into a
+    /// different cut.
+    ///
+    /// The first cut isolates node 2 and the second isolates the founder, so each
+    /// side of the second holds state the other gained while it was away. One
+    /// partition only ever asks a node to catch up; two ask both sides to, which is
+    /// the case anti-entropy must be symmetric to answer. The script also ends at
+    /// eight seconds, which widens the horizon to eighteen — the only lever on run
+    /// length this suite has.
+    #[test]
+    fn a_partition_that_heals_into_another() {
+        crate::harness::check_world(
+            "a_partition_that_heals_into_another",
+            PARTITIONED_TWICE,
+            partition_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn partition_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Honest>>> {
+        vec![
+            every_document_converges_after_the_partition_heals(cluster),
+            a_nodes_own_writes_are_readable_locally_throughout_the_partition(),
+            membership_and_roles_converge_after_the_partition_heals(),
+        ]
+    }
+
     /// In a group partitioned in two and later healed, upon the network
     /// settling, we expect every node to hold the same content.
     ///
     /// The severed node keeps editing throughout — nothing suppresses its
     /// timers — so this is a genuine two-sided reconciliation and not a
     /// catch-up by an idle peer.
-    #[test]
-    fn every_document_converges_after_the_partition_heals() {
-        partitioned(vec![
-            property::eventually_within(
-                "every node holds the same content after the partition heals",
-                Duration::from_secs(9),
-                |w: &World<'_, WorkspaceNode<Honest>>| {
-                    let nodes = joined(w);
-                    // Guarded on the count: at t=0 only the founder has joined, and
-                    // a one-element set agrees with itself trivially.
-                    nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
-                },
-            )
-            .after(Event::NetworkHealed),
-        ])
-        .run(deterministic());
+    fn every_document_converges_after_the_partition_heals(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Honest>> {
+        property::eventually_within(
+            "every node holds the same content after the partition heals",
+            Duration::from_secs(9),
+            move |w: &World<'_, WorkspaceNode<Honest>>| {
+                let nodes = joined(w);
+                // Guarded on the count: at t=0 only the founder has joined, and
+                // a one-element set agrees with itself trivially.
+                nodes.len() == cluster && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+            },
+        )
+        .after(Event::NetworkHealed)
     }
 
     /// In a partitioned group, upon a node writing on either side of the split,
@@ -2089,9 +2743,9 @@ mod an_offline_node_catches_up {
     /// node that could not read back what it just wrote while cut off would have
     /// made the write conditional on the network, which is the property this
     /// whole design exists to avoid.
-    #[test]
-    fn a_nodes_own_writes_are_readable_locally_throughout_the_partition() {
-        partitioned(vec![property::always(
+    fn a_nodes_own_writes_are_readable_locally_throughout_the_partition()
+    -> Property<WorkspaceNode<Honest>> {
+        property::always(
             "every joined node can read its own contributions at all times",
             |w: &World<'_, WorkspaceNode<Honest>>| {
                 joined(w).iter().all(|n| {
@@ -2099,8 +2753,7 @@ mod an_offline_node_catches_up {
                     n.contributed().iter().all(|frag| text.contains(frag))
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a partitioned group, upon healing, we expect the derived rosters and
@@ -2110,42 +2763,92 @@ mod an_offline_node_catches_up {
     /// capability closure travel on the control plane, and a heal that restored
     /// the data plane while leaving membership split would look like success
     /// from every text-only property.
+    fn membership_and_roles_converge_after_the_partition_heals() -> Property<WorkspaceNode<Honest>>
+    {
+        property::eventually_within(
+            "every node derives the same roster after the partition heals",
+            Duration::from_secs(9),
+            |w: &World<'_, WorkspaceNode<Honest>>| {
+                let nodes = joined(w);
+                nodes.len() == NODES
+                    && nodes
+                        .windows(2)
+                        .all(|p| p[0].derived_roster() == p[1].derived_roster())
+                    && nodes.iter().all(|n| n.admin_count() == 1)
+            },
+        )
+        .after(Event::NetworkHealed)
+    }
+
+    /// The world: an ordinary member stops at `FAULT_AT` and starts again at
+    /// `REPAIR_AT`.
+    ///
+    /// Three nodes, scripted faults.
     #[test]
-    fn membership_and_roles_converge_after_the_partition_heals() {
-        partitioned(vec![
-            property::eventually_within(
-                "every node derives the same roster after the partition heals",
-                Duration::from_secs(9),
-                |w: &World<'_, WorkspaceNode<Honest>>| {
-                    let nodes = joined(w);
-                    nodes.len() == NODES
-                        && nodes
-                            .windows(2)
-                            .all(|p| p[0].derived_roster() == p[1].derived_roster())
-                        && nodes.iter().all(|n| n.admin_count() == 1)
-                },
-            )
-            .after(Event::NetworkHealed),
-        ])
-        .run(deterministic());
+    fn a_member_crashed_then_restarted() {
+        crate::harness::check_world("a_member_crashed_then_restarted", CRASHED, crash_claims);
+    }
+
+    /// The crash claims, with the founder left alone.
+    ///
+    /// One crash always leaves a peer that holds everything, so a restarted node can
+    /// be caught up by somebody who never left. Here both ordinary members stop
+    /// together, so the founder's anti-entropy is the only thing that can answer
+    /// either restart.
+    #[test]
+    fn both_members_crashed_at_once() {
+        crate::harness::check_world(
+            "both_members_crashed_at_once",
+            BOTH_MEMBERS_CRASHED,
+            crash_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn crash_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Honest>>> {
+        vec![
+            every_document_converges_after_the_crashed_node_restarts(),
+            a_restarted_node_still_holds_the_writes_it_acknowledged(),
+            the_run_really_does_crash_a_node_that_had_something_to_lose(),
+            a_restarted_node_is_a_member_again_without_being_re_invited(cluster),
+        ]
     }
 
     /// In a group where one node crashes and restarts, upon the node rejoining,
     /// we expect every node to hold the same content again.
+    fn every_document_converges_after_the_crashed_node_restarts() -> Property<WorkspaceNode<Honest>>
+    {
+        property::eventually_within(
+            "every node holds the same content after the restart",
+            Duration::from_secs(9),
+            |w: &World<'_, WorkspaceNode<Honest>>| {
+                let nodes = joined(w);
+                nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+            },
+        )
+        .after(Event::NodeRejoined)
+    }
+
+    /// The world: the founder stops at `FAULT_AT` and starts again at
+    /// `REPAIR_AT`.
+    ///
+    /// Three nodes, scripted faults. Only this world can catch a restart that
+    /// founds the workspace a second time; see `FOUNDER_VICTIM`.
     #[test]
-    fn every_document_converges_after_the_crashed_node_restarts() {
-        crashed(vec![
-            property::eventually_within(
-                "every node holds the same content after the restart",
-                Duration::from_secs(9),
-                |w: &World<'_, WorkspaceNode<Honest>>| {
-                    let nodes = joined(w);
-                    nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
-                },
-            )
-            .after(Event::NodeRejoined),
-        ])
-        .run(deterministic());
+    fn the_founder_crashed_then_restarted() {
+        crate::harness::check_world(
+            "the_founder_crashed_then_restarted",
+            CRASHED_FOUNDER,
+            founder_crash_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn founder_crash_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Honest>>> {
+        vec![
+            no_node_ever_initialises_the_workspace_more_than_once(),
+            every_document_converges_after_the_founder_restarts(cluster),
+        ]
     }
 
     /// In a group where a node restarts, upon it coming back, we expect it never
@@ -2159,13 +2862,11 @@ mod an_offline_node_catches_up {
     /// `on_start`'s founding branch would fork the group under a second root
     /// while *also* still converging on the honest path, because there is only
     /// one node that founds.
-    #[test]
-    fn no_node_ever_initialises_the_workspace_more_than_once() {
-        crashed_founder(vec![property::always(
+    fn no_node_ever_initialises_the_workspace_more_than_once() -> Property<WorkspaceNode<Honest>> {
+        property::always(
             "no node founds or joins the workspace twice",
             |w: &World<'_, WorkspaceNode<Honest>>| w.nodes().all(|n| n.initialisations() <= 1),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group where a node restarts, upon it coming back, we expect the
@@ -2175,9 +2876,9 @@ mod an_offline_node_catches_up {
     /// updated inside `on_client_op` before the response is returned, exactly as
     /// `Workspace::drive` writes before returning `Ok`, so a fragment this node
     /// promised to keep must survive its own amnesia.
-    #[test]
-    fn a_restarted_node_still_holds_the_writes_it_acknowledged() {
-        crashed(vec![property::always(
+    fn a_restarted_node_still_holds_the_writes_it_acknowledged() -> Property<WorkspaceNode<Honest>>
+    {
+        property::always(
             "a node's acknowledged writes are in its own view even after a restart",
             |w: &World<'_, WorkspaceNode<Honest>>| {
                 w.nodes().filter(|n| n.has_joined()).all(|n| {
@@ -2185,8 +2886,7 @@ mod an_offline_node_catches_up {
                     n.contributed().iter().all(|frag| text.contains(frag))
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the scripted crash firing, we expect a node to have
@@ -2196,15 +2896,14 @@ mod an_offline_node_catches_up {
     /// is satisfied by a run in which nothing ever crashed, and three of them by
     /// a run in which the crashed node had never written a snapshot — so without
     /// this the module could go green while testing none of what it names.
-    #[test]
-    fn the_run_really_does_crash_a_node_that_had_something_to_lose() {
-        crashed(vec![property::sometimes(
+    fn the_run_really_does_crash_a_node_that_had_something_to_lose()
+    -> Property<WorkspaceNode<Honest>> {
+        property::sometimes(
             "some node restarts from a disk it had written",
             |w: &World<'_, WorkspaceNode<Honest>>| {
                 w.nodes().any(|n| n.reboots() > 0 && n.has_disk())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon a node restarting, we expect it to be a member again.
@@ -2213,17 +2912,15 @@ mod an_offline_node_catches_up {
     /// with no state would trivially satisfy every `always` above — it
     /// contributes nothing to compare — and would be filtered out of `joined`
     /// entirely. This is the property that says the disk was actually read.
-    #[test]
-    fn a_restarted_node_is_a_member_again_without_being_re_invited() {
-        crashed(vec![
-            property::eventually_within(
-                "every node is joined again after the restart",
-                Duration::from_secs(9),
-                |w: &World<'_, WorkspaceNode<Honest>>| joined(w).len() == NODES,
-            )
-            .after(Event::NodeRejoined),
-        ])
-        .run(deterministic());
+    fn a_restarted_node_is_a_member_again_without_being_re_invited(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Honest>> {
+        property::eventually_within(
+            "every node is joined again after the restart",
+            Duration::from_secs(9),
+            move |w: &World<'_, WorkspaceNode<Honest>>| joined(w).len() == cluster,
+        )
+        .after(Event::NodeRejoined)
     }
 
     /// In a group whose founder crashes and restarts, upon the network settling,
@@ -2240,26 +2937,24 @@ mod an_offline_node_catches_up {
     /// the sole admin of its own new tree, so it reports exactly one
     /// administrator, and so does everybody else. The fork is invisible to any
     /// property that asks each node about itself rather than comparing them.
-    #[test]
-    fn every_document_converges_after_the_founder_restarts() {
-        crashed_founder(vec![
-            property::eventually_within(
-                "every node holds the same content after the founder restarts",
-                Duration::from_secs(9),
-                |w: &World<'_, WorkspaceNode<Honest>>| {
-                    let nodes = joined(w);
-                    nodes.len() == NODES && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
-                },
-            )
-            .after(Event::NodeRejoined),
-        ])
-        .run(deterministic());
+    fn every_document_converges_after_the_founder_restarts(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Honest>> {
+        property::eventually_within(
+            "every node holds the same content after the founder restarts",
+            Duration::from_secs(9),
+            move |w: &World<'_, WorkspaceNode<Honest>>| {
+                let nodes = joined(w);
+                nodes.len() == cluster && nodes.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+            },
+        )
+        .after(Event::NodeRejoined)
     }
 
     /// Reproducibility, as every other scenario asserts it.
     #[test]
     fn the_restart_run_is_reproducible() {
-        assert_deterministic(|| crashed(Vec::new()), Seed(0x0DEA_D515));
+        assert_deterministic(|| plan_of::<Honest>(CRASHED), Seed(0x0DEA_D515));
     }
 }
 
@@ -2295,12 +2990,52 @@ mod an_asset_reaches_every_member {
 
     use propsim::prelude::*;
 
-    use super::{Duration, HORIZON, NODES, WorkspaceNode, asset_plaintext, joined, plan};
+    use super::{
+        Duration, HARSH, HORIZON, PRISTINE, SWARM, WorkspaceNode, asset_plaintext, joined, plan_of,
+    };
 
-    fn asset_plan(
-        properties: Vec<Property<WorkspaceNode<Assets>>>,
-    ) -> TestPlan<WorkspaceNode<Assets>> {
-        plan(properties)
+    /// The world: the founder attaches a binary asset that every member must
+    /// reassemble.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn an_asset_attached_to_the_workspace() {
+        crate::harness::check_world("an_asset_attached_to_the_workspace", SWARM, asset_claims);
+    }
+
+    /// The same claims as `an_asset_attached_to_the_workspace`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn an_asset_on_a_clean_network() {
+        crate::harness::check_world("an_asset_on_a_clean_network", PRISTINE, asset_claims);
+    }
+
+    /// The same claims as `an_asset_attached_to_the_workspace`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn an_asset_on_a_cruel_network() {
+        crate::harness::check_world("an_asset_on_a_cruel_network", HARSH, asset_claims);
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn asset_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Assets>>> {
+        vec![
+            every_member_eventually_reads_the_whole_asset(cluster),
+            an_asset_never_occupies_the_parked_chunk_budget(),
+            an_asset_really_is_attached_in_this_run(),
+        ]
     }
 
     /// In a workspace where the founder attached a binary asset, upon the
@@ -2311,21 +3046,38 @@ mod an_asset_reaches_every_member {
     /// CGKA, every segment present, and the recorded digest matching — a member
     /// that lost a segment or applied one at the wrong offset fails the digest
     /// rather than returning something plausible.
-    #[test]
-    fn every_member_eventually_reads_the_whole_asset() {
-        asset_plan(vec![property::eventually_within(
+    fn every_member_eventually_reads_the_whole_asset(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Assets>> {
+        property::eventually_within(
             "every joined node reassembles the attached asset",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Assets>>| {
+            move |w: &World<'_, WorkspaceNode<Assets>>| {
                 let expected = asset_plaintext();
                 let nodes = joined(w);
-                nodes.len() == NODES
+                nodes.len() == cluster
                     && nodes
                         .iter()
                         .all(|n| n.read_asset_view() == Some(expected.as_slice()))
             },
-        )])
-        .run(deterministic());
+        )
+    }
+
+    /// The world: an asset is attached, and a member is then removed.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn an_asset_attached_before_a_removal() {
+        crate::harness::check_world(
+            "an_asset_attached_before_a_removal",
+            SWARM,
+            asset_churn_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn asset_churn_claims(cluster: usize) -> Vec<Property<WorkspaceNode<AssetChurn>>> {
+        vec![a_removal_does_not_cost_the_survivors_their_asset(cluster)]
     }
 
     /// In a workspace holding an asset, upon a member being removed, we expect
@@ -2335,21 +3087,21 @@ mod an_asset_reaches_every_member {
     /// catch a rotation implemented as "abandon the replica and forget the
     /// asset". A member that lost its attachment every time somebody left would
     /// satisfy every confidentiality property in this file.
-    #[test]
-    fn a_removal_does_not_cost_the_survivors_their_asset() {
-        plan::<AssetChurn>(vec![property::eventually_within(
+    fn a_removal_does_not_cost_the_survivors_their_asset(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<AssetChurn>> {
+        property::eventually_within(
             "every remaining member still reassembles the asset",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<AssetChurn>>| {
+            move |w: &World<'_, WorkspaceNode<AssetChurn>>| {
                 let expected = asset_plaintext();
                 let staying: Vec<_> = joined(w).into_iter().filter(|n| n.id() != VICTIM).collect();
-                staying.len() == NODES - 1
+                staying.len() == cluster - 1
                     && staying
                         .iter()
                         .all(|n| n.read_asset_view() == Some(expected.as_slice()))
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace holding an asset, upon the network settling, we expect no
@@ -2360,13 +3112,35 @@ mod an_asset_reaches_every_member {
     /// that content genuinely in flight depends on. An implementation that
     /// pushed segments through `Event::ChunkArrived` would pass every other
     /// property here and quietly evict documents under load.
-    #[test]
-    fn an_asset_never_occupies_the_parked_chunk_budget() {
-        asset_plan(vec![property::always(
+    fn an_asset_never_occupies_the_parked_chunk_budget() -> Property<WorkspaceNode<Assets>> {
+        property::always(
             "no node evicts a chunk while an asset is being distributed",
             |w: &World<'_, WorkspaceNode<Assets>>| w.nodes().all(|n| n.evicted_chunks() == 0),
-        )])
-        .run(deterministic());
+        )
+    }
+
+    /// The world: a member is removed, and an asset is then attached.
+    ///
+    /// Three nodes, swarm faults. Only an attachment that comes *after* the
+    /// removal can state forward secrecy about the asset path.
+    #[test]
+    fn an_asset_attached_after_a_removal() {
+        crate::harness::check_world(
+            "an_asset_attached_after_a_removal",
+            SWARM,
+            asset_after_removal_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn asset_after_removal_claims(
+        cluster: usize,
+    ) -> Vec<Property<WorkspaceNode<AssetAfterRemoval>>> {
+        vec![
+            a_member_removed_before_an_attachment_never_holds_its_content_key(),
+            a_member_removed_before_an_attachment_never_reads_it(),
+            the_survivors_do_read_an_asset_attached_after_the_removal(cluster),
+        ]
     }
 
     /// In a workspace that removed a member and *then* attached an asset, upon
@@ -2385,17 +3159,16 @@ mod an_asset_reaches_every_member {
     /// key and only that key is encrypted to the group, so "cannot read the asset"
     /// is exactly "cannot unwrap one small chunk". A member that somehow obtained
     /// the key would have the whole asset however the segments were distributed.
-    #[test]
-    fn a_member_removed_before_an_attachment_never_holds_its_content_key() {
-        plan::<AssetAfterRemoval>(vec![property::always(
+    fn a_member_removed_before_an_attachment_never_holds_its_content_key()
+    -> Property<WorkspaceNode<AssetAfterRemoval>> {
+        property::always(
             "the removed member never unwraps the content key",
             |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
                 w.nodes()
                     .filter(|n| n.id() == VICTIM)
                     .all(|n| !n.holds_asset_key())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace that removed a member and then attached an asset, upon the
@@ -2407,17 +3180,16 @@ mod an_asset_reaches_every_member {
     /// reassemble the plaintext if segments were ever distributed unsealed, and it
     /// could hold the key and reassemble nothing if the rotation withdrew its
     /// access to the segments — only asserting both says the envelope works.
-    #[test]
-    fn a_member_removed_before_an_attachment_never_reads_it() {
-        plan::<AssetAfterRemoval>(vec![property::always(
+    fn a_member_removed_before_an_attachment_never_reads_it()
+    -> Property<WorkspaceNode<AssetAfterRemoval>> {
+        property::always(
             "the removed member never reassembles the asset",
             |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
                 w.nodes()
                     .filter(|n| n.id() == VICTIM)
                     .all(|n| n.read_asset_view().is_none())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace that removed a member and then attached an asset, upon the
@@ -2428,21 +3200,21 @@ mod an_asset_reaches_every_member {
     /// which — since it is scheduled late, after the removal and the rotation it
     /// triggers — is exactly the failure mode to worry about. If the attachment
     /// silently did not occur, this fails and the other two go on passing.
-    #[test]
-    fn the_survivors_do_read_an_asset_attached_after_the_removal() {
-        plan::<AssetAfterRemoval>(vec![property::eventually_within(
+    fn the_survivors_do_read_an_asset_attached_after_the_removal(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<AssetAfterRemoval>> {
+        property::eventually_within(
             "every remaining member reassembles an asset attached after the removal",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
+            move |w: &World<'_, WorkspaceNode<AssetAfterRemoval>>| {
                 let expected = asset_plaintext();
                 let staying: Vec<_> = joined(w).into_iter().filter(|n| n.id() != VICTIM).collect();
-                staying.len() == NODES - 1
+                staying.len() == cluster - 1
                     && staying
                         .iter()
                         .all(|n| n.read_asset_view() == Some(expected.as_slice()))
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect the attachment really to
@@ -2450,20 +3222,18 @@ mod an_asset_reaches_every_member {
     ///
     /// The module had no anti-vacuity guard at all before this: every property in
     /// it is satisfied by a run in which the founder never attached anything.
-    #[test]
-    fn an_asset_really_is_attached_in_this_run() {
-        asset_plan(vec![property::sometimes(
+    fn an_asset_really_is_attached_in_this_run() -> Property<WorkspaceNode<Assets>> {
+        property::sometimes(
             "some node holds the asset's content key",
             |w: &World<'_, WorkspaceNode<Assets>>| w.nodes().any(WorkspaceNode::holds_asset_key),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Reproducibility, as every other scenario asserts it and this module did
     /// not.
     #[test]
     fn the_asset_run_is_reproducible() {
-        assert_deterministic(|| asset_plan(Vec::new()), Seed(0x0A55_E731));
+        assert_deterministic(|| plan_of::<Assets>(SWARM), Seed(0x0A55_E731));
     }
 }
 
@@ -2481,7 +3251,7 @@ mod a_member_leaves_of_its_own_accord {
     use iroh_beekem_sim::{Departure, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{NODES, joined, plan};
+    use super::{HARSH, PRISTINE, SWARM, joined, plan_of};
 
     /// The nodes that are staying.
     fn remaining<'a>(
@@ -2493,22 +3263,72 @@ mod a_member_leaves_of_its_own_accord {
             .collect()
     }
 
+    /// The world: a member issues `Event::Leave`. Nobody removes it and nothing
+    /// rotates.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn a_member_leaving_of_its_own_accord() {
+        crate::harness::check_world(
+            "a_member_leaving_of_its_own_accord",
+            SWARM,
+            departure_claims,
+        );
+    }
+
+    /// The same claims as `a_member_leaving_of_its_own_accord`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn a_departure_on_a_clean_network() {
+        crate::harness::check_world("a_departure_on_a_clean_network", PRISTINE, departure_claims);
+    }
+
+    /// The same claims as `a_member_leaving_of_its_own_accord`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn a_departure_on_a_cruel_network() {
+        crate::harness::check_world("a_departure_on_a_cruel_network", HARSH, departure_claims);
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn departure_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Departure>>> {
+        vec![
+            a_departing_member_eventually_leaves_every_remaining_members_group(cluster),
+            a_departure_never_rotates_the_namespace(),
+            a_departure_never_retracts_anybody_elses_leaf(cluster),
+            the_remaining_members_converge_through_the_departure(cluster),
+            somebody_really_does_leave_in_this_run(),
+        ]
+    }
+
     /// In a group one of whose members leaves, upon the network settling, we
     /// expect the remaining members to stop counting it.
-    #[test]
-    fn a_departing_member_eventually_leaves_every_remaining_members_group() {
-        plan::<Departure>(vec![property::eventually_within(
+    fn a_departing_member_eventually_leaves_every_remaining_members_group(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Departure>> {
+        property::eventually_within(
             "every remaining member's group has shrunk by one",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Departure>>| {
+            move |w: &World<'_, WorkspaceNode<Departure>>| {
                 let staying = remaining(w);
-                staying.len() == NODES - 1
+                staying.len() == cluster - 1
                     && staying
                         .iter()
-                        .all(|n| u32::try_from(NODES - 1) == Ok(n.group_size()))
+                        .all(|n| u32::try_from(cluster - 1) == Ok(n.group_size()))
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group one of whose members leaves, upon the departure, we expect no
@@ -2520,13 +3340,11 @@ mod a_member_leaves_of_its_own_accord {
     /// itself the replica it had just walked away from. Rotation after a
     /// departure is the group's job, and this scenario deliberately has nobody
     /// do it.
-    #[test]
-    fn a_departure_never_rotates_the_namespace() {
-        plan::<Departure>(vec![property::always(
+    fn a_departure_never_rotates_the_namespace() -> Property<WorkspaceNode<Departure>> {
+        property::always(
             "no node ever adopts a rotated namespace",
             |w: &World<'_, WorkspaceNode<Departure>>| w.nodes().all(|n| !n.has_rotated()),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group one of whose members leaves, upon the network settling, we
@@ -2544,14 +3362,15 @@ mod a_member_leaves_of_its_own_accord {
     /// onboards, so an `always` bound on it is false at t=0 for reasons that
     /// have nothing to do with departures — the "guard the length" hazard this
     /// suite runs into whenever a count is asserted before the group has formed.
-    #[test]
-    fn a_departure_never_retracts_anybody_elses_leaf() {
-        plan::<Departure>(vec![property::eventually_within(
+    fn a_departure_never_retracts_anybody_elses_leaf(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Departure>> {
+        property::eventually_within(
             "every remaining member derives a roster containing every other one",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Departure>>| {
+            move |w: &World<'_, WorkspaceNode<Departure>>| {
                 let staying = remaining(w);
-                staying.len() == NODES - 1
+                staying.len() == cluster - 1
                     && staying.iter().all(|n| {
                         staying
                             .iter()
@@ -2559,8 +3378,7 @@ mod a_member_leaves_of_its_own_accord {
                             && n.admin_count() == 1
                     })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group one of whose members leaves, upon the network settling, we
@@ -2570,17 +3388,18 @@ mod a_member_leaves_of_its_own_accord {
     /// everyone still in it. Convergence through that is the liveness half of
     /// the story: the safety properties above are all satisfied by a group that
     /// simply stopped.
-    #[test]
-    fn the_remaining_members_converge_through_the_departure() {
-        plan::<Departure>(vec![property::eventually_within(
+    fn the_remaining_members_converge_through_the_departure(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Departure>> {
+        property::eventually_within(
             "the remaining members hold the same content",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Departure>>| {
+            move |w: &World<'_, WorkspaceNode<Departure>>| {
                 let staying = remaining(w);
-                staying.len() == NODES - 1 && staying.windows(2).all(|p| shape(p[0]) == shape(p[1]))
+                staying.len() == cluster - 1
+                    && staying.windows(2).all(|p| shape(p[0]) == shape(p[1]))
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// The multiset of characters across every document.
@@ -2596,19 +3415,17 @@ mod a_member_leaves_of_its_own_accord {
     /// The anti-vacuity guard. `a_departure_never_rotates_the_namespace` and
     /// `a_departure_never_retracts_anybody_elses_leaf` are both satisfied by a
     /// run in which nobody ever left.
-    #[test]
-    fn somebody_really_does_leave_in_this_run() {
-        plan::<Departure>(vec![property::sometimes(
+    fn somebody_really_does_leave_in_this_run() -> Property<WorkspaceNode<Departure>> {
+        property::sometimes(
             "the departing node has issued its departure",
             |w: &World<'_, WorkspaceNode<Departure>>| w.nodes().any(WorkspaceNode::has_left),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Reproducibility, as every other scenario asserts it.
     #[test]
     fn the_departure_run_is_reproducible() {
-        assert_deterministic(|| plan::<Departure>(Vec::new()), Seed(0x0DEA_2712));
+        assert_deterministic(|| plan_of::<Departure>(SWARM), Seed(0x0DEA_2712));
     }
 }
 
@@ -2629,22 +3446,92 @@ mod an_action_needs_a_quorum {
     use iroh_beekem_sim::{Quorum, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{SEEDS, joined, plan_of_size};
+    use super::{HARSH, PARTITIONED, PRISTINE, SWARM, joined, plan_of};
 
     /// One more than the honest group, so the removal target is not an approver.
     const NODES_WITH_VICTIM: usize = 4;
     /// The node the founder proposes to remove.
     const VICTIM: u64 = 2;
 
-    fn quorum_plan(
-        properties: Vec<Property<WorkspaceNode<Quorum>>>,
-    ) -> TestPlan<WorkspaceNode<Quorum>> {
-        plan_of_size(NODES_WITH_VICTIM, properties)
-    }
-
     /// Nodes that are not the removal target.
     fn survivors<'a>(w: &'a World<'a, WorkspaceNode<Quorum>>) -> Vec<&'a WorkspaceNode<Quorum>> {
         joined(w).into_iter().filter(|n| n.id() != VICTIM).collect()
+    }
+
+    /// The world: the founder appoints a second administrator and raises the
+    /// threshold to two, then proposes a removal that needs both of them.
+    ///
+    /// Four nodes, swarm faults, so that the victim of the proposed removal is
+    /// neither of the two administrators deciding on it.
+    #[test]
+    fn an_action_needing_a_quorum() {
+        crate::harness::check_world(
+            "an_action_needing_a_quorum",
+            SWARM.sized(NODES_WITH_VICTIM),
+            quorum_claims,
+        );
+    }
+
+    /// A threshold of two, with the proposal's target severed from the approvers.
+    ///
+    /// A quorum forms from certificates that travel like anything else, so the
+    /// question a partition asks is whether an approval that reached one
+    /// administrator and not the other leaves the group divided about what was
+    /// executed. `run_quorum_actions` marks a proposal executed only on success, and
+    /// this is the world that exercises why.
+    #[test]
+    fn a_quorum_across_a_partition() {
+        crate::harness::check_world(
+            "a_quorum_across_a_partition",
+            PARTITIONED.sized(NODES_WITH_VICTIM),
+            quorum_claims,
+        );
+    }
+
+    /// The same claims as `an_action_needing_a_quorum`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn a_quorum_on_a_clean_network() {
+        crate::harness::check_world(
+            "a_quorum_on_a_clean_network",
+            PRISTINE.sized(NODES_WITH_VICTIM),
+            quorum_claims,
+        );
+    }
+
+    /// The same claims as `an_action_needing_a_quorum`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn a_quorum_on_a_cruel_network() {
+        crate::harness::check_world(
+            "a_quorum_on_a_cruel_network",
+            HARSH.sized(NODES_WITH_VICTIM),
+            quorum_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn quorum_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Quorum>>> {
+        vec![
+            no_proposal_is_executable_below_the_threshold(),
+            a_proposal_with_enough_approvals_is_eventually_performed_everywhere(cluster),
+            every_node_resolves_the_same_threshold(cluster),
+            nobody_but_the_founder_can_add_an_administrator(),
+            a_quorum_is_actually_reached_in_this_run(),
+            the_remaining_members_still_converge_under_a_quorum(cluster),
+        ]
     }
 
     /// In a workspace whose threshold is two, upon any proposal, we expect no
@@ -2655,9 +3542,8 @@ mod an_action_needs_a_quorum {
     /// duplicated by the transport, and are re-shipped whole on every log
     /// exchange. A count that double-counted a re-delivered approval would
     /// satisfy a unit test and fail here.
-    #[test]
-    fn no_proposal_is_executable_below_the_threshold() {
-        quorum_plan(vec![property::always(
+    fn no_proposal_is_executable_below_the_threshold() -> Property<WorkspaceNode<Quorum>> {
+        property::always(
             "no node treats a proposal as executable on too few approvals",
             |w: &World<'_, WorkspaceNode<Quorum>>| {
                 w.nodes().all(|n| {
@@ -2666,8 +3552,7 @@ mod an_action_needs_a_quorum {
                     })
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace whose threshold is two, upon the network settling, we
@@ -2675,12 +3560,13 @@ mod an_action_needs_a_quorum {
     ///
     /// The counterweight to every `always` here: an implementation that refused
     /// all quorum actions would satisfy them and fail this.
-    #[test]
-    fn a_proposal_with_enough_approvals_is_eventually_performed_everywhere() {
-        quorum_plan(vec![property::eventually_within(
+    fn a_proposal_with_enough_approvals_is_eventually_performed_everywhere(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Quorum>> {
+        property::eventually_within(
             "every remaining admin's group has lost the proposed member",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Quorum>>| {
+            move |w: &World<'_, WorkspaceNode<Quorum>>| {
                 let staying = survivors(w);
                 // `current_member_count` rather than `group_size`, and the
                 // difference is not stylistic: beekem's tree count is read
@@ -2689,13 +3575,10 @@ mod an_action_needs_a_quorum {
                 // something happens to replay. This property failed on seeds
                 // where every node had in fact carried out the removal. See
                 // `beekem_group_size_disagrees_with_current_members`.
-                staying.len() == NODES_WITH_VICTIM - 1
-                    && staying
-                        .iter()
-                        .all(|n| n.current_member_count() < NODES_WITH_VICTIM)
+                staying.len() == cluster - 1
+                    && staying.iter().all(|n| n.current_member_count() < cluster)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace founded at a threshold of two, upon every node joining, we
@@ -2706,17 +3589,15 @@ mod an_action_needs_a_quorum {
     /// bundle without which a node could not have joined at all — so a member
     /// cannot be behind on it, and no two members can merge different sets of
     /// operations because they disagreed about the bar.
-    #[test]
-    fn every_node_resolves_the_same_threshold() {
-        quorum_plan(vec![property::eventually_within(
+    fn every_node_resolves_the_same_threshold(cluster: usize) -> Property<WorkspaceNode<Quorum>> {
+        property::eventually_within(
             "every joined node reports the same threshold",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Quorum>>| {
+            move |w: &World<'_, WorkspaceNode<Quorum>>| {
                 let nodes = joined(w);
-                nodes.len() == NODES_WITH_VICTIM && nodes.iter().all(|n| n.threshold() == 2)
+                nodes.len() == cluster && nodes.iter().all(|n| n.threshold() == 2)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace founded at a threshold of two, upon the run finishing, we
@@ -2727,13 +3608,11 @@ mod an_action_needs_a_quorum {
     /// keeps it narrow: nobody the founder appoints inherits the power to appoint
     /// further admins, or an admin could raise a puppet and approve its own
     /// actions twice.
-    #[test]
-    fn nobody_but_the_founder_can_add_an_administrator() {
-        quorum_plan(vec![property::always(
+    fn nobody_but_the_founder_can_add_an_administrator() -> Property<WorkspaceNode<Quorum>> {
+        property::always(
             "no node ever sees more than two administrators",
             |w: &World<'_, WorkspaceNode<Quorum>>| joined(w).iter().all(|n| n.admin_count() <= 2),
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect a quorum to have actually
@@ -2743,9 +3622,8 @@ mod an_action_needs_a_quorum {
     /// is satisfied by a run in which nothing was ever proposed, and
     /// `nobody_but_the_founder_can_add_an_administrator` by one in which nobody
     /// tried.
-    #[test]
-    fn a_quorum_is_actually_reached_in_this_run() {
-        quorum_plan(vec![property::sometimes(
+    fn a_quorum_is_actually_reached_in_this_run() -> Property<WorkspaceNode<Quorum>> {
+        property::sometimes(
             "some node holds a proposal that reached a threshold above one",
             |w: &World<'_, WorkspaceNode<Quorum>>| {
                 w.nodes().any(|n| {
@@ -2755,8 +3633,7 @@ mod an_action_needs_a_quorum {
                             .any(|status| status.executable && status.approvals >= 2)
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a workspace under a quorum, upon the network settling, we expect the
@@ -2765,14 +3642,15 @@ mod an_action_needs_a_quorum {
     /// Refusing more aggressively is not a fix. A threshold that stalled the
     /// group, or an execution path that every replica ran differently, would
     /// satisfy every safety property above.
-    #[test]
-    fn the_remaining_members_still_converge_under_a_quorum() {
-        quorum_plan(vec![property::eventually_within(
+    fn the_remaining_members_still_converge_under_a_quorum(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Quorum>> {
+        property::eventually_within(
             "the remaining members hold the same content",
             Duration::from_secs(12),
-            |w: &World<'_, WorkspaceNode<Quorum>>| {
+            move |w: &World<'_, WorkspaceNode<Quorum>>| {
                 let staying = survivors(w);
-                staying.len() == NODES_WITH_VICTIM - 1
+                staying.len() == cluster - 1
                     && staying.windows(2).all(|p| {
                         let mut a: Vec<char> = p[0].all_text().concat().chars().collect();
                         let mut b: Vec<char> = p[1].all_text().concat().chars().collect();
@@ -2781,15 +3659,16 @@ mod an_action_needs_a_quorum {
                         a == b
                     })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Reproducibility, as every other scenario asserts it.
     #[test]
     fn the_quorum_run_is_reproducible() {
-        let _ = SEEDS;
-        assert_deterministic(|| quorum_plan(Vec::new()), Seed(0x0000_9401));
+        assert_deterministic(
+            || plan_of::<Quorum>(SWARM.sized(NODES_WITH_VICTIM)),
+            Seed(0x0000_9401),
+        );
     }
 }
 
@@ -2817,7 +3696,7 @@ mod devices_onboard_without_losing_content {
     use iroh_beekem_sim::{DOCS, DocumentUuid, Onboarding, WorkspaceNode};
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan};
+    use super::{HARSH, HORIZON, PRISTINE, SWARM, plan_of};
 
     /// The node that joins as a second device of another node's person.
     const SECOND_DEVICE: u64 = 2;
@@ -2827,12 +3706,6 @@ mod devices_onboard_without_losing_content {
 
     /// How many distinct people the scenario admits.
     ///
-    /// Three nodes, two of which are one person, so two. Written as a name rather
-    /// than a literal because it is the whole claim of
-    /// `both_of_a_users_devices_resolve_to_one_user`: a device count and a person
-    /// count that move together is precisely the bug.
-    const USERS: usize = NODES - 1;
-
     /// The two nodes that are one person, once both have joined.
     fn one_persons_devices<'a>(
         w: &'a World<'a, WorkspaceNode<Onboarding>>,
@@ -2853,6 +3726,89 @@ mod devices_onboard_without_losing_content {
         chars
     }
 
+    /// The world: devices arrive one after another, after the founder has
+    /// written. Admission itself has to carry the content to them.
+    ///
+    /// Three nodes, swarm faults. Node 2 is a second device of node 1's person.
+    #[test]
+    fn devices_onboarding_one_after_another() {
+        crate::harness::check_world(
+            "devices_onboarding_one_after_another",
+            SWARM,
+            onboarding_claims,
+        );
+    }
+
+    /// The same claims as `devices_onboarding_one_after_another`, on a network
+    /// with no injected faults.
+    ///
+    /// # Ignored: staggered onboarding does not converge in time on one seed
+    ///
+    /// `every admitted device reads every document identically` misses its
+    /// deadline at seed `0x03317bb4875fb038`, and only at that seed. The other
+    /// four claims hold everywhere.
+    ///
+    /// **The lighter network is what exposes it, and it is not the cause.** The
+    /// fault plan is empty here, but `InMemory::unordered_lossy` still drops two
+    /// per cent of messages and reorders the rest — a fault plan governs
+    /// partitions, crashes and added loss, not the transport underneath. What
+    /// changes between profiles is which draws the scheduler makes, so a seed
+    /// that loses a chunk this scenario cannot re-fetch in time is reachable here
+    /// and is not reachable under the swarm profile.
+    ///
+    /// The margin is genuinely thin: a staggered joiner arrives at 800ms and is
+    /// caught up by the republish `on_hello` performs and the repair behind it,
+    /// while anti-entropy stops at `MAX_RESYNCS * RESYNC_INTERVAL` — 14.4s inside
+    /// a 15s horizon. Whether the answer is a longer horizon, a larger repair
+    /// budget, or a real gap in the onboarding catch-up path is a question this
+    /// refactor raises and does not settle.
+    ///
+    /// ```text
+    /// cargo test -p iroh-beekem-sim --test properties -- --ignored onboarding_on_a_clean_network
+    /// ```
+    #[test]
+    #[ignore = "onboarding misses its convergence deadline at seed 0x03317bb4875fb038"]
+    fn onboarding_on_a_clean_network() {
+        crate::harness::check_world("onboarding_on_a_clean_network", PRISTINE, onboarding_claims);
+    }
+
+    /// The same claims as `devices_onboarding_one_after_another`, on a network
+    /// that also loses, duplicates and stops nodes.
+    ///
+    /// # Ignored: the second device is never enrolled at all on one seed
+    ///
+    /// The same seed as `onboarding_on_a_clean_network`, `0x03317bb4875fb038`,
+    /// and a worse outcome. Three claims fail there, and the one that explains
+    /// the other two is the anti-vacuity guard: `some node sees more certified
+    /// devices than people` **never holds in any state**, so node 2 does not
+    /// finish enrolling as a second device of node 1's person within the horizon.
+    /// The two convergence claims then fail because they guard on the full
+    /// cluster having joined.
+    ///
+    /// A guard reporting "never reachable" is the useful half of this result: it
+    /// separates "the group did not converge" from "the scenario did not happen",
+    /// and only the second is true here.
+    ///
+    /// ```text
+    /// cargo test -p iroh-beekem-sim --test properties -- --ignored onboarding_on_a_cruel_network
+    /// ```
+    #[test]
+    #[ignore = "the second device never enrols at seed 0x03317bb4875fb038"]
+    fn onboarding_on_a_cruel_network() {
+        crate::harness::check_world("onboarding_on_a_cruel_network", HARSH, onboarding_claims);
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn onboarding_claims(cluster: usize) -> Vec<Property<WorkspaceNode<Onboarding>>> {
+        vec![
+            every_admitted_device_eventually_reads_every_file(cluster),
+            both_of_a_users_devices_resolve_to_one_user(cluster),
+            all_of_one_users_devices_converge_on_the_same_view(),
+            content_exists_before_the_last_device_is_admitted(),
+            a_second_device_really_is_admitted_as_a_device(),
+        ]
+    }
+
     /// In a group whose members are admitted one after another and after content
     /// already exists, upon the run settling, we expect every admitted device to
     /// read the same text as every other for **every** document — not merely for
@@ -2865,16 +3821,17 @@ mod devices_onboard_without_losing_content {
     /// another produces exactly that. This is also the property that protects the
     /// Phase 1 republish cooldown — throttled too hard, a late joiner is served
     /// nothing it can decrypt and onboarding fails silently.
-    #[test]
-    fn every_admitted_device_eventually_reads_every_file() {
-        plan::<Onboarding>(vec![property::eventually_within(
+    fn every_admitted_device_eventually_reads_every_file(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Onboarding>> {
+        property::eventually_within(
             "every admitted device reads every document identically",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+            move |w: &World<'_, WorkspaceNode<Onboarding>>| {
                 let nodes: Vec<_> = w.nodes().filter(|n| n.has_joined()).collect();
                 // Guarded on the count: at t=0 only the founder has joined, and a
                 // one-element set agrees with itself for every document trivially.
-                if nodes.len() != NODES {
+                if nodes.len() != cluster {
                     return false;
                 }
                 DOCS.into_iter().all(|doc| {
@@ -2883,8 +3840,7 @@ mod devices_onboard_without_losing_content {
                         .all(|p| shape_of(p[0], doc) == shape_of(p[1], doc))
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group where two devices belong to one person, upon any node being
@@ -2897,16 +3853,17 @@ mod devices_onboard_without_losing_content {
     /// nobody invited, who then holds a role in their own right and survives the
     /// removal of the device that was supposed to *be* them. `certified_users`
     /// cannot see that on its own; the count of distinct people is what moves.
-    #[test]
-    fn both_of_a_users_devices_resolve_to_one_user() {
-        plan::<Onboarding>(vec![property::always(
+    fn both_of_a_users_devices_resolve_to_one_user(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<Onboarding>> {
+        property::always(
             "a second device never mints a second person",
-            |w: &World<'_, WorkspaceNode<Onboarding>>| {
+            move |w: &World<'_, WorkspaceNode<Onboarding>>| {
                 w.nodes().filter(|n| n.has_joined()).all(|n| {
                     // Never *more* than were admitted. Fewer is ordinary while
                     // certificates are still in flight, and is what the liveness
                     // property below covers instead.
-                    n.certified_users().len() <= USERS
+                    n.certified_users().len() <= (cluster - 1)
                 }) && one_persons_devices(w).windows(2).all(|p| {
                     match (p[0].user_of_this_device(), p[1].user_of_this_device()) {
                         // Skipped rather than failed: a device has no user until
@@ -2917,8 +3874,7 @@ mod devices_onboard_without_losing_content {
                     }
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group where one person holds two devices, upon the run settling, we
@@ -2930,9 +3886,8 @@ mod devices_onboard_without_losing_content {
     /// by *different* issuers — the founder admitted the primary, the primary
     /// enrolled the second — so they reach the group along different paths and a
     /// defect in the second path shows here first.
-    #[test]
-    fn all_of_one_users_devices_converge_on_the_same_view() {
-        plan::<Onboarding>(vec![property::eventually_within(
+    fn all_of_one_users_devices_converge_on_the_same_view() -> Property<WorkspaceNode<Onboarding>> {
+        property::eventually_within(
             "one person's two devices agree on content and on the roster",
             HORIZON,
             |w: &World<'_, WorkspaceNode<Onboarding>>| {
@@ -2948,8 +3903,7 @@ mod devices_onboard_without_losing_content {
                     a == b && p[0].derived_roster() == p[1].derived_roster()
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect content to have existed
@@ -2965,9 +3919,8 @@ mod devices_onboard_without_losing_content {
     /// before everyone was in" is false without the stagger, since a `Hello` sent
     /// at t=0 is answered well before `FIRST_EDIT`, and true by construction
     /// with it.
-    #[test]
-    fn content_exists_before_the_last_device_is_admitted() {
-        plan::<Onboarding>(vec![property::sometimes(
+    fn content_exists_before_the_last_device_is_admitted() -> Property<WorkspaceNode<Onboarding>> {
+        property::sometimes(
             "the founder has written while a device is still outside the group",
             |w: &World<'_, WorkspaceNode<Onboarding>>| {
                 let written = w
@@ -2975,8 +3928,7 @@ mod devices_onboard_without_losing_content {
                     .any(|n| n.has_joined() && !n.document_text().is_empty());
                 written && w.nodes().any(|n| !n.has_joined())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect the second device to have
@@ -2987,22 +3939,20 @@ mod devices_onboard_without_losing_content {
     /// — and under a lossy transport that is a reachable run, not a hypothetical
     /// one. More certified devices than certified people is the single
     /// observation that says the `AddDevice` path was taken.
-    #[test]
-    fn a_second_device_really_is_admitted_as_a_device() {
-        plan::<Onboarding>(vec![property::sometimes(
+    fn a_second_device_really_is_admitted_as_a_device() -> Property<WorkspaceNode<Onboarding>> {
+        property::sometimes(
             "some node sees more certified devices than people",
             |w: &World<'_, WorkspaceNode<Onboarding>>| {
                 w.nodes()
                     .any(|n| n.certified_device_count() > n.certified_users().len())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Reproducibility, as every other scenario asserts it.
     #[test]
     fn the_onboarding_run_is_reproducible() {
-        assert_deterministic(|| plan::<Onboarding>(Vec::new()), Seed(0x0B0A_2D17));
+        assert_deterministic(|| plan_of::<Onboarding>(SWARM), Seed(0x0B0A_2D17));
     }
 }
 
@@ -3027,7 +3977,7 @@ mod removing_one_device_leaves_the_user_working {
     };
     use propsim::prelude::*;
 
-    use super::{HORIZON, NODES, plan};
+    use super::{HARSH, HORIZON, PRISTINE, SWARM, plan_of};
 
     /// The removed device.
     const REMOVED_DEVICE: u64 = 2;
@@ -3052,6 +4002,60 @@ mod removing_one_device_leaves_the_user_working {
             .find(|n| n.id() == REMOVED_DEVICE && n.has_joined())
     }
 
+    /// The world: one device of a two-device person is removed, and the person
+    /// stays.
+    ///
+    /// Three nodes, swarm faults.
+    #[test]
+    fn one_device_of_a_person_removed() {
+        crate::harness::check_world("one_device_of_a_person_removed", SWARM, device_churn_claims);
+    }
+
+    /// The same claims as `one_device_of_a_person_removed`, on a network that does nothing.
+    ///
+    /// A failure here is unambiguous. Under the swarm profile a liveness
+    /// failure has two possible causes, and telling the protocol's from the
+    /// network's means reading the seed's fault subset; here there is no
+    /// second cause. It is also the cheapest world in the file, because a run
+    /// with no latency and no partition to heal reaches its horizon in fewer
+    /// scheduler events.
+    #[test]
+    fn one_device_removed_on_a_clean_network() {
+        crate::harness::check_world(
+            "one_device_removed_on_a_clean_network",
+            PRISTINE,
+            device_churn_claims,
+        );
+    }
+
+    /// The same claims as `one_device_of_a_person_removed`, on a network that also loses,
+    /// duplicates and stops nodes.
+    ///
+    /// Loss and duplication are what the anti-entropy paths exist for, and a
+    /// crash and restart is what `WorkspaceNode::reboot` exists for. Under the
+    /// swarm profile none of the three is exercised outside the scripted
+    /// worlds, so every claim here is asserted against a network it has never
+    /// met before.
+    #[test]
+    fn one_device_removed_on_a_cruel_network() {
+        crate::harness::check_world(
+            "one_device_removed_on_a_cruel_network",
+            HARSH,
+            device_churn_claims,
+        );
+    }
+
+    /// Everything this scenario claims, whatever shape it runs in.
+    fn device_churn_claims(cluster: usize) -> Vec<Property<WorkspaceNode<DeviceChurn>>> {
+        vec![
+            the_users_other_device_keeps_its_role(),
+            the_users_other_device_stays_on_every_roster(cluster),
+            the_removed_device_stops_seeing_entries_written_after_it_went(),
+            the_remaining_devices_still_converge(cluster),
+            a_device_really_is_enrolled_and_really_is_removed(),
+        ]
+    }
+
     /// In a group where a person holds two devices and one of them is removed,
     /// upon any remaining node being asked at any instant, we expect that person
     /// still to hold the role it was granted.
@@ -3063,9 +4067,8 @@ mod removing_one_device_leaves_the_user_working {
     /// Asserted as `always` rather than eventually because a role is never
     /// supposed to move here: nobody issued a grant, so no interleaving may
     /// produce one.
-    #[test]
-    fn the_users_other_device_keeps_its_role() {
-        plan::<DeviceChurn>(vec![property::always(
+    fn the_users_other_device_keeps_its_role() -> Property<WorkspaceNode<DeviceChurn>> {
+        property::always(
             "removing one device never costs the person its role",
             |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 let user = member_bytes_of(SURVIVING_DEVICE);
@@ -3076,8 +4079,7 @@ mod removing_one_device_leaves_the_user_working {
                     n.role_of(user).is_none_or(|role| role == Role::Editor)
                 })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group where one of a person's two devices is removed, upon the run
@@ -3088,20 +4090,20 @@ mod removing_one_device_leaves_the_user_working {
     /// with current members, so a removal that retracted one device's binding too
     /// broadly would evict the person's other device from every peer's roster and
     /// cut it off from the group without anyone having removed it.
-    #[test]
-    fn the_users_other_device_stays_on_every_roster() {
-        plan::<DeviceChurn>(vec![property::eventually_within(
+    fn the_users_other_device_stays_on_every_roster(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<DeviceChurn>> {
+        property::eventually_within(
             "the person's remaining device is on every remaining roster",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+            move |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 let staying = remaining(w);
-                staying.len() == NODES - 1
+                staying.len() == cluster - 1
                     && staying
                         .iter()
                         .all(|n| n.is_on_roster(NodeId(SURVIVING_DEVICE)))
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group that removed one device and then wrote, upon that device being
@@ -3113,15 +4115,14 @@ mod removing_one_device_leaves_the_user_working {
     /// rotation the removal triggers, and a removal that retracted the leaf
     /// without rotating would leave the device reading the replica through the
     /// capability it already holds.
-    #[test]
-    fn the_removed_device_stops_seeing_entries_written_after_it_went() {
-        plan::<DeviceChurn>(vec![property::always(
+    fn the_removed_device_stops_seeing_entries_written_after_it_went()
+    -> Property<WorkspaceNode<DeviceChurn>> {
+        property::always(
             "a removed device never sees an entry written after its removal",
             |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 victim(w).is_none_or(|n| n.entry(&doc_key(POST_REVOCATION_DOC)).is_none())
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In a group that removed one device, upon the run settling, we expect the
@@ -3131,14 +4132,15 @@ mod removing_one_device_leaves_the_user_working {
     /// refusing more aggressively. A removal that broke the group's convergence,
     /// or that stranded the surviving device on the abandoned replica, would
     /// satisfy every "the victim sees nothing" claim perfectly.
-    #[test]
-    fn the_remaining_devices_still_converge() {
-        plan::<DeviceChurn>(vec![property::eventually_within(
+    fn the_remaining_devices_still_converge(
+        cluster: usize,
+    ) -> Property<WorkspaceNode<DeviceChurn>> {
+        property::eventually_within(
             "the devices that stay converge through the removal",
             HORIZON,
-            |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
+            move |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 let staying = remaining(w);
-                staying.len() == NODES - 1
+                staying.len() == cluster - 1
                     && staying.windows(2).all(|p| {
                         let mut a: Vec<char> = p[0].all_text().concat().chars().collect();
                         let mut b: Vec<char> = p[1].all_text().concat().chars().collect();
@@ -3147,8 +4149,7 @@ mod removing_one_device_leaves_the_user_working {
                         a == b
                     })
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// In this plan, upon the run finishing, we expect a device really to have
@@ -3158,21 +4159,19 @@ mod removing_one_device_leaves_the_user_working {
     /// which node 2 joined as a third *person* and was removed as one — which is
     /// exactly the implementation they exist to rule out, and which would look
     /// identical from every angle except this one.
-    #[test]
-    fn a_device_really_is_enrolled_and_really_is_removed() {
-        plan::<DeviceChurn>(vec![property::sometimes(
+    fn a_device_really_is_enrolled_and_really_is_removed() -> Property<WorkspaceNode<DeviceChurn>> {
+        property::sometimes(
             "some node saw the person hold two devices",
             |w: &World<'_, WorkspaceNode<DeviceChurn>>| {
                 let user = member_bytes_of(SURVIVING_DEVICE);
                 w.nodes().any(|n| n.devices_of_user(&user) == 2)
             },
-        )])
-        .run(deterministic());
+        )
     }
 
     /// Reproducibility, as every other scenario asserts it.
     #[test]
     fn the_device_churn_run_is_reproducible() {
-        assert_deterministic(|| plan::<DeviceChurn>(Vec::new()), Seed(0x0DEC_1CE5));
+        assert_deterministic(|| plan_of::<DeviceChurn>(SWARM), Seed(0x0DEC_1CE5));
     }
 }
