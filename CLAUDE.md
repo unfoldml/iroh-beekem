@@ -16,8 +16,14 @@ over library functionality described here.
 cargo test -p iroh-beekem-core   # pure engine: CGKA loop, state machine, capability closure,
                                  # forgery rejection, insider falsification tests
 cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, forging peer,
-                                 # outsiders, insiders, revenants, assets
-                                 # ~3 min: runs under swarm faults (partitions, latency, reorder).
+                                 # outsiders, insiders, revenants, assets, quorums, onboarding
+                                 # ~2m15s for 52 worlds under four network profiles: clean,
+                                 # swarm (partitions, latency, reorder), cruel (adds loss,
+                                 # duplication, crash-restart) and five scripted scripts.
+                                 # One `#[test]` is one *world*, and it reads that world's whole
+                                 # property vector out of each of six traces — see the header of
+                                 # `tests/properties.rs` for why that asserts what one plan per
+                                 # property asserted, at a sixth of the cost.
                                  # Cost is proportional to the *number of events*, because the
                                  # simulator deep-clones every node's state per event, and that
                                  # clone is four Loro snapshot round trips plus the CGKA tree.
@@ -27,6 +33,10 @@ cargo test -p iroh-beekem-sim    # propsim: convergence, rotation/revocation, fo
                                  # Neither `RESYNC_INTERVAL` nor `MAX_RESYNCS` is a free lever —
                                  # propsim ends every run here at 15 virtual seconds and their
                                  # product already fills it; see `MAX_RESYNCS` in sim/src/lib.rs.
+cargo test -p iroh-beekem-sim -- --ignored   # four known defects, each documented at its own
+                                 # `#[ignore]` with the failure and the seed: a beekem
+                                 # `debug_assert!` panic, two onboarding failures, and one
+                                 # five-node world that passes but costs the suite 340s.
 cargo test -p iroh-beekem        # two real endpoints over real QUIC, plus blob collection
                                  # and the large-asset round trip. Do NOT run alongside the
                                  # simulator: these wait on wall-clock outcomes and a
@@ -431,6 +441,40 @@ them *without* noticing will not fail loudly.
   The workspace form builds one job graph and runs the simulator and the real-QUIC suite
   concurrently — the combination the Commands section says never to run. `make test` existed and did
   exactly that until phase 11.
+
+- **A property is free and a world is what costs.** One `#[test]` in
+  [properties.rs](crates/iroh-beekem-sim/tests/properties.rs) runs one *world* and reads its whole
+  property vector out of each of six traces. This is sound because a simulation is a function of the
+  plan's shape and its seed and **not** of its properties: propsim runs `run_deterministic` once per
+  seed and only then calls `evaluate_properties`, and `effective_seed` ignores the plan, so seed
+  index *s* is the same seed in every plan. Adding a property to an existing world therefore costs a
+  scan of frames that already exist; adding a world costs six simulations. The suite ran 636
+  simulations over 21 worlds before this shape and runs 332 over 56 now.
+
+- **The world runner is in this repo, and `TestPlan::run` must not come back.**
+  `harness::check_world` ([harness.rs](crates/iroh-beekem-sim/tests/properties/harness.rs)) drives
+  `run_deterministic` and `evaluate_properties` itself, because `Run::run` aborts at the first failing
+  property of the first failing seed and *discards the shrunk counterexample it computed* — it renders
+  only a name and a seed. With ten properties on a world, "one failed on one seed" and "all failed on
+  every seed" are different defects and the abort cannot tell them apart. This is why `propsim-sim` is
+  a second dev-dependency, and it must stay on the **same pinned revision** as `propsim` or the two
+  `Property` types are distinct.
+
+- **`.seeds(n)` means operation count here, not seed count.** On a propsim plan it means both — how
+  many seeds `drive` loops over, and how many operations to draw from the workload
+  (`data.seeds.clamp(1, 64)`). The world runner does not call `drive`, so only the second survives;
+  how many seeds a world runs is `harness::SEEDS`. `OPS_PER_RUN` is named for what it now does.
+
+- **`cluster` is the shape's node count and is not always the member count.** A world holding a node
+  that never joins — the outsider, the invite thief — has `cluster - 1` members, and a property that
+  counts members against `cluster` waits for an admission that never comes and fails on every seed.
+  `admitted()` in the outsider module exists for exactly that and says so.
+
+- **The node-count axis is bound by memory, not by arithmetic.** Measured: 62 worlds without any
+  five-node world take **135 s** (2m37s system time); adding three takes **475 s** (8m7s system time).
+  Three worlds cost 340 seconds and only ~90 are their own — the rest is what deep-cloning five nodes
+  per event does to the seven other worlds sharing the machine. `a_larger_honest_group` is kept
+  `#[ignore]`d with the measurement; **measure before adding a second**.
 
 - **A history property is only non-vacuous in a plan with a workload.** `World::history()` is empty
   unless the plan supplies `.workload()` and `.client()`, which only `generated_crud_workloads` does —
